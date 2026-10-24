@@ -99,6 +99,8 @@ class ColoursTest(unittest.TestCase):
     def test_scaled_frames_decode_at_that_size(self):
         frames, shown = [], []
         decoder = Decoder("h264", lambda t: shown.append(t), formats=("I420",), gpu_frames=False)
+        # Said up front: a short clip can be decoded whole before the size learned from it applies.
+        decoder.native = (720, 480)
         decoder.show_at(180, 120)
         decoder.start()
         encoder = subprocess.Popen(["gst-launch-1.0", "-q"] + BARS.split(), stdout=subprocess.PIPE,

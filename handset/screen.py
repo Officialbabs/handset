@@ -41,6 +41,23 @@ class Screen(Gtk.Widget):
             scale = self.scale()
             self.on_resize(round(width * scale), round(height * scale))
 
+    def is_dark(self) -> bool:
+        """Whether the frame showing is all but black, as a sleeping phone's screen is: from a
+        tiny copy the GPU makes of it (12×24 pixels)."""
+        native = self.get_native()
+        renderer = native.get_renderer() if native else None
+        if self.texture is None or renderer is None:
+            return False
+        snapshot = Gtk.Snapshot()
+        snapshot.append_scaled_texture(self.texture, Gsk.ScalingFilter.TRILINEAR, Graphene.Rect().init(0, 0, 12, 24))
+        small = renderer.render_texture(snapshot.to_node(), Graphene.Rect().init(0, 0, 12, 24))
+        downloader = Gdk.TextureDownloader.new(small)
+        downloader.set_format(Gdk.MemoryFormat.R8G8B8A8)
+        data, stride = downloader.download_bytes()
+        raw = data.get_data()
+        brightest = max(max(raw[y * stride + x * 4:y * stride + x * 4 + 3]) for y in range(24) for x in range(12))
+        return brightest < 24
+
     def set_paintable(self, texture: Gdk.Texture | None):
         self.texture = texture
         self.queue_draw()

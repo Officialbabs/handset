@@ -278,12 +278,19 @@ async fn stream(options: Options) -> Fallible<()> {
 /// its own TCP in user space, and the services' handshake.
 async fn reach(ip: IpAddr, port: u16, pairing: &str) -> Fallible<(idevice::tcp::handle::AdapterHandle, RsdHandshake)> {
     let mut pairing = RpPairingFile::read_from_file(pairing).await?;
-    let socket = RpPairingSocket::new(TcpStream::connect((ip, port)).await?);
+    let unreachable = "The iPhone went to sleep or left Wi-Fi: it didn't answer.";
+    let socket = RpPairingSocket::new(TcpStream::connect((ip, port)).await.map_err(|_| unreachable)?);
     let mut remote = RemotePairingClient::new(socket, "handset");
-    remote
-        .connect(&mut pairing, || async { String::new() })
-        .await
-        .map_err(|e| format!("The iPhone didn't accept this computer ({e}): set it up with Ada again."))?;
+    remote.connect(&mut pairing, || async { String::new() }).await.map_err(|e| -> Box<dyn Error + Send + Sync> {
+        // A connection that drops or never answers is the phone away, not the pairing refused;
+        // only a refusal of the pairing itself needs Ada to set the phone up again.
+        let why = e.to_string();
+        if why.contains("socket") || why.contains("io") || why.contains("timed out") || why.contains("closed") {
+            unreachable.into()
+        } else {
+            format!("The iPhone didn't accept this computer ({why}): set it up with Ada again.").into()
+        }
+    })?;
 
     // A tunnel to the phone's developer services, with its own TCP in user space.
     let tunnel_port = remote.create_tcp_listener().await?;

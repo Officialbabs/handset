@@ -83,6 +83,8 @@ class LinkTest(unittest.TestCase):
 
 
 class FakeHelper(unittest.TestCase):
+    """The stand-in helper's picture is a ball on black; tests say what the window would see."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = os.environ.get("FAKEIOS_DIR")
@@ -150,6 +152,7 @@ class FakeHelper(unittest.TestCase):
     def test_a_dark_screen_and_a_click_to_wake(self):
         changes = []
         self.phone.on_awake = changes.append
+        self.phone.looks_dark = lambda: True  # as the window finds a black picture
         os.environ["FAKEIOS_DARK_AFTER"] = "1"
         saved = iphone.DARK_AFTER_S
         iphone.DARK_AFTER_S = 0.6
@@ -159,6 +162,24 @@ class FakeHelper(unittest.TestCase):
             self.assertFalse(self.phone.awake)
             self.phone.wake()
             spin(lambda: {"op": "button", "name": "home"} in self.commands())
+        finally:
+            iphone.DARK_AFTER_S = saved
+            del os.environ["FAKEIOS_DARK_AFTER"]
+
+    def test_a_still_lit_screen_keeps_taking_taps(self):
+        changes = []
+        self.phone.on_awake = changes.append
+        self.phone.looks_dark = lambda: False  # frames stopped, but the picture is lit
+        os.environ["FAKEIOS_DARK_AFTER"] = "1"
+        saved = iphone.DARK_AFTER_S
+        iphone.DARK_AFTER_S = 0.6
+        try:
+            self.phone.start()
+            spin(lambda: self.frames)
+            end = time.monotonic() + 3
+            spin(lambda: time.monotonic() > end, seconds=5)
+            self.assertTrue(self.phone.awake)
+            self.assertEqual(changes, [])
         finally:
             iphone.DARK_AFTER_S = saved
             del os.environ["FAKEIOS_DARK_AFTER"]

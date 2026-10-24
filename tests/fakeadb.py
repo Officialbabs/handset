@@ -88,6 +88,8 @@ def main(args):
                   "deviceSize=[1080, 2400], isActive=[1]")
         if "mWakefulness" in command:
             print(f"  mWakefulness={wakefulness()}")
+        if "isKeyguardShowing" in command:
+            print(f"    isKeyguardShowing={str(os.path.exists(os.path.join(HERE, 'locked'))).lower()}")
         if command == "input keyevent KEYCODE_WAKEUP":
             with open(os.path.join(HERE, "wakefulness"), "w") as file:
                 file.write("Awake")

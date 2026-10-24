@@ -160,6 +160,9 @@ class IPhone:
         self.on_status = on_status
         self.last_frame = 0.0
         self.dark_timer = 0
+        # Whether the picture showing is dark (the window's screen.is_dark): frames stopping
+        # alone may be a still screen, which must keep taking taps.
+        self.looks_dark: Callable[[], bool] | None = None
         self.shown_at: tuple[int, int] | None = None
         self.shown = FIRST_SHOWN
         self.awake = True
@@ -212,8 +215,14 @@ class IPhone:
 
     def wake(self):
         """Home lights a dark iPhone (and on a lit one only goes home; the side button would lock
-        it), so it's what a click on a dark screen presses."""
+        it), so it's what a click on a dark screen presses. It counts as awake straight away, so
+        the next press is a touch."""
         self._send({"op": "button", "name": "home"})
+        self.last_frame = time.monotonic()
+        if not self.awake:
+            self.awake = True
+            if self.on_awake:
+                self.on_awake(True)
 
     # A finger on the glass, live: down, moves, up.
     def press(self, x: int, y: int):
@@ -344,7 +353,8 @@ class IPhone:
         if self.stopped:
             self.dark_timer = 0
             return GLib.SOURCE_REMOVE
-        if self.awake and self.last_frame and time.monotonic() - self.last_frame > DARK_AFTER_S:
+        quiet = self.last_frame and time.monotonic() - self.last_frame > DARK_AFTER_S
+        if self.awake and quiet and self.looks_dark and self.looks_dark():
             self.awake = False
             if self.pressed:
                 self.release()
@@ -375,7 +385,7 @@ class IPhone:
 def plainly(why: str) -> str:
     """The helper's reasons, in the words a person needs: most mean the phone isn't reachable."""
     gone = ("No route to host", "adapter closed", "Connection refused", "timed out", "Network is unreachable",
-            "went to sleep")
+            "went to sleep", "device socket io failed")
     if any(word in why for word in gone):
         return "It went to sleep or left Wi-Fi. It shows here again once it's back: unlock it."
     return why

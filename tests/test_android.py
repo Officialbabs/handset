@@ -11,7 +11,8 @@ from gi.repository import GLib
 
 from handset import android
 from handset.android import (Android, Link, Touch, Video, down_events, even_size, find_serial, gesture_command,
-                             key_command, parse_awake, parse_devices, parse_rotation, parse_wm_size, shown_size,
+                             key_command, parse_awake, parse_devices, parse_locked, parse_rotation, parse_wm_size,
+                             shown_size,
                              stream_edge, text_command, to_natural, touch_device, up_events)
 from handset.gestures import Gesture
 
@@ -56,6 +57,13 @@ class AwakeTest(unittest.TestCase):
         self.assertFalse(parse_awake("  mWakefulness=Dozing"))
         self.assertFalse(parse_awake("mWakefulness=Asleep"))
         self.assertIsNone(parse_awake("mWakefulnessChanging=false"))
+
+
+class LockedTest(unittest.TestCase):
+    def test_lock_screen(self):
+        self.assertTrue(parse_locked("    isKeyguardShowing=true\n"))
+        self.assertFalse(parse_locked("isKeyguardShowing=false"))
+        self.assertIsNone(parse_locked("mWakefulness=Awake"))
 
 
 class TurningTest(unittest.TestCase):
@@ -245,7 +253,9 @@ class FakePhone(unittest.TestCase):
         android.ROTATION_POLL_S = 0.2
         try:
             phone.start()
-            spin(lambda: changes == [True])  # woken by Handset, and seen to be on
+            spin(lambda: changes == [True])  # woken by Handset, and counted on at once
+            # The wake key reaches the phone a moment later; only then does it go back to sleep.
+            spin(lambda: ["shell", "input keyevent KEYCODE_WAKEUP"] in self.logged("log.jsonl"))
             with open(os.path.join(self.tmp.name, "wakefulness"), "w") as file:
                 file.write("Asleep")
             spin(lambda: changes == [True, False])

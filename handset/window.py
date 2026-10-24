@@ -60,6 +60,7 @@ CSS = b"""
 .handset-ring { border: 3px solid var(--accent-bg-color); }
 .handset-asleep { background: alpha(black, 0.6); color: white; }
 .handset-asleep .title { font-weight: 700; font-size: 1.15em; }
+.handset-hidden { color: alpha(white, 0.85); font-weight: 600; }
 .handset-bezel { background: #101012; }
 .handset-grip { background: alpha(white, 0.32); border-radius: 3px; min-width: 44px; min-height: 5px; }
 .handset-window:not(.on-screen) .handset-bezel { background: none; }
@@ -202,6 +203,7 @@ class Window(Adw.ApplicationWindow):
         self.shown_at: tuple[int, int] | None = None
         self.resize_timer = 0
         self._take_size(wanted)
+        GLib.timeout_add(1000, self._check_hidden)
 
         provider = Gtk.CssProvider()
         provider.load_from_data(CSS)
@@ -241,8 +243,14 @@ class Window(Adw.ApplicationWindow):
         words.append(off)
         words.append(Gtk.Label(label="Click to wake it"))
         self.asleep.append(words)
+        # A locked phone's PIN pad shows black: the phone hides it from screen sharing.
+        self.hidden = Gtk.Label(label="The phone hides its PIN pad from screen sharing.\n"
+                                      "Type your PIN, then press Enter.",
+                                justify=Gtk.Justification.CENTER, wrap=True, can_target=False,
+                                visible=False, valign=Gtk.Align.CENTER, margin_start=16, margin_end=16)
+        self.hidden.add_css_class("handset-hidden")
         self.screen = Gtk.Overlay(child=self.picture, focusable=True)
-        for overlay in (self.dots, self.asleep, self.ring, self.ada_shown):
+        for overlay in (self.dots, self.asleep, self.hidden, self.ring, self.ada_shown):
             self.screen.add_overlay(overlay)
         self.frame = Gtk.AspectFrame(ratio=0.45, obey_child=False, child=self.screen)
 
@@ -487,6 +495,7 @@ class Window(Adw.ApplicationWindow):
             self.device = iphone.IPhone(link, self._frame, self._turned, self._touch_changed,
                                         self._video_ended, self._awake_changed,
                                         on_status=self._helper_status)
+            self.device.looks_dark = self.picture.is_dark
             self._turned()
             self.device.start()
             self._show_at()
@@ -750,6 +759,17 @@ class Window(Adw.ApplicationWindow):
             self.shown_at = (round(width * scale), round(height * scale))
             self._show_at()
         return GLib.SOURCE_REMOVE
+
+    def _check_hidden(self):
+        """The note on a locked phone's black PIN pad: shown while the phone is awake and locked
+        and its picture is black."""
+        device = self.device
+        hidden = bool(device and getattr(device, "locked", False) and device.awake
+                      and self.stack.get_visible_child_name() == "screen" and self.picture.is_dark())
+        if hidden != self.hidden.get_visible():
+            debug("PIN pad note", "shown" if hidden else "hidden")
+            self.hidden.set_visible(hidden)
+        return GLib.SOURCE_CONTINUE
 
     def _snapped(self, fit: Fit, x: int, y: int) -> tuple[int, int]:
         """A point of this press's path, moved as its start was onto the edge, kept on the screen."""

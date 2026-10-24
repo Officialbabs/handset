@@ -53,9 +53,13 @@ def stream_edge(monitor_pixels: int, natural: tuple[int, int]) -> int:
     edge = monitor_pixels * 2 // 8 * 8
     return 0 if edge <= 0 or edge >= max(natural) else edge
 # How often the screen's rotation, and whether it's on, are checked while it shows.
-ROTATION_POLL_S = 1.5
+ROTATION_POLL_S = 0.75
+# After Handset wakes the phone, a reading that it's still off is believed only this much later:
+# waking takes a moment, and meanwhile the person's next press must reach the phone.
+WAKING_S = 2.0
 # One look at the screen in one adb call: its rotation, and whether it's on.
-SCREEN_STATE = "dumpsys input | grep -m1 'Viewport INTERNAL'; dumpsys power | grep -m1 'mWakefulness='"
+SCREEN_STATE = ("dumpsys input | grep -m1 'Viewport INTERNAL'; dumpsys power | grep -m1 'mWakefulness='; "
+                "dumpsys window | grep -m1 'isKeyguardShowing='")
 
 
 def adb_binary() -> str | None:
@@ -130,6 +134,12 @@ def parse_rotation(text: str) -> int | None:
             if match and match[1] in _ROTATIONS:
                 return _ROTATIONS[match[1]]
     return None
+
+
+def parse_locked(text: str) -> bool | None:
+    """Whether the lock screen shows, from `dumpsys window` ("isKeyguardShowing=true")."""
+    match = re.search(r"isKeyguardShowing=(true|false)", text)
+    return match[1] == "true" if match else None
 
 
 def parse_awake(text: str) -> bool | None:
@@ -644,6 +654,8 @@ class Android:
         self.on_awake = on_awake
         self.rotation = link.rotation
         self.awake = link.awake
+        self.woken_at = 0.0
+        self.locked = False  # the lock screen shows (its PIN pad is hidden from screen sharing)
         self.video = Video(link.serial, link.natural, link.rotation, on_frame, on_ended)
         self.video.edge = MAX_EDGE if edge is None else edge
         self.touch = Touch(link.serial, link.natural, self._touch_ready, self._touch_failed)
@@ -665,7 +677,11 @@ class Android:
         threading.Thread(target=self._watch_screen, daemon=True).start()
 
     def wake(self):
+        """Wakes the screen, and counts it awake straight away, so the next press is a touch."""
         self.commands.run("input keyevent KEYCODE_WAKEUP")
+        self.woken_at = time.monotonic()
+        if not self.awake:
+            self._awake_changed(True)
 
     def show_at(self, width: int, height: int):
         """The screen shows this big in the window (the monitor's pixels)."""
@@ -747,8 +763,13 @@ class Android:
             if self.stopped:
                 return
             rotation, awake = parse_rotation(state), parse_awake(state)
+            locked = parse_locked(state)
+            if locked is not None:
+                self.locked = locked
             if rotation is not None and rotation != self.rotation:
                 GLib.idle_add(self._turned, rotation)
+            if awake is False and time.monotonic() - self.woken_at < WAKING_S:
+                continue  # still waking
             if awake is not None and awake != self.awake:
                 GLib.idle_add(self._awake_changed, awake)
 
