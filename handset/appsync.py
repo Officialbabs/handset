@@ -88,6 +88,15 @@ def notification_state_path() -> str:
     return os.path.join(config, "handset", "notifications.json")
 
 
+def known_iphones() -> set[str]:
+    """The Bluetooth addresses of the iPhones paired for their notifications."""
+    try:
+        with open(notification_state_path()) as file:
+            return set(json.load(file).get("iphones", []))
+    except (OSError, ValueError, AttributeError):
+        return set()
+
+
 def notifications_wanted() -> bool:
     """Handset's settings may say no ("phone_notifications": false)."""
     config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
@@ -128,7 +137,7 @@ class AppSync:
         self.desk.on_action = self._action
         from .ancs import Ancs
 
-        self.ancs = Ancs(self._iphone_note, self.desk.close, self._known_iphones, self._remember_iphone)
+        self.ancs = Ancs(self._iphone_note, self.desk.close, known_iphones, self._remember_iphone)
         self.ancs.start()
         folder = Gio.File.new_for_path(os.path.dirname(pair_request_path()))
         self.pair_monitor = folder.monitor_directory(Gio.FileMonitorFlags.NONE, None)
@@ -144,15 +153,8 @@ class AppSync:
             if self.ancs:
                 self.ancs.pair()
 
-    def _known_iphones(self) -> set[str]:
-        try:
-            with open(notification_state_path()) as file:
-                return set(json.load(file).get("iphones", []))
-        except (OSError, ValueError, AttributeError):
-            return set()
-
     def _remember_iphone(self, address: str):
-        known = self._known_iphones()
+        known = known_iphones()
         if address and address not in known:
             os.makedirs(os.path.dirname(notification_state_path()), exist_ok=True)
             GLib.file_set_contents(notification_state_path(),

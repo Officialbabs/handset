@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from queue import Queue
 
+import gi
 from gi.repository import GLib  # noqa: E402
 
 from .gestures import Gesture  # noqa: E402
@@ -1519,3 +1520,139 @@ class AdbFiles:
 
     def stop(self):
         pass
+
+
+# ---- The phone's sound, played here -----------------------------------------------------------
+
+OPUS = 0x6F707573  # "opus"
+AUDIO_DISABLED, AUDIO_FAILED = 0, 1  # the codec ids the server sends when it can't capture
+PACKET_CONFIG = 1 << 63
+
+
+class SoundLink:
+    """The phone's sound played on this computer: scrcpy's server capturing the phone's whole
+    audio output (which silences the phone itself while it does) as Opus, decoded here and played
+    through the computer's speakers. Stopped, the phone plays its own sound again. Android 11 and
+    later. `on_ended(why)` on GLib's main loop if it can't go on."""
+
+    def __init__(self, serial: str, on_ended: Callable[[str], None] | None = None):
+        self.serial = serial
+        self.on_ended = on_ended
+        self.process: subprocess.Popen | None = None
+        self.sock: socket.socket | None = None
+        self.port: int | None = None
+        self.pipeline = None
+        self.source = None
+        self.stopped = False
+        self.packets = 0
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self.stopped = True
+        sock, self.sock = self.sock, None
+        if sock:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        process, self.process = self.process, None
+        if process and process.poll() is None:
+            process.kill()
+            process.wait()
+        if self.port:
+            try:
+                adb(self.serial, "forward", "--remove", f"tcp:{self.port}", timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        pipeline, self.pipeline, self.source = self.pipeline, None, None
+        if pipeline:
+            from gi.repository import Gst
+
+            pipeline.set_state(Gst.State.NULL)
+
+    def _ended(self, why: str):
+        debug("the phone's sound here stopped:", why)
+        if not self.stopped and self.on_ended:
+            self.on_ended(why)
+        return GLib.SOURCE_REMOVE
+
+    def _player(self):
+        """Opus packets in, the computer's speakers out (the desktop's own choice of them)."""
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+
+        Gst.init(None)
+        pipeline = Gst.parse_launch(
+            "appsrc name=source is-live=true do-timestamp=true format=time "
+            'caps="audio/x-opus,channel-mapping-family=(int)0,rate=(int)48000,channels=(int)2" ! '
+            "queue max-size-time=200000000 leaky=downstream ! opusdec plc=true ! audioconvert ! audioresample ! "
+            "autoaudiosink sync=false")
+        pipeline.set_state(Gst.State.PLAYING)
+        return pipeline, pipeline.get_by_name("source")
+
+    def _run(self):
+        from gi.repository import Gst
+
+        version = scrcpy_version()
+        if not version:
+            GLib.idle_add(self._ended, "Install the scrcpy package to play the phone's sound here.")
+            return
+        scid = f"{secrets.randbits(31):08x}"
+        try:
+            adb(self.serial, "push", SCRCPY_SERVER, PHONE_SERVER, timeout=30)
+            self.port = int(adb(self.serial, "forward", "tcp:0", f"localabstract:scrcpy_{scid}").strip())
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            GLib.idle_add(self._ended, f"The phone's sound didn't start ({error}).")
+            return
+        options = (f"scid={scid} log_level=warn tunnel_forward=true video=false audio=true control=false "
+                   "audio_codec=opus audio_source=output power_on=false cleanup=false send_device_meta=false "
+                   "send_dummy_byte=true send_codec_meta=true send_frame_meta=true")
+        command = adb_command(self.serial, "shell", f"CLASSPATH={PHONE_SERVER} app_process / "
+                                                    f"com.genymobile.scrcpy.Server {version} {options}")
+        try:
+            self.process = subprocess.Popen(command, stdout=TOOL_ERRORS, stderr=TOOL_ERRORS)
+        except OSError as error:
+            GLib.idle_add(self._ended, str(error))
+            return
+        sock = None
+        for _ in range(60):  # the audio socket is the first here: it sends the one byte
+            if self.stopped or self.process.poll() is not None:
+                break
+            try:
+                candidate = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+                if candidate.recv(1) == b"\0":
+                    sock = candidate
+                    break
+                candidate.close()
+            except OSError:
+                pass
+            time.sleep(0.1)
+        if not sock:
+            if not self.stopped:
+                GLib.idle_add(self._ended, "scrcpy's server didn't answer.")
+            return
+        sock.settimeout(None)
+        self.sock = sock
+        try:
+            (codec,) = struct.unpack(">I", read_exactly(sock, 4))
+            if codec in (AUDIO_DISABLED, AUDIO_FAILED) or codec != OPUS:
+                GLib.idle_add(self._ended, "The phone didn't let its sound be shared (it needs Android 11 or later).")
+                return
+            self.pipeline, self.source = self._player()
+            debug("the phone's sound plays here")
+            while not self.stopped:
+                pts_flags, size = struct.unpack(">QI", read_exactly(sock, 12))
+                data = read_exactly(sock, size)
+                if pts_flags & PACKET_CONFIG:
+                    continue  # the Opus header: the caps say as much
+                source = self.source
+                if source:
+                    source.emit("push-buffer", Gst.Buffer.new_wrapped(data))
+                    self.packets += 1
+        except (OSError, ConnectionError):
+            pass
+        if not self.stopped:
+            GLib.idle_add(self._ended, "The phone's sound stopped.")

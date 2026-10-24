@@ -16,12 +16,12 @@ class ChooseTest(unittest.TestCase):
         self.assertIsNone(choose([], None))
 
     def test_asked_for_by_id_or_name(self):
-        both = phones(phone(), phone(id="IPH", name="Babs iPhone", platform="ios"))
-        self.assertEqual(choose(both, "IPH").name, "Babs iPhone")
-        self.assertEqual(choose(both, "Babs iPhone").id, "IPH")
+        both = phones(phone(), phone(id="IPH", name="Test iPhone", platform="ios"))
+        self.assertEqual(choose(both, "IPH").name, "Test iPhone")
+        self.assertEqual(choose(both, "Test iPhone").id, "IPH")
 
     def test_a_connected_android_first(self):
-        listed = phones(phone(id="IPH", name="Babs iPhone", platform="ios", wifi=True),
+        listed = phones(phone(id="IPH", name="Test iPhone", platform="ios", wifi=True),
                         phone(id="OLD", name="Old Pixel"), phone(id="P7", name="Pixel 7", usb=True))
         self.assertEqual(choose(listed, None).id, "P7")
         self.assertEqual(choose(listed, "gone").id, "P7")
@@ -32,7 +32,7 @@ class ChooseTest(unittest.TestCase):
 
 
 class TwoWindowsTest(unittest.TestCase):
-    PIXEL, IPHONE = phone(id="P7", name="Pixel 7", usb=True), phone(id="IPH", name="Babs iPhone", platform="ios")
+    PIXEL, IPHONE = phone(id="P7", name="Pixel 7", usb=True), phone(id="IPH", name="Test iPhone", platform="ios")
 
     def test_a_second_window_takes_the_other_phone(self):
         both = phones(self.PIXEL, self.IPHONE)

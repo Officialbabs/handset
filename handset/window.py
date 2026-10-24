@@ -394,6 +394,9 @@ class Window(Adw.ApplicationWindow):
         self._action("next-phone", lambda _a, _p: self._next_phone())
         self._action("phone-apps", lambda _a, _p: self.show_phone_apps())
         self._action("phone-files", lambda _a, _p: self.show_phone_files())
+        sound_here = Gio.SimpleAction.new_stateful("sound-here", None, GLib.Variant("b", False))
+        sound_here.connect("change-state", self._sound_here)
+        self.add_action(sound_here)
         self._action("pair-iphone", lambda _a, _p: self._pair_iphone())
         self._action("pin", lambda _a, _p: self._pin_this(True))
         self._action("unpin", lambda _a, _p: self._pin_this(False))
@@ -416,15 +419,19 @@ class Window(Adw.ApplicationWindow):
         """Right-click on the bezel: the phone's apps (or, for an app's window, its pin)."""
         from . import apps
 
+        sound = self.get_application().sound
+        self.sound_switched(bool(sound and self.phone and sound.is_on(self.phone.id)))
         menu = Gio.Menu()
         if self.phone_app:
             pinned = apps.is_pinned(self.phone_app.phone_id, self.phone_app.app)
             menu.append("Unpin from the Dock" if pinned else "Pin to the Dock", "win.unpin" if pinned else "win.pin")
             menu.append("Show the Whole Phone", "win.whole-phone")
             menu.append("Phone Files…", "win.phone-files")
+            menu.append("Play Sound Here", "win.sound-here")
         else:
             menu.append("Phone Apps…", "win.phone-apps")
             menu.append("Phone Files…", "win.phone-files")
+            menu.append("Play Sound Here", "win.sound-here")
             menu.append("Pair an iPhone for Notifications…", "win.pair-iphone")
             menu.append("New Window", "app.new-window")
         popover = Gtk.PopoverMenu(menu_model=menu, has_arrow=False, halign=Gtk.Align.START)
@@ -672,6 +679,7 @@ class Window(Adw.ApplicationWindow):
             self._show_at()
             self._show_status("phone-symbolic", f"Connecting to {name}…", "")
             self._expect_picture(IPHONE_PICTURE_WAIT_MS)
+            self._resume_sound()
             return GLib.SOURCE_REMOVE
         # The phone's own size when the GPU decodes; otherwise as sharp as the monitor can show
         # it and no more, since decoding on the CPU grows with the size.
@@ -683,6 +691,7 @@ class Window(Adw.ApplicationWindow):
             edge = android.stream_edge(round(min(self._monitor()) * self._monitor_scale()), link.natural)
         debug("asking the phone for video", edge or "at its own size")
         self._link_clipboard(lambda on_text: android.ClipboardLink(link.serial, on_text))
+        GLib.idle_add(self._resume_sound)
         if self.phone_app:
             self.device = android.AppScreen(link, self.phone_app.app, self._frame, self._turned,
                                             self._touch_changed, self._video_ended, self._awake_changed)
@@ -756,6 +765,27 @@ class Window(Adw.ApplicationWindow):
         from .filesdialog import FilesDialog
 
         FilesDialog(self, self.phone, self._files()).present(self)
+
+    def _resume_sound(self):
+        sound = self.get_application().sound
+        if sound:
+            sound.resume(self)
+        return GLib.SOURCE_REMOVE
+
+    def _sound_here(self, action, value):
+        """Play Sound Here, switched: the phone's sound comes here, or goes back to the phone."""
+        action.set_state(value)
+        sound = self.get_application().sound
+        if sound and self.phone:
+            sound.switch(self, value.get_boolean())
+            self.say(f"{self.phone.name}'s sound plays here" if value.get_boolean()
+                     else f"{self.phone.name}'s sound plays on the phone")
+
+    def sound_switched(self, on: bool):
+        """The switch shown as it is (it went off by itself, say)."""
+        action = self.lookup_action("sound-here")
+        if action and action.get_state().get_boolean() != on:
+            action.set_state(GLib.Variant("b", on))
 
     def _link_clipboard(self, make_link):
         """The clipboard shared with this window's phone (one link per phone, however many
@@ -915,8 +945,11 @@ class Window(Adw.ApplicationWindow):
         self._remember_size()
         app = self.get_application()
         app.remember_windows(closing=self)
+        others = {w.phone.id for w in app.handset_windows() if w.phone and w is not self}
         if app.clipboard:
-            app.clipboard.release({w.phone.id for w in app.handset_windows() if w.phone and w is not self})
+            app.clipboard.release(others)
+        if app.sound:
+            app.sound.release(others)
         self.watch.stop()
         self._close_phone()
         return False

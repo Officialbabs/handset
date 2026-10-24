@@ -57,18 +57,24 @@ class App(Adw.Application):
         self.turning_off = False
         self.connect("startup", self._started)
         self.clipboard = None  # the clipboard shared with the phones (clipboard.py), once started
+        self.sound = None  # each phone's sound, here or on it (sound.py)
         self.connect("shutdown", self._shutdown)
 
     def _shutdown(self, _app):
         say_on(False)
         if self.clipboard:
             self.clipboard.stop()
+        if self.sound:
+            self.sound.stop()
 
     def _started(self, _app):
         from .appsync import start_if_needed
         from .clipboard import ClipboardSync
 
         self.clipboard = ClipboardSync(self)
+        from .sound import SoundSwitch
+
+        self.sound = SoundSwitch(self)
         start_if_needed()  # the phones' apps among the desk's, whether or not it ran at sign-in
         action = Gio.SimpleAction.new("new-window", None)
         action.connect("activate", lambda *_a: self.open_window(new=True))

@@ -74,7 +74,7 @@ class StateTest(unittest.TestCase):
         self.assertEqual(status_line(Phone.from_state(phone(wifi=True))), "Connected over Wi-Fi")
         self.assertEqual(status_line(Phone.from_state(phone())), "Not connected")
         self.assertEqual(status_line(Phone.from_state(phone(problem="It's locked"))), "It's locked")
-        iphone = Phone.from_state(phone(platform="ios", name="Babs iPhone"))
+        iphone = Phone.from_state(phone(platform="ios", name="Test iPhone"))
         self.assertEqual(iphone.platform, "ios")
 
 

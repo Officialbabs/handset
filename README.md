@@ -89,6 +89,20 @@ desk isn't possible, and clearing one here leaves it on the phone.
   photos in DCIM, Downloads, recordings) through Handset's helper (Apple's file service, AFC).
   Photos copied into an iPhone's DCIM don't join its Photos library.
 
+## The phone's sound here
+
+**Play Sound Here** (right-click a phone window's bezel) plays the phone's sound on this computer
+instead of on the phone, until it's switched off; it's remembered, so it comes back with the
+phone's window.
+
+- **Android** sends it over its adb link (scrcpy's server, Android 11 and later): its music,
+  videos and games, while the phone itself goes quiet. Its ringtone and notification sounds stay
+  on the phone.
+- **An iPhone** sends it over Bluetooth, with this computer as its headphones and handsfree:
+  its sound, and its calls when there's one (heard here, answered through this computer's
+  microphone). Pair it with the computer once in Settings › Bluetooth on the iPhone (as for its
+  notifications).
+
 ## How it works
 
 On an Android phone, Handset uses the same adb connection Ada set up, by cable or over Wi-Fi,
