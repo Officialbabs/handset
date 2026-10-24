@@ -78,7 +78,7 @@ CSS = b"""
 .handset-grip { background: alpha(white, 0.32); border-radius: 3px; min-width: 44px; min-height: 5px; }
 .handset-window:not(.on-screen) .handset-bezel { background: none; }
 .handset-window:not(.on-screen) .handset-grip { background: alpha(currentColor, 0.2); }
-.handset-bezel-button { min-width: 18px; min-height: 18px; padding: 0; margin: 0 4px; border-radius: 999px;
+.handset-bezel-button { min-width: 18px; min-height: 18px; padding: 0; margin: 0 2px; border-radius: 999px;
                         background: none; box-shadow: none; color: alpha(white, 0.5); -gtk-icon-size: 12px; }
 .handset-bezel-button:hover { background: alpha(white, 0.14); color: white; }
 .handset-bezel-button.close:hover { background: #e01b24; color: white; }
@@ -328,10 +328,14 @@ class Window(Adw.ApplicationWindow):
         grip.add_css_class("handset-grip")
         top = grip
         if self.phone_app:
-            # An app's window: the whole phone on the left, closing on the right, quiet until hovered.
+            # An app's window: the whole phone on the left, minimizing and closing on the right,
+            # quiet until hovered.
             top = Gtk.CenterBox(center_widget=grip)
             top.set_start_widget(self._bezel_button("phone-symbolic", "Show the whole phone", "win.whole-phone"))
-            top.set_end_widget(self._bezel_button("window-close-symbolic", "Close", "window.close", "close"))
+            ends = Gtk.Box()
+            ends.append(self._bezel_button("window-minimize-symbolic", "Minimize", "window.minimize"))
+            ends.append(self._bezel_button("window-close-symbolic", "Close", "window.close", "close"))
+            top.set_end_widget(ends)
         self.bezel = Gtk.WindowHandle(child=top, height_request=BEZEL,
                                       tooltip_text="Drag to move · Right-click for more")
         self.bezel.add_css_class("handset-bezel")
