@@ -1,0 +1,20 @@
+[package]
+name = "handset-ios"
+version = "0.1.0"
+edition = "2024"
+description = "Handset's iPhone helper: the phone's screen as HEVC on stdout, touches and keys on stdin"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+# The crate Ada's phone service is built on, at the same version, with ring for TLS: the default,
+# aws-lc, needs cmake to build.
+idevice = { version = "=0.1.68", default-features = false, features = ["ring", "remote_pairing", "tunnel_tcp_stack", "rsd", "display_stream"] }
+mdns-sd = "0.19"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "io-std", "signal", "sync"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+strip = true
+lto = "thin"

@@ -1,0 +1,23 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Handset
+GenericName=Phone Mirror
+Comment=Your phone's screen in a window, shared with Ada
+Exec=@EXEC@
+Icon=io.github.Officialbabs.Handset
+Terminal=false
+Categories=Utility;
+Keywords=phone;mirror;android;iphone;screen;pixel;
+StartupWMClass=io.github.Officialbabs.Handset
+StartupNotify=true
+SingleMainWindow=true
+Actions=new-window;off;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=@EXEC@ --new-window
+
+[Desktop Action off]
+Name=Turn Off
+Exec=@EXEC@ --off

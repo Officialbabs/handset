@@ -1,0 +1,17 @@
+#!/usr/bin/python3
+"""Run Handset.
+
+A Python script rather than a shell wrapper, so the process is called "handset" in task
+managers instead of "python3". install.sh gives the installed copy the Python that has PyGObject
+on its first line, and this checkout in HANDSET_DIR.
+"""
+import os
+import sys
+
+HANDSET_DIR = ""  # empty: the checkout this script is in
+
+sys.path.insert(0, HANDSET_DIR or os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+from handset.__main__ import main  # noqa: E402
+
+sys.exit(main(sys.argv))

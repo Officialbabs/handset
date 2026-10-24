@@ -1,0 +1,450 @@
+//! Handset's iPhone helper: it reaches the iPhone over Wi-Fi with the pairing Ada's desktop
+//! already made, the way Ada's phone service does (Apple's remote pairing, a tunnel in user
+//! space, CoreDevice's services), and then:
+//!
+//! - writes the phone's screen to standard output, as H.265 (Annex B) from the phone's own
+//!   screen-sharing stream;
+//! - reads commands from standard input, one JSON object per line: {"op":"down"|"move","x","y"}
+//!   with x and y from 0 to 65535 across the screen, {"op":"up"}, {"op":"button","name"} (home,
+//!   lock, volume_up, volume_down), {"op":"key","name"} and {"op":"text","text"};
+//! - says what it's doing on standard error, one JSON object per line: {"event":"status"},
+//!   {"event":"video","codec":"h265"}, {"event":"input","ready":true}, {"event":"error"}.
+//!
+//! The end of standard input stops the phone's stream and ends the helper.
+//!
+//!     handset-ios stream --pairing FILE --udid UDID [--address IP] [--port PORT] [--verbose]
+
+use std::error::Error;
+use std::io::Write;
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
+
+use idevice::RsdService;
+use idevice::core_device::{
+    CallInfoBlob, DisplayServiceClient, HevcDepacketizer, RtpPacket, build_screen_audio_offer,
+    build_screen_video_offer, build_start_audio_parameters, build_start_video_parameters,
+};
+use idevice::remote_pairing::{RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native};
+use idevice::rsd::RsdHandshake;
+use idevice::services::core_device::display_stream::{build_keyframe_request, build_liveness, is_rtcp};
+use idevice::services::core_device::hid::{
+    ButtonState, IndigoHidClient, TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE, UniversalHidServiceClient,
+};
+use idevice::tcp::adapter::Adapter;
+use serde_json::{Value, json};
+use tokio::io::AsyncBufReadExt;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+
+type Fallible<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+/// The phone sends its screen from this port, and its sound (needed to open the session) from
+/// the one before.
+const VIDEO_PORT: u16 = 50001;
+const AUDIO_PORT: u16 = 50000;
+/// The phone takes touches a moment after its screen starts being sent.
+const INPUT_AFTER: Duration = Duration::from_millis(400);
+/// How long to look for the phone on the network.
+const BROWSE_FOR: Duration = Duration::from_secs(12);
+/// How long reaching the phone may take, once found: a sleeping phone doesn't answer at all,
+/// and TCP alone would wait minutes to say so.
+const REACH_FOR: Duration = Duration::from_secs(20);
+/// Where iPhones' remote pairing listens, when looking it up finds nothing (as Ada's desktop
+/// has always found it).
+const PAIRING_PORT: u16 = 49152;
+/// The phone's stream going this quiet means someone stopped it: the phone has one screen
+/// stream for everyone, and stopping it stops them all (Ada's desktop does when it gets the phone
+/// ready for her). It's started again.
+const QUIET: Duration = Duration::from_secs(5);
+
+/// One line on standard error, for Handset.
+fn say(event: Value) {
+    eprintln!("{event}");
+}
+
+fn status(text: &str) {
+    say(json!({"event": "status", "text": text}));
+}
+
+struct Options {
+    pairing: String,
+    udid: String,
+    address: Option<IpAddr>,
+    port: Option<u16>,
+    verbose: bool,
+}
+
+fn options() -> Result<Options, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) != Some("stream") {
+        return Err("usage: handset-ios stream --pairing FILE --udid UDID [--address IP] [--port PORT]".into());
+    }
+    let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    Ok(Options {
+        pairing: value("--pairing").ok_or("--pairing FILE is needed")?,
+        udid: value("--udid").ok_or("--udid UDID is needed")?,
+        address: value("--address").map(|a| a.parse().map_err(|_| format!("{a} isn't an address"))).transpose()?,
+        port: value("--port").map(|p| p.parse().map_err(|_| format!("{p} isn't a port"))).transpose()?,
+        verbose: args.iter().any(|a| a == "--verbose"),
+    })
+}
+
+/// The phone's remote-pairing service on the network: its address and port. Phones advertise it
+/// as _remotepairing._tcp; the port changes, so it's looked up every time.
+fn browse(address: Option<IpAddr>, verbose: bool) -> Fallible<(IpAddr, u16)> {
+    let daemon = mdns_sd::ServiceDaemon::new()?;
+    let events = daemon.browse("_remotepairing._tcp.local.")?;
+    let until = Instant::now() + BROWSE_FOR;
+    let mut found: Vec<(IpAddr, u16)> = Vec::new();
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        let Ok(event) = events.recv_timeout(left) else { break };
+        if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
+            let port = info.get_port();
+            for ip in info.get_addresses() {
+                let ip: IpAddr = ip.to_ip_addr();
+                if verbose {
+                    eprintln!("found {} at {ip}:{port}", info.get_fullname());
+                }
+                if address.is_none_or(|wanted| wanted == ip) {
+                    found.push((ip, port));
+                }
+            }
+            // The phone Ada knows by its address: that's it. Without one, take a moment for
+            // others to answer, so two phones are never mixed up.
+            if address.is_some() && !found.is_empty() {
+                break;
+            }
+        }
+    }
+    let _ = daemon.shutdown();
+    found.sort();
+    found.dedup();
+    match found.as_slice() {
+        [one] => Ok(*one),
+        [] => Err("The iPhone isn't on this Wi-Fi: unlock it and keep it near.".into()),
+        _ => Err("More than one iPhone is here: Handset needs the address Ada knows.".into()),
+    }
+}
+
+/// A key on a US keyboard, as a HID usage: (usage, with Shift).
+fn usage(c: char) -> Option<(u64, bool)> {
+    const SHIFTED: &str = "!@#$%^&*()";
+    Some(match c {
+        'a'..='z' => (0x04 + (c as u64 - 'a' as u64), false),
+        'A'..='Z' => (0x04 + (c as u64 - 'A' as u64), true),
+        '1'..='9' => (0x1E + (c as u64 - '1' as u64), false),
+        '0' => (0x27, false),
+        '\n' => (0x28, false),
+        '\t' => (0x2B, false),
+        ' ' => (0x2C, false),
+        '-' => (0x2D, false),
+        '_' => (0x2D, true),
+        '=' => (0x2E, false),
+        '+' => (0x2E, true),
+        '[' => (0x2F, false),
+        '{' => (0x2F, true),
+        ']' => (0x30, false),
+        '}' => (0x30, true),
+        '\\' => (0x31, false),
+        '|' => (0x31, true),
+        ';' => (0x33, false),
+        ':' => (0x33, true),
+        '\'' => (0x34, false),
+        '"' => (0x34, true),
+        '`' => (0x35, false),
+        '~' => (0x35, true),
+        ',' => (0x36, false),
+        '<' => (0x36, true),
+        '.' => (0x37, false),
+        '>' => (0x37, true),
+        '/' => (0x38, false),
+        '?' => (0x38, true),
+        _ => {
+            let shifted = SHIFTED.find(c)?;
+            // ! is Shift+1 … ( is Shift+9, ) is Shift+0.
+            let digit = if shifted == 9 { 0x27 } else { 0x1E + shifted as u64 };
+            (digit, true)
+        }
+    })
+}
+
+/// A named key, as a HID usage on the keyboard page.
+fn key_usage(name: &str) -> Option<u64> {
+    Some(match name {
+        "enter" => 0x28,
+        "escape" => 0x29,
+        "delete" => 0x2A,
+        "tab" => 0x2B,
+        "forward_delete" => 0x4C,
+        "right" => 0x4F,
+        "left" => 0x50,
+        "down" => 0x51,
+        "up" => 0x52,
+        _ => return None,
+    })
+}
+
+/// A button, as (usage on the consumer page, how long it's held).
+fn button_usage(name: &str) -> Option<(u64, u64)> {
+    Some(match name {
+        "home" => (0x40, 80),
+        "lock" => (0x30, 200),
+        "volume_up" => (0xE9, 80),
+        "volume_down" => (0xEA, 80),
+        _ => return None,
+    })
+}
+
+/// Commands from Handset, carried out on the phone in order.
+async fn work_input(
+    mut touch: UniversalHidServiceClient<Box<dyn idevice::ReadWrite>>,
+    mut keys: IndigoHidClient<Box<dyn idevice::ReadWrite>>,
+    mut commands: mpsc::Receiver<Value>,
+) {
+    let (mut last_x, mut last_y) = (0u16, 0u16);
+    let at = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0).min(65535) as u16;
+    while let Some(command) = commands.recv().await {
+        let result: Result<(), idevice::IdeviceError> = async {
+            match command.get("op").and_then(Value::as_str).unwrap_or("") {
+                "down" | "move" => {
+                    (last_x, last_y) = (at(&command, "x"), at(&command, "y"));
+                    touch.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, last_x, last_y, None).await?;
+                }
+                "up" => touch.send_touchscreen(TOUCHSCREEN_STATE_RELEASE, last_x, last_y, None).await?,
+                "button" => {
+                    if let Some((code, hold)) = command.get("name").and_then(Value::as_str).and_then(button_usage) {
+                        keys.send_button(0x0C, code, ButtonState::Down).await?;
+                        tokio::time::sleep(Duration::from_millis(hold)).await;
+                        keys.send_button(0x0C, code, ButtonState::Up).await?;
+                    }
+                }
+                "key" => {
+                    if let Some(code) = command.get("name").and_then(Value::as_str).and_then(key_usage) {
+                        keys.send_keyboard(code, ButtonState::Down).await?;
+                        keys.send_keyboard(code, ButtonState::Up).await?;
+                    }
+                }
+                "text" => {
+                    let text = command.get("text").and_then(Value::as_str).unwrap_or("");
+                    for (code, shift) in text.chars().filter_map(usage) {
+                        if shift {
+                            keys.send_keyboard(0xE1, ButtonState::Down).await?;
+                        }
+                        keys.send_keyboard(code, ButtonState::Down).await?;
+                        keys.send_keyboard(code, ButtonState::Up).await?;
+                        if shift {
+                            keys.send_keyboard(0xE1, ButtonState::Up).await?;
+                        }
+                        tokio::time::sleep(Duration::from_millis(12)).await;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            eprintln!("input: {error}");
+        }
+    }
+}
+
+async fn stream(options: Options) -> Fallible<()> {
+    status(&format!("Looking for {} on Wi-Fi", "the iPhone"));
+    let (ip, port) = match (options.address, options.port) {
+        (Some(ip), Some(port)) => (ip, port),
+        (address, _) => {
+            let verbose = options.verbose;
+            match tokio::task::spawn_blocking(move || browse(address, verbose)).await? {
+                Ok(found) => found,
+                Err(_) if address.is_some() => (address.unwrap(), PAIRING_PORT),
+                Err(why) => return Err(why),
+            }
+        }
+    };
+    if options.verbose {
+        eprintln!("phone {} at {ip}:{port}", options.udid);
+    }
+
+    status("Connecting over Wi-Fi");
+    let (mut adapter, mut handshake) = tokio::time::timeout(REACH_FOR, reach(ip, port, &options.pairing))
+        .await
+        .map_err(|_| "The iPhone went to sleep or left Wi-Fi: it didn't answer.")??;
+    stream_screen(options, &mut adapter, &mut handshake).await
+}
+
+/// The phone's developer services, reached: the pairing Ada's desktop made, checked again (never
+/// made anew here: that needs the person at the phone, and Ada's own card), then a tunnel with
+/// its own TCP in user space, and the services' handshake.
+async fn reach(ip: IpAddr, port: u16, pairing: &str) -> Fallible<(idevice::tcp::handle::AdapterHandle, RsdHandshake)> {
+    let mut pairing = RpPairingFile::read_from_file(pairing).await?;
+    let socket = RpPairingSocket::new(TcpStream::connect((ip, port)).await?);
+    let mut remote = RemotePairingClient::new(socket, "handset");
+    remote
+        .connect(&mut pairing, || async { String::new() })
+        .await
+        .map_err(|e| format!("The iPhone didn't accept this computer ({e}): set it up with Ada again."))?;
+
+    // A tunnel to the phone's developer services, with its own TCP in user space.
+    let tunnel_port = remote.create_tcp_listener().await?;
+    let tunnel = connect_tls_psk_tunnel_native(TcpStream::connect((ip, tunnel_port)).await?, remote.encryption_key()).await?;
+    let host: IpAddr = tunnel.info.client_address.parse()?;
+    let peer: IpAddr = tunnel.info.server_address.parse()?;
+    let rsd_port = tunnel.info.server_rsd_port;
+    let mut adapter = Adapter::new(Box::new(tunnel.into_inner()), host, peer).to_async_handle();
+    let handshake = RsdHandshake::new(adapter.connect(rsd_port).await?).await?;
+    Ok((adapter, handshake))
+}
+
+async fn stream_screen(
+    options: Options,
+    adapter: &mut idevice::tcp::handle::AdapterHandle,
+    handshake: &mut RsdHandshake,
+) -> Fallible<()> {
+
+    // The phone's screen, as its screen-sharing stream: sound first (it opens the session),
+    // then the picture, in one session.
+    status("Starting the iPhone's screen");
+    let mut display = DisplayServiceClient::connect_rsd(&mut *adapter, &mut *handshake)
+        .await
+        .map_err(|e| format!("The iPhone's screen sharing isn't there ({e}): turn on Developer Mode."))?;
+    let audio = adapter.bind_udp(0).await?;
+    let video = adapter.bind_udp(0).await?;
+    let (ours, theirs) = (adapter.host_ip().to_string(), adapter.peer_ip().to_string());
+    let call = CallInfoBlob {
+        call_id: 0,
+        client_version: 1,
+        device_type: "Mac17,7".into(),
+        framework_version: "2205.3.1".into(),
+        os_version: "25F71".into(),
+        device_name: None,
+        audio_device_uid: None,
+    };
+    let our_ssrc = uuid::Uuid::new_v4().as_u128() as u32;
+    let (audio_port, video_port) = (audio.local_port(), video.local_port());
+    start_screen(&mut display, &call, (&ours, audio_port, video_port), &theirs, our_ssrc).await?;
+    say(json!({"event": "video", "codec": "h265"}));
+
+    // Touches and keys, once the phone takes them.
+    tokio::time::sleep(INPUT_AFTER).await;
+    let (send, commands) = mpsc::channel::<Value>(256);
+    match (
+        UniversalHidServiceClient::connect_rsd(&mut *adapter, &mut *handshake).await,
+        IndigoHidClient::connect_rsd(&mut *adapter, &mut *handshake).await,
+    ) {
+        (Ok(touch), Ok(keys)) => {
+            tokio::spawn(work_input(touch, keys, commands));
+            say(json!({"event": "input", "ready": true}));
+        }
+        (touch, keys) => {
+            let why = touch.err().or(keys.err()).map(|e| e.to_string()).unwrap_or_default();
+            eprintln!("no input: {why}");
+            say(json!({"event": "input", "ready": false}));
+        }
+    }
+
+    // Handset's commands, until it closes standard input.
+    let (closed_send, mut closed) = mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(command) = serde_json::from_str::<Value>(&line) {
+                let _ = send.send(command).await;
+            }
+        }
+        let _ = closed_send.send(()).await;
+    });
+
+    // The picture: RTP from the phone, its frames out as they come. A keyframe is asked for
+    // when the first packet comes, so the decoder can start, and the phone hears regularly that
+    // someone's watching.
+    let mut frames = HevcDepacketizer::new();
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    let (mut media_ssrc, mut fir) = (0u32, 0u8);
+    let mut alive = tokio::time::interval(Duration::from_secs(1));
+    let mut heard = Instant::now();
+    let mut ended = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    loop {
+        tokio::select! {
+            packet = video.recv() => {
+                let datagram = packet?;
+                heard = Instant::now();
+                if is_rtcp(&datagram.data) {
+                    continue;
+                }
+                let Some(rtp) = RtpPacket::parse(&datagram.data) else { continue };
+                if media_ssrc == 0 {
+                    media_ssrc = rtp.ssrc;
+                    let request = build_keyframe_request(our_ssrc, "handset@desk", media_ssrc, &[], fir);
+                    fir = fir.wrapping_add(1);
+                    let _ = video.send_to(datagram.source_port, request).await;
+                }
+                frames.push(rtp.sequence_number, rtp.timestamp, rtp.payload);
+                let unit = frames.take_output();
+                if !unit.is_empty() && out.write_all(&unit).and_then(|_| out.flush()).is_err() {
+                    break; // Handset stopped reading
+                }
+            }
+            _ = alive.tick() => {
+                if media_ssrc != 0 {
+                    let _ = video.send_to(VIDEO_PORT, build_liveness(our_ssrc, "handset@desk", &[])).await;
+                }
+                if heard.elapsed() > QUIET {
+                    if options.verbose {
+                        eprintln!("the phone's stream went quiet: starting it again");
+                    }
+                    heard = Instant::now();
+                    media_ssrc = 0; // and a keyframe is asked for again
+                    if let Err(why) = start_screen(&mut display, &call, (&ours, audio_port, video_port), &theirs, our_ssrc).await {
+                        // The connection itself is gone (the phone slept, or left Wi-Fi): Handset
+                        // starts over, with a new one.
+                        eprintln!("starting the stream again: {why}");
+                        return Err("The iPhone went to sleep or left Wi-Fi.".into());
+                    }
+                }
+            }
+            _ = closed.recv() => break,
+            _ = ended.recv() => break,
+        }
+    }
+    // No stop_media_stream: it stops every stream the phone has (stopAll), Ada's too, and her
+    // touches with it. Closing the tunnel ends this one.
+    Ok(())
+}
+
+/// Starts the phone's screen stream to our two ports: sound first (it opens the session), then
+/// the picture, in one session.
+async fn start_screen(
+    display: &mut DisplayServiceClient<Box<dyn idevice::ReadWrite>>,
+    call: &CallInfoBlob,
+    (ours, audio_port, video_port): (&str, u16, u16),
+    theirs: &str,
+    our_ssrc: u32,
+) -> Fallible<()> {
+    let session = uuid::Uuid::new_v4();
+    let call_id = || uuid::Uuid::new_v4().to_string().to_uppercase();
+    let offer = build_screen_audio_offer(&call_id(), call)?;
+    display
+        .start_media_stream(build_start_audio_parameters(ours, audio_port, theirs, AUDIO_PORT, offer, 140, session))
+        .await?;
+    let offer = build_screen_video_offer(&call_id(), call, our_ssrc)?;
+    display
+        .start_media_stream(build_start_video_parameters(ours, video_port, theirs, VIDEO_PORT, offer, 140, 1, session))
+        .await?;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    let options = match options() {
+        Ok(options) => options,
+        Err(why) => {
+            say(json!({"event": "error", "message": why}));
+            std::process::exit(2);
+        }
+    };
+    if let Err(why) = stream(options).await {
+        say(json!({"event": "error", "message": why.to_string()}));
+        std::process::exit(1);
+    }
+}
