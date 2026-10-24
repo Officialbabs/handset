@@ -384,6 +384,7 @@ class Window(Adw.ApplicationWindow):
             self._action(name, lambda _a, _p, key=name: self._key(key))
         self._action("next-phone", lambda _a, _p: self._next_phone())
         self._action("phone-apps", lambda _a, _p: self.show_phone_apps())
+        self._action("pair-iphone", lambda _a, _p: self._pair_iphone())
         self._action("pin", lambda _a, _p: self._pin_this(True))
         self._action("unpin", lambda _a, _p: self._pin_this(False))
         self._action("whole-phone", lambda _a, _p: self.phone and self.get_application().open_window(self.phone.id))
@@ -412,6 +413,7 @@ class Window(Adw.ApplicationWindow):
             menu.append("Show the Whole Phone", "win.whole-phone")
         else:
             menu.append("Phone Apps…", "win.phone-apps")
+            menu.append("Pair an iPhone for Notifications…", "win.pair-iphone")
             menu.append("New Window", "app.new-window")
         popover = Gtk.PopoverMenu(menu_model=menu, has_arrow=False, halign=Gtk.Align.START)
         popover.set_parent(self.bezel)
@@ -421,6 +423,15 @@ class Window(Adw.ApplicationWindow):
         popover.connect("closed", lambda p: GLib.idle_add(p.unparent))
         popover.popup()
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _pair_iphone(self):
+        """This computer, visible to iPhones for a few minutes: one paired from its Bluetooth
+        settings shares its notifications here (ancs.py)."""
+        from .appsync import ask_to_pair_iphone, start_if_needed
+
+        start_if_needed()
+        ask_to_pair_iphone()
+        self.say("On the iPhone: Settings › Bluetooth, then pick this computer")
 
     def show_phone_apps(self):
         """The phone's apps, to open one in a window of its own or pin it to the dock."""

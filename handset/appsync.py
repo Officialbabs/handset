@@ -22,11 +22,12 @@ import sys
 import threading
 import time
 
-from gi.repository import GLib
+from gi.repository import Gio, GLib
 
 from . import APP_ID, DEFAULT_APP_ID, apps
 from .apps import PhoneApp
 from .log import debug
+from .notifications import Desk, Note
 from .service import Phone, Watch
 
 # A connected phone's apps are listed again this often, for the ones put on it or taken off.
@@ -73,9 +74,37 @@ def start_if_needed():
         debug("the app sync didn't start:", error)
 
 
+def pair_request_path() -> str:
+    return os.path.join(os.path.dirname(lock_path()), "handset-pair-iphone")
+
+
+def ask_to_pair_iphone():
+    """`handset --pair-iphone`: the running sync makes the computer visible for a few minutes."""
+    GLib.file_set_contents(pair_request_path(), b"")
+
+
+def notification_state_path() -> str:
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(config, "handset", "notifications.json")
+
+
+def notifications_wanted() -> bool:
+    """Handset's settings may say no ("phone_notifications": false)."""
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    try:
+        with open(os.path.join(config, "handset", "settings.json")) as file:
+            return json.load(file).get("phone_notifications", True) is not False
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
 class AppSync:
     def __init__(self):
         self.watch = Watch(self._phones_changed)
+        self.desk: Desk | None = None
+        self.notifiers: dict[str, object] = {}  # an Android phone's id → its notifications
+        self.ancs = None
+        self.phone_names: dict[str, str] = {}
         self.online: dict[str, Phone] = {}
         self.listed: dict[str, float] = {}  # phone id → when its apps were last listed
         self.busy: set[str] = set()
@@ -85,9 +114,82 @@ class AppSync:
     def start(self):
         self.watch.start()
         GLib.timeout_add_seconds(60, self._relist)
+        if notifications_wanted():
+            self._start_notifications()
+
+    # ---- Notifications ---------------------------------------------------------------------
+
+    def _start_notifications(self):
+        try:
+            self.desk = Desk()
+        except GLib.Error as error:
+            debug("no notifications on the desk:", error.message)
+            return
+        self.desk.on_action = self._action
+        from .ancs import Ancs
+
+        self.ancs = Ancs(self._iphone_note, self.desk.close, self._known_iphones, self._remember_iphone)
+        self.ancs.start()
+        folder = Gio.File.new_for_path(os.path.dirname(pair_request_path()))
+        self.pair_monitor = folder.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        self.pair_monitor.connect("changed", self._pair_asked)
+        if os.path.exists(pair_request_path()):  # asked before this sync was there to hear it
+            os.unlink(pair_request_path())
+            self.ancs.pair()
+
+    def _pair_asked(self, _monitor, file, _other, event):
+        if file.get_path() == pair_request_path() and event == Gio.FileMonitorEvent.CREATED:
+            os.unlink(file.get_path())
+            debug("pairing an iPhone for notifications")
+            if self.ancs:
+                self.ancs.pair()
+
+    def _known_iphones(self) -> set[str]:
+        try:
+            with open(notification_state_path()) as file:
+                return set(json.load(file).get("iphones", []))
+        except (OSError, ValueError, AttributeError):
+            return set()
+
+    def _remember_iphone(self, address: str):
+        known = self._known_iphones()
+        if address and address not in known:
+            os.makedirs(os.path.dirname(notification_state_path()), exist_ok=True)
+            GLib.file_set_contents(notification_state_path(),
+                                   json.dumps({"iphones": sorted(known | {address})}).encode())
+
+    def _iphone_note(self, note: Note):
+        if self.desk:
+            self.desk.show(note, self.phone_names.get(note.phone_id, "iPhone"), self.ancs.app_name(note.app))
+
+    def _android_note(self, note: Note):
+        if self.desk:
+            self.desk.show(note, self.phone_names.get(note.phone_id, "phone"))
+
+    def _action(self, note: Note, action: str):
+        from .notifications import open_app
+
+        if action in ("ancs-positive", "ancs-negative") and self.ancs:
+            self.ancs.act(note.key, action == "ancs-positive")
+        elif action == "default" and apps.find(note.phone_id, note.app):
+            open_app(note)
+
+    def _follow(self, phone_id: str, serial: str):
+        """An Android phone's notifications, followed while it's connected."""
+        if self.desk and phone_id in self.online and phone_id not in self.notifiers:
+            from .notifications import AndroidNotifications
+
+            notifier = AndroidNotifications(phone_id, serial, self._android_note, self.desk.close)
+            self.notifiers[phone_id] = notifier
+            notifier.start()
+        return GLib.SOURCE_REMOVE
 
     def _phones_changed(self, phones: list[Phone]):
         online = {p.id: p for p in phones if p.online}
+        self.phone_names = {p.id: p.name for p in phones}
+        iphones = [p.id for p in phones if p.platform == "ios"]
+        if self.ancs and len(iphones) == 1:
+            self.ancs.phone_id = iphones[0]  # its notes go with its apps' entries
         gone = set(self.online) - set(online)
         came = set(online) - set(self.online)
         first, self.seen = not self.seen, True
@@ -97,6 +199,9 @@ class AppSync:
             self._drop_unconnected()
         for phone_id in gone:
             self.listed.pop(phone_id, None)  # listed afresh when it's back
+            notifier = self.notifiers.pop(phone_id, None)
+            if notifier:
+                notifier.stop()
         self._relist()
 
     def _relist(self):
@@ -141,6 +246,7 @@ class AppSync:
         serial = android.find_serial(phone.id, phone.address, phone.port)
         if not serial:
             return
+        GLib.idle_add(self._follow, phone.id, serial)
         listed = android.list_apps(serial)
         if isinstance(listed, str):
             debug(phone.name, "didn't list its apps:", listed)
@@ -278,7 +384,10 @@ def main() -> int:
     loop = GLib.MainLoop()
     for number in (signal.SIGTERM, signal.SIGINT):
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, number, loop.quit)
-    AppSync().start()
+    sync = AppSync()
+    sync.start()
     loop.run()
+    if sync.ancs:
+        sync.ancs.stop()
     held.close()
     return 0

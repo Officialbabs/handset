@@ -164,6 +164,33 @@ def scrcpy(command):
     return 0
 
 
+def events():
+    """The phone's event log, followed: the lines put in FAKEADB_DIR/events, as they're put."""
+    path = os.path.join(HERE, "events")
+    at = 0
+    while True:
+        if os.path.exists(path):
+            with open(path) as file:
+                file.seek(at)
+                for line in file:
+                    print(line.rstrip("\n"), flush=True)
+                at = file.tell()
+        time.sleep(0.1)
+
+
+def notification(command):
+    """One notification's record (dumpsys, cut by awk on the phone): FAKEADB_DIR/records/<key>."""
+    import shlex
+
+    words = shlex.split(command)
+    key = next((word[2:] for word in words if word.startswith("k=")), "")
+    path = os.path.join(HERE, "records", key.replace("|", "_"))
+    if os.path.exists(path):
+        with open(path) as file:
+            print(file.read(), end="")
+    return 0
+
+
 def versions() -> dict[str, int]:
     """The apps' versions (FAKEADB_DIR/versions.json, to say one was updated)."""
     try:
@@ -219,6 +246,13 @@ def main(args):
         return 0
     if args[:1] == ["shell"] and "com.genymobile.scrcpy.Server" in " ".join(args[1:]):
         return scrcpy(" ".join(args[1:]))
+    if args[:1] == ["shell"] and " ".join(args[1:]).startswith("logcat -b events"):
+        return events()
+    if args[:1] == ["shell"] and " ".join(args[1:]).startswith("dumpsys notification"):
+        return notification(" ".join(args[1:]))
+    if args[:1] == ["shell"] and " ".join(args[1:]) == "date +%s.%N":
+        print(f"{time.time():.6f}")
+        return 0
     if args[:1] == ["shell"]:
         command = " ".join(args[1:])
         if command == "getprop ro.serialno":

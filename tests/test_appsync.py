@@ -56,6 +56,9 @@ class SyncTest(unittest.TestCase):
         os.makedirs(os.path.dirname(apps.dock_path()))
         with open(apps.dock_path(), "w") as file:
             file.write("[Dock]\nPinned=ada-files.desktop;\n")
+        os.makedirs(os.path.join(os.environ["XDG_CONFIG_HOME"], "handset"))
+        with open(os.path.join(os.environ["XDG_CONFIG_HOME"], "handset", "settings.json"), "w") as file:
+            file.write('{"phone_notifications": false}')  # the real desk's and Bluetooth's: not here
         self.version = android.scrcpy_version
         android.scrcpy_version = lambda: "3.3.4"
         self.service = FakeService(os.environ["ADA_PHONES_SOCKET"],

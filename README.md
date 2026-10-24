@@ -55,6 +55,24 @@ a list, to open one or pin it. An app's window has the phone's button on the lef
   a pin is a line in the dock's pins (`~/.config/os-ai/dock.ini`). `handset --phone ID --app APP`
   is what it runs; `handset --forget-apps` takes them all away (`./install.sh --uninstall` does).
 
+## The phone's notifications on the desk
+
+A connected phone's notifications show on the desk as the desk's own, under the app's name and
+icon; clicking one opens that app in a window of its own, and one cleared on the phone goes from
+the desk too. Shown are the ones that would sound or pop up on the phone: not ongoing ones (music,
+a download), group summaries, silent ones, or ones Do Not Disturb holds back. Replying from the
+desk isn't possible, and clearing one here leaves it on the phone.
+
+- **Android** sends them over its adb link, as it posts them (its event log, and the notification
+  itself from `dumpsys notification`): nothing is installed on the phone.
+- **An iPhone** sends them over Bluetooth, as it does to a watch (Apple's Notification Center
+  Service). Pair it once: right-click the bezel, **Pair an iPhone for Notifications…** (or
+  `handset --pair-iphone`), then on the iPhone open Settings › Bluetooth, pick this computer and
+  allow its notifications. The computer is visible for a few minutes for that, and afterwards only
+  while that iPhone is away, so it can come back. A call's Accept and Decline are on its
+  notification.
+- Off: `"phone_notifications": false` in `~/.config/handset/settings.json`.
+
 ## How it works
 
 On an Android phone, Handset uses the same adb connection Ada set up, by cable or over Wi-Fi,

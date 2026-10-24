@@ -9,6 +9,8 @@ per phone: two phones, two windows, side by side.
   handset --off           close every window and quit (the same windows open next time)
   handset --sync          keep connected phones' apps among the desk's apps (from sign-in)
   handset --forget-apps   take every phone app off the desk and out of the dock
+  handset --pair-iphone   show this computer to iPhones for a few minutes, to pair one for its
+                          notifications (Settings › Bluetooth on the iPhone)
 
 While Handset runs it keeps a file, $XDG_RUNTIME_DIR/handset.on, so others can show whether
 it's on (a switch in the desktop's Control Center, say) without asking it.
@@ -205,6 +207,13 @@ def main(argv=None) -> int:
         from .appsync import icons_worker
 
         return icons_worker(argv[2], argv[3])
+    if "--pair-iphone" in argv[1:]:
+        from .appsync import ask_to_pair_iphone, start_if_needed
+
+        start_if_needed()
+        ask_to_pair_iphone()
+        print("Open Settings › Bluetooth on the iPhone and pick this computer from Other Devices.")
+        return 0
     if "--forget-apps" in argv[1:]:
         from .appsync import forget_all
 
