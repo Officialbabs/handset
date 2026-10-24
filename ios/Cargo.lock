@@ -518,8 +518,11 @@ dependencies = [
 name = "handset-ios"
 version = "0.1.0"
 dependencies = [
+ "flate2",
+ "futures",
  "idevice",
  "mdns-sd",
+ "plist",
  "serde_json",
  "tokio",
  "uuid",

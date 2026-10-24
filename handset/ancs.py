@@ -11,12 +11,15 @@ minutes) or once one has been, so that it comes back.
 from __future__ import annotations
 
 import struct
+import unicodedata
 import time
 from collections.abc import Callable
 
 from gi.repository import Gio, GLib
 
+from .ams import AMS, ENTITY_UPDATE, REMOTE_COMMAND, Ams, Writes
 from .log import debug
+from .media import NowPlaying
 from .notifications import Note
 
 ANCS = "7905f431-b5ce-4e99-a40f-4b1e122d00d0"
@@ -100,21 +103,32 @@ def parse_reply(data: bytes, wanted: int) -> tuple[int, str | int, dict[int, str
     return (command, subject, attributes) if len(attributes) >= wanted else None
 
 
+def plain_name(name: str) -> str:
+    """An app's name as the iPhone gives it, without the invisible marks some carry (WhatsApp's
+    starts with a left-to-right mark)."""
+    return "".join(c for c in name if unicodedata.category(c) != "Cf").strip()
+
+
 # ---- BlueZ -------------------------------------------------------------------------------------
 
 class Ancs:
     """The iPhone's notifications, from whichever paired iPhone connects: `on_note(note)` and
     `on_gone(phone_id, key)` on GLib's main loop. `phone_id` is the id the notes carry (the
-    iPhone's in Ada's service, when there's one, so its apps' entries and windows go with them)."""
+    iPhone's in Ada's service, when there's one, so its apps' entries and windows go with them).
+    With `on_media`, what it plays too (ams), over the same link."""
 
     def __init__(self, on_note: Callable[[Note], None], on_gone: Callable[[str, str], None],
-                 known: Callable[[], set[str]], remember: Callable[[str], None]):
+                 known: Callable[[], set[str]], remember: Callable[[str], None],
+                 on_media: Callable[[NowPlaying | None], None] | None = None,
+                 app_of: Callable[[str], str] = lambda _name: ""):
         self.on_note = on_note
         self.on_gone = on_gone
         self.known = known  # the Bluetooth addresses of iPhones paired for this before
         self.remember = remember
         self.phone_id = "iphone"
         self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+        self.writes = Writes(self.bus)
+        self.media = Ams(self.bus, self.writes, on_media, app_of) if on_media else None
         self.adapter: str | None = None
         self.advertising = False
         self.pairing_until = 0.0
@@ -136,8 +150,9 @@ class Ancs:
             return
         self.bus.signal_subscribe("org.bluez", "org.freedesktop.DBus.Properties", "PropertiesChanged", None, None,
                                   Gio.DBusSignalFlags.NONE, self._properties)
-        self.bus.signal_subscribe("org.bluez", "org.freedesktop.DBus.ObjectManager", "InterfacesAdded", "/", None,
-                                  Gio.DBusSignalFlags.NONE, lambda *_a: GLib.idle_add(self._look))
+        for signal in ("InterfacesAdded", "InterfacesRemoved"):
+            self.bus.signal_subscribe("org.bluez", "org.freedesktop.DBus.ObjectManager", signal, "/", None,
+                                      Gio.DBusSignalFlags.NONE, lambda *_a: GLib.idle_add(self._look))
         GLib.timeout_add_seconds(10, self._tick)
         self._look()
 
@@ -220,12 +235,14 @@ class Ancs:
         interface, changed, _gone = parameters.unpack()
         if interface == "org.bluez.Device1" and {"ServicesResolved", "Connected", "Paired"} & set(changed):
             GLib.idle_add(self._look)
-        elif interface == "org.bluez.GattCharacteristic1" and "Value" in changed and path in self.chars.values():
+        elif interface == "org.bluez.GattCharacteristic1" and "Value" in changed:
             value = bytes(changed["Value"])
             if path == self.chars.get(NOTIFICATION_SOURCE):
                 self._source(value)
             elif path == self.chars.get(DATA_SOURCE):
                 self._data(value)
+            elif self.media and self.media.owns(path):
+                self.media.changed(path, value)
 
     def _look(self):
         """A connected device that offers the service: subscribed to, once."""
@@ -237,9 +254,13 @@ class Ancs:
             debug("the iPhone went")
             self.device, self.chars = None, {}
             self.queue, self.waiting, self.buffer = [], None, b""
+            self.writes.clear()
             self._tick()
         if self.device:
+            self._look_media(objects)
             return GLib.SOURCE_REMOVE
+        if self.media:
+            self.media.detach()
         for path, interfaces in objects.items():
             service = interfaces.get("org.bluez.GattService1")
             if not service or service.get("UUID", "").lower() != ANCS:
@@ -248,9 +269,7 @@ class Ancs:
             props = objects.get(device, {}).get("org.bluez.Device1", {})
             if not props.get("Connected"):
                 continue
-            chars = {interfaces2["org.bluez.GattCharacteristic1"]["UUID"].lower(): path2
-                     for path2, interfaces2 in objects.items()
-                     if path2.startswith(path + "/") and "org.bluez.GattCharacteristic1" in interfaces2}
+            chars = self._chars(objects, path)
             if not {NOTIFICATION_SOURCE, CONTROL_POINT, DATA_SOURCE} <= set(chars):
                 continue
             self.device, self.chars = device, chars
@@ -263,8 +282,29 @@ class Ancs:
                 self.bus.call(
                     "org.bluez", chars[uuid], "org.bluez.GattCharacteristic1", "StartNotify", None, None,
                     Gio.DBusCallFlags.NONE, 10000, None, self._started, uuid)
+            self._look_media(objects)
             break
         return GLib.SOURCE_REMOVE
+
+    @staticmethod
+    def _chars(objects: dict, service: str) -> dict[str, str]:
+        """A GATT service's characteristics: uuid → path."""
+        return {interfaces["org.bluez.GattCharacteristic1"]["UUID"].lower(): path
+                for path, interfaces in objects.items()
+                if path.startswith(service + "/") and "org.bluez.GattCharacteristic1" in interfaces}
+
+    def _look_media(self, objects: dict):
+        """The iPhone's media service, while it offers it (it can stop, and offer it again)."""
+        if not self.media:
+            return
+        for path, interfaces in objects.items():
+            service = interfaces.get("org.bluez.GattService1")
+            if service and service.get("UUID", "").lower() == AMS and service.get("Device") == self.device:
+                chars = self._chars(objects, path)
+                if {REMOTE_COMMAND, ENTITY_UPDATE} <= set(chars):
+                    self.media.attach(chars)
+                    return
+        self.media.detach()
 
     def _started(self, bus, result, uuid):
         try:
@@ -315,7 +355,7 @@ class Ancs:
 
     def _named(self, reply: tuple, note: Note):
         _command, app, attributes = reply
-        self.app_names[app] = attributes.get(0, app)
+        self.app_names[app] = plain_name(attributes.get(0, "")) or app
         self.on_note(note)
 
     def app_name(self, app: str) -> str:
@@ -361,6 +401,4 @@ class Ancs:
     def _write(self, value: bytes):
         path = self.chars.get(CONTROL_POINT)
         if path:
-            self.bus.call("org.bluez", path, "org.bluez.GattCharacteristic1", "WriteValue",
-                          GLib.Variant("(aya{sv})", (value, {"type": GLib.Variant("s", "request")})), None,
-                          Gio.DBusCallFlags.NONE, 10000, None, None)
+            self.writes.write(path, value)  # after any request going (an action's, say)

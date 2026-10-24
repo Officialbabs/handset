@@ -98,6 +98,13 @@ class TurningTest(unittest.TestCase):
         self.assertEqual(even_size((1081, 1201), 0), (1080, 1200))
 
 
+class BitRateTest(unittest.TestCase):
+    def test_more_over_a_cable(self):
+        self.assertEqual(android.bit_rate("0A1B2C3D4E5F6G"), android.CABLE_BIT_RATE)
+        self.assertEqual(android.bit_rate("192.168.0.5:41234"), android.BIT_RATE)
+        self.assertEqual(android.bit_rate("adb-0A1B2C3D4E5F6G-x1._adb-tls-connect._tcp"), android.BIT_RATE)
+
+
 class EdgeTest(unittest.TestCase):
     def test_twice_the_monitor_and_no_more_than_the_phone(self):
         self.assertEqual(stream_edge(768, (1080, 2400)), 1536)  # a 1366×768 laptop

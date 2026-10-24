@@ -1,7 +1,9 @@
-"""The phone's screen, drawn. Frames come made twice the size it shows (decoder.py), and are
-halved here with a plain linear filter, which at exactly half is an even 2×2 average: sharp.
-Frames much bigger than that (the window just resized, or a decoder that can't scale) are drawn
-with mipmaps instead, so they aren't jagged meanwhile."""
+"""The phone's screen, drawn. Frames come made exactly twice the pixels it takes on the monitor
+(decoder.py), and are halved here with a plain linear filter, which at exactly half, on the
+monitor's own pixels, is an even 2×2 average: as sharp as the monitor can show. Frames the very
+size it shows are drawn pixel for pixel. Any other size (the window just resized, the frames for
+the new one not come yet; or a window more than half the phone's screen) is drawn filtered:
+mipmapped when much bigger, so it isn't jagged meanwhile."""
 
 from __future__ import annotations
 
@@ -16,6 +18,9 @@ from gi.repository import Gdk, Graphene, Gsk, Gtk  # noqa: E402
 
 # Frames up to this many times the size they show are drawn with a linear filter.
 LINEAR_UP_TO = 2.2
+# Frames within this many pixels of the size they show (or of twice it) were made for it: drawn
+# pixel for pixel (or halved exactly).
+EXACT_WITHIN = 2
 
 
 class Screen(Gtk.Widget):
@@ -69,6 +74,15 @@ class Screen(Gtk.Widget):
         width, height = self.get_width(), self.get_height()
         if self.texture is None or width <= 0 or height <= 0:
             return
-        ratio = self.texture.get_width() / (width * self.scale())
+        scale = self.scale()
+        tw, th = self.texture.get_width(), self.texture.get_height()
+        for times, filtering in ((2, Gsk.ScalingFilter.LINEAR), (1, Gsk.ScalingFilter.NEAREST)):
+            if abs(tw - times * width * scale) <= EXACT_WITHIN and abs(th - times * height * scale) <= EXACT_WITHIN:
+                # Made for these pixels: each 2×2 of the frame's evenly on one of the monitor's (or
+                # each on one), from the window's corner.
+                snapshot.append_scaled_texture(self.texture, filtering,
+                                               Graphene.Rect().init(0, 0, tw / times / scale, th / times / scale))
+                return
+        ratio = tw / (width * scale)
         scaling = Gsk.ScalingFilter.LINEAR if ratio <= LINEAR_UP_TO else Gsk.ScalingFilter.TRILINEAR
         snapshot.append_scaled_texture(self.texture, scaling, Graphene.Rect().init(0, 0, width, height))

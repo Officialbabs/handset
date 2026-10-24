@@ -18,7 +18,9 @@ import io
 import os
 import re
 import shutil
+import subprocess
 import sys
+import time
 from dataclasses import dataclass
 
 from gi.repository import GLib
@@ -103,6 +105,16 @@ def launcher() -> str:
     return shutil.which("handset") or "handset"
 
 
+def open_window(phone_id: str, app: str | None = None):
+    """The phone's app in its own window (or the phone's window), as its entry would open it."""
+    command = [launcher(), "--phone", phone_id] + (["--app", app] if app else [])
+    try:
+        subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as error:
+        print("handset: the window didn't open:", error, file=sys.stderr)
+
+
 def quoted(arg: str) -> str:
     """One Exec argument, as desktop entries quote them."""
     if arg and all(c.isalnum() or c in "._-/+:@" for c in arg):
@@ -153,9 +165,9 @@ def write_entry(app: PhoneApp, icon: bytes | None = None, replace: bool = True) 
         return False
     os.makedirs(icons_dir(), exist_ok=True)
     os.makedirs(applications_dir(), exist_ok=True)
-    kept = icon_files(app.phone_id, app.app)
-    if icon is None and kept:
-        picture = kept[0]
+    named = named_icon(app.phone_id, app.app)
+    if icon is None and named and os.path.isfile(named):
+        picture = named
     else:
         data = icon or letter_icon(app.name)
         picture = os.path.join(icons_dir(), f"{app.id}-{hashlib.sha1(data).hexdigest()[:10]}.png")
@@ -185,10 +197,37 @@ def write_entry(app: PhoneApp, icon: bytes | None = None, replace: bool = True) 
     except OSError:
         pass
     GLib.file_set_contents(path, data.encode())
-    for old in kept:
-        if old != picture:
-            os.unlink(old)
+    # An icon it had stays a while: the desktop shows it by its path until it reads the entry again.
     return True
+
+
+def forget_old_icons(older_than: float = 24 * 3600):
+    """Icons no entry names any more, kept a day for the desktop's sake, gone after that."""
+    named = set()
+    for app in entries():
+        entry = GLib.KeyFile()
+        try:
+            entry.load_from_file(entry_path(app.phone_id, app.app), GLib.KeyFileFlags.NONE)
+            named.add(entry.get_string(ENTRY, "Icon"))
+        except GLib.Error:
+            continue
+    now = time.time()
+    for path in glob.glob(os.path.join(glob.escape(icons_dir()), "*.png")):
+        try:
+            if path not in named and now - os.path.getmtime(path) > older_than:
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def named_icon(phone_id: str, app: str) -> str | None:
+    """The icon the app's entry names now."""
+    entry = GLib.KeyFile()
+    try:
+        entry.load_from_file(entry_path(phone_id, app), GLib.KeyFileFlags.NONE)
+        return entry.get_string(ENTRY, "Icon")
+    except GLib.Error:
+        return None
 
 
 def remove_entry(phone_id: str, app: str):

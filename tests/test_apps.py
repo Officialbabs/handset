@@ -80,8 +80,10 @@ class PinTest(unittest.TestCase):
         self.assertTrue(apps.write_entry(CHAT, own))
         icon = self.entry().get_string("Desktop Entry", "Icon")
         self.assertNotEqual(icon, letter)  # the desk sees a new picture by its new name
+        self.assertIn(letter, apps.icon_files("FAKE7", "org.example.chat"))  # kept a while, for the desktop
+        apps.forget_old_icons(older_than=-1)
         self.assertEqual(apps.icon_files("FAKE7", "org.example.chat"), [icon])
-        apps.write_entry(CHAT)  # no icon given: the one it has stays
+        apps.write_entry(CHAT)  # no icon given: the one it names stays
         self.assertEqual(self.entry().get_string("Desktop Entry", "Icon"), icon)
 
     def test_without_the_docks_settings_nothing_is_made_up(self):

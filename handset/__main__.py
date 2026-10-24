@@ -101,29 +101,48 @@ class App(Adw.Application):
         return None
 
     def open_app(self, phone_id: str, app: str, phone_app=None):
-        """One app of a phone in a window of its own (the one showing it comes forward). An
-        iPhone has one screen, so its app opens in front in a window showing that iPhone."""
+        """One app of a phone in a window of its own (the one showing it comes forward, the app
+        in front again). An iPhone has one screen: the app's window takes it over from the
+        others showing that iPhone (screen_to)."""
         from .apps import PhoneApp, find, write_entry
         from .window import Window
 
         for window in self.handset_windows():
             if window.phone_app and (window.phone_app.phone_id, window.phone_app.app) == (phone_id, app):
                 window.present()
+                if window.gave_screen:
+                    window.take_screen()
+                else:
+                    window.open_app(app)
                 return window
         phone_app = phone_app or find(phone_id, app) or PhoneApp(phone_id, phone_id, "", app, app)
         if phone_app.platform:
             # An entry of its own, so its window counts as that app (in the dock, say).
             write_entry(phone_app, None, replace=False)
-        if phone_app.platform == "ios":
-            for window in self.handset_windows():
-                if window.phone and window.phone.id == phone_id:
-                    window.present()
-                    window.open_app(app)
-                    return window
         window = Window(self, phone_app=phone_app)
         window.present()
         say_on(True)
         return window
+
+    def screen_to(self, window) -> bool:
+        """An iPhone's one screen, to `window`: the other windows showing that iPhone give it up,
+        and the one with the link to it hands that over. Whether a link came (if not, `window`
+        makes its own)."""
+        if not window.phone or window.phone.platform != "ios":
+            return False
+        came = False
+        for other in self.handset_windows():
+            if other is not window and other.phone and other.phone.id == window.phone.id and not other.gave_screen:
+                came = other.give_screen(window) or came
+        return came
+
+    def screen_back(self, closing):
+        """An iPhone's screen, from a window going, to a window that gave it up (the phone's own
+        window first)."""
+        waiting = [w for w in self.handset_windows() if w is not closing and w.gave_screen and w.phone
+                   and closing.phone and w.phone.id == closing.phone.id]
+        if waiting:
+            min(waiting, key=lambda w: bool(w.phone_app)).take_screen()
 
     def open_window(self, wanted: str | None = None, new: bool = False):
         """A window for `wanted`, or (new) for a phone no window shows yet; the one already
@@ -132,6 +151,8 @@ class App(Adw.Application):
 
         if wanted and (window := self.window_for(wanted)):
             window.present()
+            if window.gave_screen:
+                window.take_screen()
             return window
         if new and not wanted:
             known = next((w.phones for w in self.handset_windows() if w.phones), [])

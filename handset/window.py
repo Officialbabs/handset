@@ -73,6 +73,7 @@ CSS = b"""
 .handset-ring { border: 3px solid var(--accent-bg-color); }
 .handset-asleep { background: alpha(black, 0.6); color: white; }
 .handset-asleep .title { font-weight: 700; font-size: 1.15em; }
+.handset-away .title { font-weight: 700; }
 .handset-hidden { color: alpha(white, 0.85); font-weight: 600; }
 .handset-bezel { background: #101012; }
 .handset-grip { background: alpha(white, 0.32); border-radius: 3px; min-width: 44px; min-height: 5px; }
@@ -198,6 +199,7 @@ class Window(Adw.ApplicationWindow):
         super().__init__(application=app, title=phone_app.name if phone_app else NAME)
         self.add_css_class("handset-window")
         self.phone_app = phone_app  # the one app this window shows, if it shows one
+        self.gave_screen = False  # an iPhone's one screen went to another window (screen_to)
         self.border = BORDER if phone_app else 0
         # libadwaita's windows are at least 360 wide: narrower than that is a phone's own shape.
         self.set_size_request(160, 240)
@@ -213,6 +215,7 @@ class Window(Adw.ApplicationWindow):
         self.retries = 0
         self.typed = ""
         self.frames_seen = 0
+        self.snapshots = 0  # the debugging snapshot's signal handler, when there's one
         self.picture_timer = 0
         self.picture_tries = 0
         self.type_timer = 0
@@ -240,6 +243,7 @@ class Window(Adw.ApplicationWindow):
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self._build()
         self.connect("close-request", self._closing)
+        self.connect("notify::is-active", self._activated)
         for name in ("default-width", "default-height", "maximized"):
             self.connect(f"notify::{name}", self._resized)
         self.watch = Watch(self._phones_changed, self._service_gone)
@@ -295,6 +299,16 @@ class Window(Adw.ApplicationWindow):
         words.append(off)
         words.append(Gtk.Label(label="Click to wake it"))
         self.asleep.append(words)
+        # An iPhone's one screen is in another of its windows: this one's last picture, dimmed.
+        self.away = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, can_target=False, visible=False,
+                            valign=Gtk.Align.END, margin_bottom=24, halign=Gtk.Align.CENTER)
+        self.away.add_css_class("handset-away")
+        self.away.add_css_class("osd")
+        self.away.add_css_class("handset-ada")
+        self.away_where = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+        self.away_where.add_css_class("title")
+        self.away.append(self.away_where)
+        self.away.append(Gtk.Label(label="Click to show it here"))
         # A locked phone's PIN pad shows black: the phone hides it from screen sharing.
         self.hidden = Gtk.Label(label="The phone hides its PIN pad from screen sharing.\n"
                                       "Type your PIN, then press Enter.",
@@ -302,7 +316,7 @@ class Window(Adw.ApplicationWindow):
                                 visible=False, valign=Gtk.Align.CENTER, margin_start=16, margin_end=16)
         self.hidden.add_css_class("handset-hidden")
         self.screen = Gtk.Overlay(child=self.picture, focusable=True)
-        for overlay in (self.dots, self.asleep, self.hidden, self.ring, self.ada_shown):
+        for overlay in (self.dots, self.asleep, self.away, self.hidden, self.ring, self.ada_shown):
             self.screen.add_overlay(overlay)
         self.frame = Gtk.AspectFrame(ratio=0.45, obey_child=False, child=self.screen)
 
@@ -314,10 +328,15 @@ class Window(Adw.ApplicationWindow):
         self.wake_button.add_css_class("pill")
         self.wake_button.add_css_class("suggested-action")
         self.wake_button.connect("clicked", lambda _b: self.device and self.device.wake())
+        self.here_button = Gtk.Button(label="Show Here", halign=Gtk.Align.CENTER, visible=False)
+        self.here_button.add_css_class("pill")
+        self.here_button.add_css_class("suggested-action")
+        self.here_button.connect("clicked", lambda _b: self.take_screen())
         self.picker = Gtk.DropDown(visible=False, halign=Gtk.Align.CENTER, tooltip_text="Which phone")
         self.picker.connect("notify::selected", self._picked)
         choices = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         choices.append(self.wake_button)
+        choices.append(self.here_button)
         choices.append(self.again)
         choices.append(self.picker)
         self.status.set_child(choices)
@@ -498,6 +517,17 @@ class Window(Adw.ApplicationWindow):
         geometry = monitor.get_geometry()
         return geometry.width, geometry.height
 
+    def _monitor_rate(self) -> int:
+        """Frames a second the window's monitor shows (60 when it doesn't say): what's asked of
+        the phone, so none it could send are left out and none are sent for nothing."""
+        display = self.get_display()
+        surface = self.get_surface()
+        monitor = display.get_monitor_at_surface(surface) if surface else None
+        from .android import FRAME_RATE
+
+        rate = round(monitor.get_refresh_rate() / 1000) if monitor else 0
+        return rate if rate >= 30 else FRAME_RATE
+
     def _monitor_scale(self) -> float:
         """The monitor's pixels per window pixel (2 on a HiDPI screen)."""
         surface = self.get_surface()
@@ -513,6 +543,7 @@ class Window(Adw.ApplicationWindow):
                      wake: bool = False):
         debug("window shows:", title, "·", description)
         self.wake_button.set_visible(wake)
+        self.here_button.set_visible(self.gave_screen)
         self.status.set_icon_name(icon)
         self.status.set_title(title)
         self.status.set_description(description)
@@ -639,8 +670,10 @@ class Window(Adw.ApplicationWindow):
             GLib.source_remove(self.retry)
             self.retry = 0
         phone = self.phone
-        if not phone or self.opening:
+        if not phone or self.opening or self.gave_screen:
             return
+        if self.get_application().screen_to(self):
+            return  # an iPhone's one screen came here from the window showing it, link and all
         self._close_phone()
         self.opening = True
         self._show_status("phone-symbolic", f"Connecting to {phone.name}…", "")
@@ -694,7 +727,8 @@ class Window(Adw.ApplicationWindow):
         GLib.idle_add(self._resume_sound)
         if self.phone_app:
             self.device = android.AppScreen(link, self.phone_app.app, self._frame, self._turned,
-                                            self._touch_changed, self._video_ended, self._awake_changed)
+                                            self._touch_changed, self._video_ended, self._awake_changed,
+                                            fps=self._monitor_rate())
             self._turned()
             self.device.start()
             self._show_at()
@@ -702,7 +736,8 @@ class Window(Adw.ApplicationWindow):
             self._expect_picture()
             return GLib.SOURCE_REMOVE
         self.device = android.Android(link, self._frame, self._turned, self._touch_changed,
-                                      self._video_ended, self._awake_changed, edge=edge)
+                                      self._video_ended, self._awake_changed, edge=edge,
+                                      fps=self._monitor_rate())
         self._turned()
         self.device.start()
         self._show_at()
@@ -794,6 +829,74 @@ class Window(Adw.ApplicationWindow):
         if clipboard and self.phone:
             clipboard.attach(self.phone.id, make_link)
 
+    def give_screen(self, to) -> bool:
+        """The iPhone's one screen goes to another of its windows (`to`), with the link to the
+        phone if this window has it, so it shows there at once. This one keeps its last picture,
+        dimmed, until it's clicked or comes forward again. Whether the link went."""
+        self.gave_screen = True
+        if self.retry:
+            GLib.source_remove(self.retry)
+            self.retry = 0
+        if self.picture_timer:
+            GLib.source_remove(self.picture_timer)
+            self.picture_timer = 0
+        device, self.device = self.device, None
+        moved = device is not None and not device.stopped and to.device is None
+        showing = self.stack.get_visible_child_name() == "screen"
+        if moved:
+            to.adopt(device, self.picture.get_paintable() if showing else None)
+        elif device:
+            device.stop()
+        self.asleep.set_visible(False)
+        self.hidden.set_visible(False)
+        where = f"{to.phone_app.name}'s window" if to.phone_app else f"{self.phone.name}'s window"
+        if showing and self.picture.get_paintable() is not None:
+            self.away_where.set_label(f"In {where}")
+            self.away.set_visible(True)
+            self.picture.set_opacity(0.5)
+        else:
+            self._show_status("phone-symbolic", f"{self.phone.name}'s screen is in {where}", "")
+        return moved
+
+    def take_screen(self):
+        """Show Here: the iPhone's screen back in this window (its app in front, for an app's)."""
+        if not self.gave_screen:
+            return
+        self.gave_screen = False
+        self.away.set_visible(False)
+        self.picture.set_opacity(1)
+        self._open()
+
+    def adopt(self, device, picture):
+        """The iPhone's link, from the window that showed it: its pictures, touches and news
+        come here now, and its last `picture` shows until the next. An app's window brings its
+        app in front."""
+        self._close_phone()
+        self.device = device
+        device.on_frame, device.on_turned, device.on_touch = self._frame, self._turned, self._touch_changed
+        device.on_ended, device.on_awake, device.on_status = self._video_ended, self._awake_changed, self._helper_status
+        device.on_launched = self._launched
+        device.looks_dark = self.picture.is_dark
+        self.picture_tries = self.retries = 0
+        self._turned()
+        if picture is not None:
+            self.frames_seen = 0
+            self._frame(picture)
+            GLib.idle_add(self._sync_shown_size)  # frames made for this window's size from now
+        else:
+            self._show_status("phone-symbolic", f"Waiting for {self.phone.name}'s screen…", "")
+            self._expect_picture(IPHONE_PICTURE_WAIT_MS)
+        self.asleep.set_visible(not device.awake)
+        if self.phone_app:
+            device.launch(self.phone_app.app)
+        debug("the iPhone's screen moved to", self.phone_app.name if self.phone_app else "its window")
+
+    def _activated(self, *_args):
+        """An iPhone's window coming forward shows the iPhone again (its app in front, for an
+        app's): the iPhone has one screen, and it goes to the window in use."""
+        if self.is_active() and self.gave_screen:
+            self.take_screen()
+
     def _launched(self, opened: bool, why: str):
         """The iPhone opened this window's app (or didn't: locked, mostly)."""
         if not opened and self.phone_app:
@@ -859,9 +962,12 @@ class Window(Adw.ApplicationWindow):
         self.frames_seen += 1
         self.picture_tries = 0
         self.retries = 0
-        if self.frames_seen == 1 and os.environ.get("HANDSET_SNAPSHOT"):
-            # Debugging: SIGUSR1 saves the screen as drawn here, to compare with the phone's own.
-            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 10, self._snapshot, os.environ["HANDSET_SNAPSHOT"])
+        if self.frames_seen == 1 and os.environ.get("HANDSET_SNAPSHOT") and not self.snapshots:
+            # Debugging: SIGUSR1 saves the screen as drawn here, to compare with the phone's own
+            # (each window's in a file of its own: NAME-android.png, NAME-ios-com.apple.Music.png…).
+            root, ext = os.path.splitext(os.environ["HANDSET_SNAPSHOT"])
+            which = "-".join([self.phone.platform] + ([self.phone_app.app] if self.phone_app else []))
+            self.snapshots = GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 10, self._snapshot, f"{root}-{which}{ext}")
         if self.stack.get_visible_child_name() != "screen":
             debug("window shows the phone's screen", self.get_width(), "x", self.get_height())
             self.stack.set_visible_child_name("screen")
@@ -945,6 +1051,8 @@ class Window(Adw.ApplicationWindow):
         self._remember_size()
         app = self.get_application()
         app.remember_windows(closing=self)
+        if self.phone and self.phone.platform == "ios" and not self.gave_screen:
+            app.screen_back(self)
         others = {w.phone.id for w in app.handset_windows() if w.phone and w is not self}
         if app.clipboard:
             app.clipboard.release(others)
@@ -962,6 +1070,10 @@ class Window(Adw.ApplicationWindow):
         return Fit((self.screen.get_width(), self.screen.get_height()), self.device.shown)
 
     def _drag_begin(self, gesture, x, y):
+        if self.gave_screen:
+            self.take_screen()  # a click on an iPhone's window showing its last picture
+            gesture.set_state(Gtk.EventSequenceState.DENIED)
+            return
         if self.device and not self.device.awake:
             self.device.wake()  # a click on a sleeping screen wakes it, and does nothing else
             gesture.set_state(Gtk.EventSequenceState.DENIED)

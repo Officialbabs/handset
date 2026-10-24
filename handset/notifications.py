@@ -248,7 +248,8 @@ class Desk:
 
     def show(self, note: Note, phone_name: str, app_name: str | None = None):
         app = apps.find(note.phone_id, note.app)
-        icons = apps.icon_files(note.phone_id, note.app) if app else []
+        named = apps.named_icon(note.phone_id, note.app) if app else None
+        icons = [named] if named else []
         name = app.name if app else (app_name or note.app)
         actions = ["default", "Open"]
         for action_id, label in note.actions:
@@ -297,10 +298,7 @@ class Desk:
             self.ids.pop((note.phone_id, note.key), None)
 
 
-def open_app(note: Note):
-    """The app the notification came from, in a window of its own."""
-    try:
-        subprocess.Popen([apps.launcher(), "--phone", note.phone_id, "--app", note.app], stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    except OSError as error:
-        debug("the app didn't open:", error)
+def open_app(note: Note, own_window: bool = True):
+    """The app the notification came from, in a window of its own; or the phone's window, for an
+    app Handset hasn't listed (one the phone's home screen or drawer doesn't show)."""
+    apps.open_window(note.phone_id, note.app if own_window else None)

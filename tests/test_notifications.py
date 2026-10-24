@@ -71,6 +71,11 @@ class AndroidWordsTest(unittest.TestCase):
 
 
 class AncsPacketsTest(unittest.TestCase):
+    def test_app_names_without_invisible_marks(self):
+        self.assertEqual(ancs.plain_name("\u200eWhatsApp"), "WhatsApp")
+        self.assertEqual(ancs.plain_name(" Snapchat\u200f "), "Snapchat")
+        self.assertEqual(ancs.plain_name(""), "")
+
     def test_the_source(self):
         self.assertEqual(ancs.parse_source(struct.pack("<BBBBI", 0, 0x12, 4, 1, 77)), (0, 0x12, 4, 77))
         self.assertIsNone(ancs.parse_source(b"\0\0"))

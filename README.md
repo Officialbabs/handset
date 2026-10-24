@@ -131,8 +131,8 @@ uses (`idevice`):
   own size, by the phone's model.
 - **Touches, buttons and typing** go in through Apple's developer input services, which take
   them while the screen is being sent. An iPhone has no Back button: Back is a swipe in from the
-  left edge, Recent apps a swipe up from the bottom held, the notifications a swipe down from
-  the top. Typing is a US keyboard's letters, digits and punctuation.
+  left edge, Recent apps Home pressed twice (the app switcher), the notifications a swipe down
+  from the top. Typing is a US keyboard's letters, digits and punctuation.
 - **Sharing the phone with Ada:** the phone has one screen stream for everyone, and stopping it
   stops them all, so Handset never stops it; it just leaves. If Ada's desktop stops it, Handset
   starts its own again.

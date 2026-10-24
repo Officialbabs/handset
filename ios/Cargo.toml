@@ -10,6 +10,12 @@ publish = false
 # The crate Ada's phone service is built on, at the same version, with ring for TLS: the default,
 # aws-lc, needs cmake to build.
 idevice = { version = "=0.1.68", default-features = false, features = ["ring", "remote_pairing", "usbmuxd", "core_device_proxy", "tunnel_tcp_stack", "rsd", "display_stream", "afc"] }
+# Streams: the phone gives its apps as one (its list in one reply never comes on iOS 27).
+futures = "0.3"
+# The screen's own media offer (main.rs, screen_offer): as the idevice crate builds its, already
+# in the build through it.
+flate2 = "1"
+plist = "1"
 mdns-sd = "0.19"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "io-std", "signal", "sync", "fs"] }

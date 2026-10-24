@@ -48,6 +48,15 @@ class WordsTest(unittest.TestCase):
                     "The iPhone is plugged in but its cable link didn't open (PasswordProtected): unlock it."):
             self.assertEqual(plainly(why), why)
 
+    def test_the_phones_own_words_from_its_errors(self):
+        call = ('device returned an error: Dictionary({"code": Integer(9022), "userInfo": Dictionary({'
+                '"NSLocalizedDescription": String("A phone or VoIP call is currently in progress on the device.")}), '
+                '"domain": String("com.apple.dt.CoreDeviceError")})')
+        self.assertEqual(plainly(call), "It's on a call: its screen shows here again when the call ends.")
+        other = ('device returned an error: Dictionary({"code": Integer(1), "userInfo": Dictionary({'
+                 '"NSLocalizedDescription": String("The \\"display\\" is busy.")})})')
+        self.assertEqual(plainly(other), 'The \\"display\\" is busy.')
+
 
 class CropTest(unittest.TestCase):
     def test_the_padding_goes(self):
@@ -195,6 +204,13 @@ class FakeHelper(unittest.TestCase):
             {"op": "down", "x": 0, "y": 0}, {"op": "move", "x": SPAN, "y": SPAN}, {"op": "up"},
             {"op": "button", "name": "home"}, {"op": "key", "name": "enter"},
             {"op": "text", "text": "hi "}])
+
+    def test_recents_is_home_pressed_twice(self):
+        self.phone.start()
+        spin(lambda: self.frames and self.phone.live_touch)
+        self.phone.key("recents")
+        spin(lambda: len(self.commands()) >= 2)
+        self.assertEqual(self.commands(), [{"op": "button", "name": "home"}] * 2)
 
     def test_back_is_a_swipe_from_the_left_edge(self):
         self.phone.start()

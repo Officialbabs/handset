@@ -88,6 +88,24 @@ class ColoursTest(unittest.TestCase):
         decoder.show_at(1000, 2222)
         self.assertIsNone(decoder.scaled_size())  # as big as it is: as it is
 
+    def test_the_gpus_frames_made_for_the_window(self):
+        # An iPhone 12's padded frames are made so their screen's part is exactly twice the
+        # pixels the window shows, for the window to halve.
+        decoder = Decoder("h265", lambda t: None, gpu_frames=True, crop=lambda size: (1170, 2532))
+        decoder.dmabuf = True
+        decoder.native, decoder.native_crop = (1184, 2576), (1170, 2532)
+        decoder.show_at(275, 595)
+        made = decoder.scaled_size()
+        self.assertEqual(decoder.exact, (made, (550, 1190)))
+        self.assertEqual((made[0] % 2, made[1] % 2), (0, 0))
+        self.assertGreaterEqual(made[0] * 1170 / 1184, 550)  # its screen's part covers what's kept
+        self.assertGreaterEqual(made[1] * 2532 / 2576, 1190)
+        decoder.show_at(700, 1500)  # more than half the phone's screen: as decoded
+        self.assertIsNone(decoder.scaled_size())
+        decoder.native, decoder.native_crop = (1080, 2400), None  # a Pixel's, not padded
+        decoder.show_at(271, 600)
+        self.assertEqual(decoder.scaled_size(), (542, 1200))
+
     def test_the_screens_part_scales_too(self):
         decoder = Decoder("h265", lambda t: None, gpu_frames=False, crop=lambda size: (1170, 2532))
         decoder.native, decoder.native_crop = (1184, 2576), (1170, 2532)

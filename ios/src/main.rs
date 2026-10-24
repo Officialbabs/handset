@@ -45,14 +45,16 @@ use idevice::{IdeviceService, RsdService};
 use idevice::core_device::{
     AppIconTarget, AppServiceClient, CallInfoBlob, DataInclusionPolicy, GENERAL_PASTEBOARD, IconServiceClient,
     PasteboardServiceClient, PasteboardSnapshot, DisplayServiceClient, HevcDepacketizer, RtpPacket, build_screen_audio_offer,
-    build_screen_video_offer, build_start_audio_parameters, build_start_video_parameters,
+    build_start_audio_parameters, build_start_video_parameters,
 };
 use idevice::remote_pairing::{RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native};
 use idevice::rsd::RsdHandshake;
+use idevice::services::core_device::display_stream::negotiation::NEGOTIATOR_MODE_COREDEVICE_SCREEN;
 use idevice::services::core_device::display_stream::{build_keyframe_request, build_liveness, is_rtcp};
 use idevice::services::core_device::hid::{
     ButtonState, IndigoHidClient, TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE, UniversalHidServiceClient,
 };
+use futures::StreamExt;
 use idevice::tcp::adapter::Adapter;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
@@ -79,6 +81,69 @@ const PAIRING_PORT: u16 = 49152;
 /// stream for everyone, and stopping it stops them all (Ada's desktop does when it gets the phone
 /// ready for her). It's started again.
 const QUIET: Duration = Duration::from_secs(5);
+/// A packet still missing once this many newer ones have come was lost (the picture comes over
+/// UDP), not merely late.
+const LOST_AFTER: u64 = 16;
+/// While a keyframe is awaited, it's asked for again this often; one that doesn't come in time
+/// gets the stream started again (which starts with one).
+const KEYFRAME_AGAIN: Duration = Duration::from_millis(500);
+const KEYFRAME_FOR: Duration = Duration::from_secs(3);
+
+/// Which of the picture's packets were lost: each one's number seen, in whatever order they come.
+#[derive(Default)]
+struct Losses {
+    next: Option<u16>,
+    missing: std::collections::BTreeMap<u16, u64>, // a missing packet → how many had come then
+    seen: u64,
+}
+
+impl Losses {
+    /// A packet came: whether one before it is lost for good.
+    fn saw(&mut self, number: u16) -> bool {
+        self.seen += 1;
+        let Some(next) = self.next else {
+            self.next = Some(number.wrapping_add(1));
+            return false;
+        };
+        let ahead = number.wrapping_sub(next);
+        if ahead == 0 {
+            self.next = Some(number.wrapping_add(1));
+        } else if ahead < 0x8000 {
+            if ahead > 1000 {
+                // A jump this big is a stream started again, not packets lost.
+                self.missing.clear();
+            } else {
+                for gap in 0..ahead {
+                    self.missing.insert(next.wrapping_add(gap), self.seen);
+                }
+            }
+            self.next = Some(number.wrapping_add(1));
+        } else {
+            self.missing.remove(&number); // late, not lost
+        }
+        let before = self.missing.len();
+        let seen = self.seen;
+        self.missing.retain(|_, when| seen - *when < LOST_AFTER);
+        self.missing.len() < before
+    }
+}
+
+/// Where a keyframe starts in Annex-B bytes (at its parameter sets, or its first slice).
+fn keyframe_start(bytes: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    while at + 3 < bytes.len() {
+        if bytes[at] == 0 && bytes[at + 1] == 0 && bytes[at + 2] == 1 {
+            let kind = (bytes[at + 3] >> 1) & 0x3f;
+            if (16..=23).contains(&kind) || (32..=34).contains(&kind) {
+                return Some(if at > 0 && bytes[at - 1] == 0 { at - 1 } else { at });
+            }
+            at += 3;
+        } else {
+            at += 1;
+        }
+    }
+    None
+}
 
 /// One line on standard error, for Handset.
 fn say(event: Value) {
@@ -304,41 +369,88 @@ enum Missed {
 /// The phone's apps that show on its home screen, a line each, with their icons saved to the
 /// --icons folder as BUNDLE.png.
 async fn list_apps(options: Options) -> Fallible<()> {
-    let (_way, (mut adapter, mut handshake)) = reach(&options).await?;
+    let verbose = options.verbose;
+    let (way, (mut adapter, mut handshake)) = reach(&options).await?;
+    if verbose {
+        eprintln!("reached {way}");
+    }
     let mut apps = AppServiceClient::connect_rsd(&mut adapter, &mut handshake).await?;
-    let mut listed: Vec<_> = apps
-        .list_apps(false, true, false, false, true)
-        .await?
+    // As a stream: asked for its list in one reply, the phone (iOS 27) never answers.
+    let streamed = tokio::time::timeout(APPS_FOR, async {
+        let mut found = Vec::new();
+        let mut stream = Box::pin(apps.stream_apps(false, true, false, false, true));
+        while let Some(app) = stream.next().await {
+            found.push(app?);
+        }
+        Ok::<_, idevice::IdeviceError>(found)
+    })
+    .await
+    .map_err(|_| "The iPhone didn't list its apps in time.")??;
+    // The apps the home screen has: every app that can be removed (the person's, and most of
+    // Apple's), and the two of Apple's that can't; not the system's helpers and extensions.
+    let mut listed: Vec<_> = streamed
         .into_iter()
         .filter(|app| !app.is_hidden && !app.is_app_clip)
+        .filter(|app| app.is_removable || HOME_SCREEN_BUILT_INS.contains(&app.bundle_identifier.as_str()))
         .collect();
     listed.sort_by_key(|app| app.name.to_lowercase());
+    if verbose {
+        eprintln!("{} apps listed", listed.len());
+    }
+    // Icons are worth a little wait each, not the list: one that doesn't come is left out, and
+    // after a few of those, the rest are too.
     let mut icons = match &options.icons {
-        Some(_) => IconServiceClient::connect_rsd(&mut adapter, &mut handshake).await.ok(),
+        Some(_) => match tokio::time::timeout(ICON_FOR * 2, IconServiceClient::connect_rsd(&mut adapter, &mut handshake)).await {
+            Ok(Ok(client)) => Some(client),
+            other => {
+                if verbose {
+                    eprintln!("no icon service: {}", if other.is_err() { "it didn't answer".to_string() } else { "refused".to_string() });
+                }
+                None
+            }
+        },
         None => None,
     };
+    let mut misses = 0;
     for app in listed {
         let mut icon = Value::Null;
         if let (Some(client), Some(folder)) = (icons.as_mut(), &options.icons) {
             let target = AppIconTarget::BundleIdentifier(app.bundle_identifier.clone());
-            match client.fetch_icon(target, 60.0, 60.0, 3.0, false).await {
-                Ok(fetched) if !fetched.is_placeholder => {
+            match tokio::time::timeout(ICON_FOR, client.fetch_icon(target, 60.0, 60.0, 3.0, false)).await {
+                Ok(Ok(fetched)) if !fetched.is_placeholder => {
                     let path = std::path::Path::new(folder).join(format!("{}.png", app.bundle_identifier));
                     let png: Vec<u8> = fetched.png_data.into();
                     if std::fs::write(&path, png).is_ok() {
                         icon = json!(path.to_string_lossy());
                     }
                 }
-                Ok(_) => {}
-                Err(why) if options.verbose => eprintln!("no icon for {}: {why}", app.bundle_identifier),
-                Err(_) => {}
+                Ok(Ok(_)) => {}
+                Ok(Err(why)) if verbose => eprintln!("no icon for {}: {why}", app.bundle_identifier),
+                Ok(Err(_)) => {}
+                Err(_) => {
+                    misses += 1;
+                    if verbose {
+                        eprintln!("no icon in time for {}", app.bundle_identifier);
+                    }
+                }
             }
         }
-        println!("{}", json!({"name": app.name, "bundle": app.bundle_identifier, "icon": icon}));
+        if misses >= 3 {
+            icons = None; // the icon service has stopped answering: the list goes on without
+        }
+        println!("{}", json!({"name": app.name, "bundle": app.bundle_identifier, "icon": icon,
+                              "removable": app.is_removable, "first_party": app.is_first_party,
+                              "internal": app.is_internal, "path": app.path}));
     }
     Ok(())
 }
 
+/// Apple's apps on the home screen that can't be removed (the others that can't are the
+/// system's own helpers: stickers, message extensions, previews).
+const HOME_SCREEN_BUILT_INS: [&str; 2] = ["com.apple.mobilephone", "com.apple.Preferences"];
+/// How long the phone may take to list its apps, and to give each one's icon.
+const APPS_FOR: Duration = Duration::from_secs(30);
+const ICON_FOR: Duration = Duration::from_secs(5);
 /// Text up to this size comes with a look at the clipboard; bigger, it's left on the phone.
 const CLIPBOARD_TEXT: i64 = 256 * 1024;
 /// How often the clipboard's change count is looked at, besides the phone's own word of changes.
@@ -658,12 +770,28 @@ async fn stream_screen(
 
     // The picture: RTP from the phone, its frames out as they come. A keyframe is asked for
     // when the first packet comes, so the decoder can start, and the phone hears regularly that
-    // someone's watching.
+    // someone's watching. A packet lost breaks the picture until the next keyframe (the frames
+    // after it are changes to it): one is asked for at once, and the picture waits for it
+    // rather than show the broken ones (green, with what changes drawn over it).
     let mut frames = HevcDepacketizer::new();
-    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    // Handset reads the picture at its own pace: it's written from a thread of its own, so a slow
+    // read never holds up the packets coming in (the phone's link drops those not taken in time,
+    // and each one lost costs a keyframe).
+    let (to_handset, units) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+        for unit in units {
+            if out.write_all(&unit).and_then(|_| out.flush()).is_err() {
+                break; // Handset stopped reading
+            }
+        }
+    });
     let (mut media_ssrc, mut fir) = (0u32, 0u8);
     let mut alive = tokio::time::interval(Duration::from_secs(1));
     let mut heard = Instant::now();
+    let mut losses = Losses::default();
+    let mut awaiting: Option<Instant> = None; // since when a keyframe is awaited, after a loss
+    let mut asked = Instant::now(); // when one was last asked for
     let mut ended = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
@@ -674,15 +802,39 @@ async fn stream_screen(
                     continue;
                 }
                 let Some(rtp) = RtpPacket::parse(&datagram.data) else { continue };
+                let lost = losses.saw(rtp.sequence_number);
+                let mut ask = media_ssrc == 0
+                    || (awaiting.is_some() && asked.elapsed() >= KEYFRAME_AGAIN);
+                if lost && awaiting.is_none() {
+                    if options.verbose {
+                        eprintln!("a picture packet was lost: asking for a keyframe");
+                    }
+                    frames = HevcDepacketizer::new(); // not waiting on what won't come
+                    awaiting = Some(Instant::now());
+                    ask = true;
+                }
                 if media_ssrc == 0 {
                     media_ssrc = rtp.ssrc;
+                }
+                if ask {
                     let request = build_keyframe_request(our_ssrc, "handset@desk", media_ssrc, &[], fir);
                     fir = fir.wrapping_add(1);
+                    asked = Instant::now();
                     let _ = video.send_to(datagram.source_port, request).await;
                 }
                 frames.push(rtp.sequence_number, rtp.timestamp, rtp.payload);
                 let unit = frames.take_output();
-                if !unit.is_empty() && out.write_all(&unit).and_then(|_| out.flush()).is_err() {
+                let unit = match awaiting {
+                    None => &unit[..],
+                    Some(_) => match keyframe_start(&unit) {
+                        Some(at) => {
+                            awaiting = None;
+                            &unit[at..]
+                        }
+                        None => &[][..],
+                    },
+                };
+                if !unit.is_empty() && to_handset.send(unit.to_vec()).is_err() {
                     break; // Handset stopped reading
                 }
             }
@@ -690,12 +842,16 @@ async fn stream_screen(
                 if media_ssrc != 0 {
                     let _ = video.send_to(VIDEO_PORT, build_liveness(our_ssrc, "handset@desk", &[])).await;
                 }
-                if heard.elapsed() > QUIET {
+                let unanswered = awaiting.is_some_and(|since| since.elapsed() > KEYFRAME_FOR);
+                if heard.elapsed() > QUIET || unanswered {
                     if options.verbose {
                         eprintln!("the phone's stream went quiet: starting it again");
                     }
                     heard = Instant::now();
                     media_ssrc = 0; // and a keyframe is asked for again
+                    losses = Losses::default();
+                    // The new stream's first frames are a keyframe's: shown from there.
+                    frames = HevcDepacketizer::new();
                     if let Err(why) = start_screen(&mut display, &call, (&ours, audio_port, video_port), &theirs, our_ssrc).await {
                         // The connection itself is gone (the phone was unplugged, slept, or left
                         // Wi-Fi): Handset starts over, with a new one, whichever way is there.
@@ -728,11 +884,127 @@ async fn start_screen(
     display
         .start_media_stream(build_start_audio_parameters(ours, audio_port, theirs, AUDIO_PORT, offer, 140, session))
         .await?;
-    let offer = build_screen_video_offer(&call_id(), call, our_ssrc)?;
-    display
+    let offer = screen_offer(&call_id(), call, &screen_blob(our_ssrc))?;
+    let answer = display
         .start_media_stream(build_start_video_parameters(ours, video_port, theirs, VIDEO_PORT, offer, 140, 1, session))
         .await?;
+    // What the phone settled on (its bit rate, frame rate, size), for Handset's debugging log.
+    let settled = answer.as_dictionary().and_then(|a| a.get("connection")).and_then(|c| c.as_dictionary())
+        .and_then(|c| c.get("streamConfig"));
+    if let Some(config) = settled {
+        eprintln!("the phone's stream: {config:?}");
+    }
     Ok(())
+}
+
+/// A protobuf message, written field by field (as the crate's own encoder writes them, zeros
+/// too).
+#[derive(Default)]
+struct Message(Vec<u8>);
+
+impl Message {
+    fn varint(&mut self, mut value: u64) {
+        while value >= 0x80 {
+            self.0.push(value as u8 | 0x80);
+            value >>= 7;
+        }
+        self.0.push(value as u8);
+    }
+    fn number(&mut self, field: u64, value: u64) {
+        self.varint(field << 3);
+        self.varint(value);
+    }
+    fn bytes(&mut self, field: u64, value: &[u8]) {
+        self.varint(field << 3 | 2);
+        self.varint(value.len() as u64);
+        self.0.extend_from_slice(value);
+    }
+    fn message(&mut self, field: u64, fill: impl FnOnce(&mut Message)) {
+        let mut inner = Message::default();
+        fill(&mut inner);
+        self.bytes(field, &inner.0);
+    }
+}
+
+/// The screen's media offer (AVConference's VCMediaNegotiationBlob), as the idevice crate makes
+/// it (Xcode's), but for two settings: feedback allowed, so the phone honours the keyframes the
+/// picture asks for after a lost packet (it ignores them otherwise); and no long-term reference
+/// frames, which leave the picture torn after a loss. The phone keeps the rest as Xcode's: its own
+/// screen size and frame rate, and at most 6 Mbit/s however much more is offered.
+fn screen_blob(ssrc: u32) -> Vec<u8> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let ntp = ((now.as_secs() + 2_208_988_800) << 32) | ((u64::from(now.subsec_nanos()) << 32) / 1_000_000_000);
+    media_blob(ssrc, ntp, true, false, b"FLS;SW:1;")
+}
+
+/// The blob, its settings given: `feedback` (allowRTCPFB), `ltrp` (long-term reference
+/// frames) and the HEVC codec's feature string.
+fn media_blob(ssrc: u32, ntp: u64, feedback: bool, ltrp: bool, hevc_features: &[u8]) -> Vec<u8> {
+    fn formats(codec: &mut Message, variants: &[u64]) {
+        for &variant in variants {
+            codec.message(2, |format| {
+                format.number(1, 1);
+                format.number(2, variant);
+                format.number(3, 0xc3c3);
+                format.number(4, 0);
+            });
+        }
+    }
+    let mut blob = Message::default();
+    blob.number(1, 1);
+    blob.number(2, 1);
+    blob.message(5, |screen| {
+        screen.number(1, u64::from(ssrc));
+        screen.number(2, u64::from(feedback)); // allowRTCPFB
+        screen.message(3, |codec| {
+            codec.number(1, 123); // H.264
+            formats(codec, &[1, 2, 1, 2]);
+            codec.bytes(3, b"FLS;SW:1;");
+            codec.number(4, 1);
+        });
+        screen.message(3, |codec| {
+            codec.number(1, 100); // HEVC
+            formats(codec, &[1, 2]);
+            codec.bytes(3, hevc_features);
+            codec.number(4, 14);
+        });
+        screen.number(7, u64::from(ltrp)); // ltrpEnabled
+        screen.number(8, 63);
+        screen.number(12, 1);
+    });
+    blob.bytes(6, b"Viceroy 1.7.0");
+    blob.number(8, 0);
+    for (id, value, flags) in [(0, 20_000_000, Some(0x18000)), (4074, 0, Some(0x4000)), (0, 60_000_000, Some(0x40000)),
+        (0, 40_000_000, Some(0x3000)), (16, 4100, None), (0, 6_000_000, Some(0x20000)), (4, 6500, None),
+        (0, 100_000_000, Some(0x100000)), (1, 299, None), (0, 75_000_000, Some(0x80000))]
+    {
+        blob.message(9, |param| {
+            param.number(1, id);
+            param.number(2, value);
+            if let Some(flags) = flags {
+                param.number(3, flags);
+            }
+        });
+    }
+    blob.number(13, ntp);
+    blob.number(14, 2);
+    blob.number(16, 0);
+    blob.number(18, 1);
+    blob.0
+}
+
+/// The offer as the phone takes it: a binary plist with the blob zlib-compressed.
+fn screen_offer(call_id: &str, call: &CallInfoBlob, blob: &[u8]) -> Fallible<Vec<u8>> {
+    let mut compressed = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    compressed.write_all(blob)?;
+    let mut offer = plist::Dictionary::new();
+    offer.insert("avcMediaStreamOptionCallID".into(), plist::Value::String(call_id.into()));
+    offer.insert("avcMediaStreamNegotiatorMediaBlob".into(), plist::Value::Data(compressed.finish()?));
+    offer.insert("avcMediaStreamNegotiatorMode".into(), plist::Value::Integer(NEGOTIATOR_MODE_COREDEVICE_SCREEN.into()));
+    offer.insert("avcMediaStreamOptionRemoteEndpointInfo".into(), plist::Value::Data(call.encode()));
+    let mut out = Vec::new();
+    plist::to_writer_binary(&mut out, &plist::Value::Dictionary(offer)).map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 #[tokio::main]
@@ -753,5 +1025,61 @@ async fn main() {
     if let Err(why) = done {
         say(json!({"event": "error", "message": why.to_string()}));
         std::process::exit(1);
+    }
+    // Out now: the runtime would otherwise wait for its read of standard input, which only ends
+    // when Handset closes it (not when the helper is told to stop).
+    std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_packets_are_not_lost() {
+        let mut losses = Losses::default();
+        assert!(!losses.saw(10));
+        assert!(!losses.saw(12)); // 11 is late
+        assert!(!losses.saw(11));
+        for number in 13..40 {
+            assert!(!losses.saw(number));
+        }
+    }
+
+    #[test]
+    fn a_packet_that_never_comes_is_lost_once() {
+        let mut losses = Losses::default();
+        assert!(!losses.saw(65534));
+        let lost: Vec<bool> = (0..20u16).map(|i| losses.saw(65535u16.wrapping_add(1 + i))).collect();
+        // 65535 never came: lost once enough newer ones have come (across the wrap to 0).
+        assert_eq!(lost.iter().filter(|l| **l).count(), 1);
+    }
+
+    #[test]
+    fn a_stream_started_again_is_not_a_loss() {
+        let mut losses = Losses::default();
+        losses.saw(100);
+        assert!(!losses.saw(30000));
+        for number in 30001..30040 {
+            assert!(!losses.saw(number));
+        }
+    }
+
+    #[test]
+    fn the_offer_is_xcodes_but_for_its_two_settings() {
+        use idevice::services::core_device::display_stream::negotiation::{SCREEN_HEVC_FLS, build_screen_media_blob};
+        let (ssrc, ntp) = (0x1234_5678, 0xE9C0_0000_8000_0000);
+        assert_eq!(media_blob(ssrc, ntp, false, true, SCREEN_HEVC_FLS.as_bytes()), build_screen_media_blob(ssrc, ntp));
+        assert_ne!(media_blob(ssrc, ntp, true, false, b"FLS;SW:1;"), build_screen_media_blob(ssrc, ntp));
+    }
+
+    #[test]
+    fn keyframes_found() {
+        let slice = [0, 0, 0, 1, 0x02, 0x01, 0xaa]; // a trailing picture's slice (type 1)
+        let vps = [0, 0, 0, 1, 0x40, 0x01, 0xbb]; // parameter sets (type 32)
+        let idr = [0, 0, 1, 0x26, 0x01, 0xcc]; // a keyframe's slice (type 19)
+        assert_eq!(keyframe_start(&slice), None);
+        assert_eq!(keyframe_start(&[&slice[..], &vps[..]].concat()), Some(slice.len()));
+        assert_eq!(keyframe_start(&idr), Some(0));
     }
 }

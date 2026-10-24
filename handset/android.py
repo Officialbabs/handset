@@ -54,8 +54,18 @@ PHONE_SERVER = "/data/local/tmp/handset-scrcpy-server.jar"
 # The video's longest edge, in the phone's pixels, when the window doesn't say (0: the screen's
 # own size). The window asks for what its monitor can show (stream_edge).
 MAX_EDGE = 0
-# Enough for a whole phone screen at 60 frames a second without blocky moving text.
+# Enough for a whole phone screen at 60 frames a second without blocky moving text, over Wi-Fi;
+# a cable carries twice that, for moving text as sharp as still.
 BIT_RATE = 12_000_000
+CABLE_BIT_RATE = 24_000_000
+# Frames a second asked of the phone when the window doesn't say (it asks for its monitor's).
+FRAME_RATE = 60
+
+
+def bit_rate(serial: str) -> int:
+    """What the phone's video may use: more over a cable than over Wi-Fi (an adb serial over
+    Wi-Fi is an address and port, or the phone's wireless debugging name)."""
+    return BIT_RATE if ":" in serial or "_adb-tls-connect" in serial else CABLE_BIT_RATE
 
 
 def stream_edge(monitor_pixels: int, natural: tuple[int, int]) -> int:
@@ -471,6 +481,7 @@ class Video:
         self.sock: socket.socket | None = None
         self.forward_port: int | None = None
         self.edge = MAX_EDGE  # the video's longest edge (0: the screen's own size)
+        self.fps = FRAME_RATE
         self.stopped = False
         self.session = 0  # each start of the phone's side; a stale reader stops quietly
         self.time_limit = True  # screenrecord's "--time-limit 0"; older Androids refuse it
@@ -530,7 +541,7 @@ class Video:
         limit = "--time-limit 0 " if self.time_limit else ""
         command = adb_command(self.serial, "exec-out",
                               f"screenrecord --output-format=h264 {limit}--size {w}x{h} "
-                              f"--bit-rate {BIT_RATE} -")
+                              f"--bit-rate {bit_rate(self.serial)} -")
         started = time.monotonic()
         try:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=TOOL_ERRORS)
@@ -568,7 +579,7 @@ class Video:
         options = (f"scid={scid} log_level=warn tunnel_forward=true audio=false control=false "
                    "cleanup=false send_device_meta=false send_frame_meta=false send_dummy_byte=true "
                    f"send_codec_meta=true video_codec=h264 max_size={self.edge} "
-                   f"video_bit_rate={BIT_RATE} max_fps=60")
+                   f"video_bit_rate={bit_rate(self.serial)} max_fps={self.fps}")
         command = adb_command(self.serial, "shell",
                               f"CLASSPATH={PHONE_SERVER} app_process / com.genymobile.scrcpy.Server "
                               f"{self.version} {options}")
@@ -673,7 +684,7 @@ class Android:
     `on_awake(on)` (the screen went on or off) and `on_ended(why)` run on GLib's main loop."""
 
     def __init__(self, link: Link, on_frame, on_turned, on_touch, on_ended, on_awake=None,
-                 edge: int | None = None):
+                 edge: int | None = None, fps: int = FRAME_RATE):
         self.link = link
         self.on_turned = on_turned
         self.on_touch = on_touch
@@ -684,6 +695,7 @@ class Android:
         self.locked = False  # the lock screen shows (its PIN pad is hidden from screen sharing)
         self.video = Video(link.serial, link.natural, link.rotation, on_frame, on_ended)
         self.video.edge = MAX_EDGE if edge is None else edge
+        self.video.fps = fps
         self.touch = Touch(link.serial, link.natural, self._touch_ready, self._touch_failed)
         self.commands = Commands(link.serial)
         self.live_touch = False
@@ -961,9 +973,10 @@ class AppScreen:
     and watches it, as Android does (`awake`, `locked`)."""
 
     def __init__(self, link: Link, package: str, on_frame, on_turned, on_touch, on_ended, on_awake=None,
-                 edge: int | None = None):
+                 edge: int | None = None, fps: int = FRAME_RATE):
         self.link = link
         self.package = package
+        self.fps = fps
         self.on_frame = on_frame
         self.on_turned = on_turned
         self.on_touch = on_touch
@@ -1088,7 +1101,7 @@ class AppScreen:
         options = (f"scid={scid} log_level=info tunnel_forward=true audio=false control=true cleanup=false "
                    "clipboard_autosync=false send_device_meta=false send_frame_meta=false "
                    "send_dummy_byte=true send_codec_meta=true video_codec=h264 max_size=0 "
-                   f"video_bit_rate={BIT_RATE} max_fps=60 new_display={width}x{height} "
+                   f"video_bit_rate={bit_rate(serial)} max_fps={self.fps} new_display={width}x{height} "
                    "vd_system_decorations=false display_ime_policy=hide")
         command = adb_command(serial, "shell", f"CLASSPATH={PHONE_SERVER} app_process / "
                                                f"com.genymobile.scrcpy.Server {self.version} {options}")

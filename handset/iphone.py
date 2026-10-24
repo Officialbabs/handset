@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -131,7 +132,6 @@ SWIPES = {
     # In from the left edge, quick, as a thumb does: a touch that starts on the screen's very
     # first pixel column, or moves slowly, isn't taken for the edge swipe.
     "back": ((0.004, 0.5), (0.72, 0.5), 220, 0),
-    "recents": ((0.5, 0.995), (0.5, 0.55), 350, 600),  # up from the bottom, and hold
     "notifications": ((0.3, 0.0), (0.3, 0.61), 350, 0),  # down from the top left
     "quick_settings": ((0.88, 0.0), (0.88, 0.61), 350, 0),  # down from the top right
 }
@@ -271,7 +271,12 @@ class IPhone:
         threading.Thread(target=self._play, args=(gesture,), daemon=True).start()
 
     def key(self, name: str):
-        if name in BUTTONS:
+        if name == "recents":
+            # The app switcher: home pressed twice, as on an iPhone with a home button. (Its
+            # gesture, a swipe up held halfway, is too often taken for going home.)
+            self._send({"op": "button", "name": "home"})
+            self._send({"op": "button", "name": "home"})
+        elif name in BUTTONS:
             self._send({"op": "button", "name": BUTTONS[name]})
         elif name in KEYS:
             self._send({"op": "key", "name": name})
@@ -453,6 +458,11 @@ def list_apps(link: Link, icons: str) -> list[tuple[str, str, str | None]] | str
 
 def plainly(why: str) -> str:
     """The helper's reasons, in the words a person needs: most mean the phone isn't reachable."""
+    if '"code": Integer(9022)' in why or "call is currently in progress" in why:
+        return "It's on a call: its screen shows here again when the call ends."
+    said = re.search(r'"NSLocalizedDescription": String\("((?:[^"\\]|\\.)*)"\)', why)
+    if said:
+        why = said.group(1)  # the phone's own words, not the whole reply
     gone = ("No route to host", "adapter closed", "Connection refused", "timed out", "Network is unreachable",
             "went to sleep", "device socket io failed", "unplugged")
     if any(word in why for word in gone):

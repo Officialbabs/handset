@@ -272,6 +272,25 @@ def clipboard_server(port):
     return 0
 
 
+def media_watch():
+    """The loop that watches the media sessions: `media_session` (lines as dumpsys gives them),
+    said with the phone's uptime first, again each time the file changes; never-ending."""
+    path = os.path.join(HERE, "media_session")
+    said = None
+    while True:
+        try:
+            with open(path) as file:
+                lines = file.read()
+        except OSError:
+            lines = ""
+        if lines != said:
+            print(f"{time.monotonic():.2f} 1.00")
+            print(lines.rstrip("\n"))
+            print("--", flush=True)
+            said = lines
+        time.sleep(0.05)
+
+
 def others() -> dict[str, tuple[str, float]]:
     try:
         with open(os.path.join(HERE, "others")) as file:
@@ -335,6 +354,15 @@ def main(args):
         return events()
     if args[:1] == ["shell"] and " ".join(args[1:]).startswith("dumpsys notification"):
         return notification(" ".join(args[1:]))
+    if args[:1] == ["shell"] and "dumpsys media_session" in " ".join(args[1:]):
+        return media_watch()
+    if args[:1] == ["shell"] and " ".join(args[1:]).startswith("dumpsys bluetooth_manager"):
+        try:
+            with open(os.path.join(HERE, "avrcp")) as file:
+                print(file.read())
+        except OSError:
+            pass
+        return 0
     if args[:1] == ["shell"] and " ".join(args[1:]) == "date +%s.%N":
         print(f"{time.time():.6f}")
         return 0

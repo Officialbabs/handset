@@ -10,6 +10,7 @@ Everything handed back runs on GLib's main loop."""
 
 from __future__ import annotations
 
+import os
 import threading
 from collections.abc import Callable
 
@@ -31,6 +32,10 @@ DECODERS = {"h264": ("vah264dec", "avdec_h264", "openh264dec"),
 # The frames' layouts GTK takes as they are from ordinary memory: three planes (I420, from
 # software decoders), or luma and interleaved chroma (NV12, from GPUs).
 FORMATS = {"I420": Gdk.MemoryFormat.G8_B8_R8_420, "NV12": Gdk.MemoryFormat.G8_B8R8_420}
+# Debugging: each stream's first bytes kept in this folder (decoder.Decoder._dump).
+DUMP = os.environ.get("HANDSET_DUMP")
+DUMP_BYTES = 40 * 1024 * 1024
+
 # Planes in a GPU frame, by its DRM format's name.
 DRM_PLANES = {"NV12": 2, "P010": 2, "YU12": 3}
 
@@ -75,6 +80,13 @@ def drm_format(text: str) -> tuple[int, int, int]:
     return fourcc, int(modifier, 16) if modifier else 0, DRM_PLANES.get(name, 1)
 
 
+def even_up(size: float) -> int:
+    """A frame's side in whole pairs of pixels (the colour planes are half size each way), never
+    smaller than asked."""
+    whole = max(2, -int(-size // 1))
+    return whole + whole % 2
+
+
 def kept_size(made: tuple[int, int], native: tuple[int, int], crop: tuple[int, int]) -> tuple[int, int]:
     """The screen's part of frames made `made` big from a stream whose own frames are `native`,
     with the screen's part `crop`: as much smaller as the frames were made, in whole pairs of
@@ -92,11 +104,16 @@ class Decoder:
     `formats` are the layouts taken from ordinary memory; `gpu_frames` False keeps a GPU's
     frames out of its memory too.
 
-    `show_at(width, height)` says how big the frames show, in the monitor's pixels: they are
-    then made twice that size (never more than they are), on the GPU when it decodes, and the
-    window halves them exactly. Halving is an even average of every 2×2 pixels, so small text
-    stays sharp; drawing a whole phone screen at a quarter of its size or less in one step either
-    leaves it jagged or (mipmapped) soft."""
+    `show_at(width, height)` says how big the frames show, in the monitor's pixels. The phone's
+    full-size frames are then made exactly twice that (their screen's part, when the stream is
+    padded), on the GPU when it decodes, and the window halves them: an even average of every 2×2
+    pixels, exactly on the monitor's. Measured against an ideal shrink (Lanczos, full colour) of
+    the phone's own frames, that's the closest, as sharp; one shrink to the window's size, or
+    the window shrinking full-size frames itself, comes out softer. It keeps the colour's detail
+    too: frames carry colour at half their size each way. A window more than half the phone's
+    screen gets the frames as they are."""
+
+    dumps = 0  # streams kept so far (HANDSET_DUMP)
 
     def __init__(self, codec: str, on_frame: Callable[[Gdk.Texture], None],
                  on_broken: Callable[[], None] | None = None,
@@ -107,6 +124,7 @@ class Decoder:
         self.gpu_frames = gpu_frames
         self.crop = crop
         self.cropped: tuple[int, int] | None = None
+        self.exact: tuple[tuple[int, int], tuple[int, int]] | None = None  # (made, its screen part)
         self.shown_at: tuple[int, int] | None = None  # the frames' size in the window
         self.native: tuple[int, int] | None = None  # the frames' size as decoded
         self.native_crop: tuple[int, int] | None = None
@@ -121,7 +139,9 @@ class Decoder:
         self.caps = None
         self.color = None
         self.frames = 0
+        self.decoded = 0
         self.stopped = False
+        self.dumped = None
 
     def start(self) -> bool:
         """False when no decoder for this codec is installed."""
@@ -131,7 +151,9 @@ class Decoder:
         display = Gdk.Display.get_default()
         self.dmabuf = self.gpu_frames and name.startswith("va") and display is not None
         if self.dmabuf:
-            scaler = "vapostproc name=scaler scale-method=hq"
+            # The GPU's own scaling, not its "hq" one: measured against an ideal (Lanczos)
+            # shrink of the phone's frames, "hq" comes out softer and shifted.
+            scaler = "vapostproc name=scaler"
             self.base_caps = "video/x-raw(memory:DMABuf),format=DMA_DRM"
         else:
             # The decoder's own 4:2:0 frames: videoconvert only steps in for a decoder that gives
@@ -163,16 +185,19 @@ class Decoder:
             self._resize()
 
     def scaled_size(self) -> tuple[int, int] | None:
-        """The size the frames are made: twice what the window shows of the screen, the same
-        shape, never more than they are (None: as decoded)."""
+        """The size the frames are made (None: as decoded): so their screen's part is exactly
+        twice the pixels the window shows, for the window to halve; as they are when they aren't
+        that big (a window more than half the phone's screen)."""
+        self.exact = None
         if not self.shown_at or not self.native:
             return None
         (fw, fh), (cw, ch) = self.native, self.native_crop or self.native
-        dw, dh = self.shown_at
-        scale = min(1.0, 2 * dw / cw, 2 * dh / ch)
-        if scale > 0.9:
-            return None  # all but their own size: as they are
-        return max(2, round(fw * scale / 2) * 2), max(2, round(fh * scale / 2) * 2)
+        tw, th = 2 * self.shown_at[0], 2 * self.shown_at[1]
+        if tw > cw or th > ch:
+            return None
+        made = (even_up(fw * tw / cw), even_up(fh * th / ch)) if self.native_crop else (tw, th)
+        self.exact = (made, (tw, th))
+        return made
 
     def _size_caps(self) -> str:
         size = self.scaled_size()
@@ -195,6 +220,7 @@ class Decoder:
             structure = event.parse_caps().get_structure(0)
             native = (structure.get_int("width")[1], structure.get_int("height")[1])
             if native != self.native:
+                debug("decoded at", f"{native[0]}x{native[1]}")
                 self.native = native
                 self.native_crop = self.crop(native) if self.crop else None
                 GLib.idle_add(self._resize)
@@ -204,6 +230,19 @@ class Decoder:
         source = self.source
         if source:
             source.emit("push-buffer", Gst.Buffer.new_wrapped(data))
+        if DUMP:
+            self._dump(data)
+
+    def _dump(self, data: bytes):
+        """Debugging: the stream as it came, its first DUMP_BYTES, kept in HANDSET_DUMP's folder
+        (h265-1.raw…), to look at frames offline."""
+        if self.dumped is None:
+            Decoder.dumps += 1
+            self.dumped = open(os.path.join(DUMP, f"{self.codec}-{Decoder.dumps}.raw"), "wb")
+        if not self.dumped.closed:
+            self.dumped.write(data)
+            if self.dumped.tell() > DUMP_BYTES:
+                self.dumped.close()
 
     def stop(self):
         self.stopped = True
@@ -239,6 +278,7 @@ class Decoder:
         sample = sink.emit("pull-sample")
         if sample is None:
             return Gst.FlowReturn.OK
+        self.decoded += 1
         caps = sample.get_caps()
         if self.caps is None or not caps.is_equal(self.caps):  # a new wrapper every frame
             self.caps = caps
@@ -280,7 +320,11 @@ class Decoder:
             what = GstVideo.VideoFormat.to_string(self.info.finfo.format)
         native = self.native or (self.width, self.height)
         self.color = color_state(colorimetry, native)
-        self.cropped = kept_size((self.width, self.height), native, self.native_crop) if self.native_crop else None
+        if self.exact and self.exact[0] == (self.width, self.height):
+            # Made for the window: its screen's part exactly the pixels the window shows.
+            self.cropped = self.exact[1] if self.native_crop else None
+        else:
+            self.cropped = kept_size((self.width, self.height), native, self.native_crop) if self.native_crop else None
         debug("video", what, self.width, self.height, "colours", colorimetry.to_string(), "kept", self.cropped)
 
     def _show(self):
@@ -313,7 +357,7 @@ class Decoder:
         self.on_frame(texture)
         self.frames += 1
         if self.frames in (1, 30) or self.frames % 600 == 0:
-            debug("frames shown:", self.frames, f"{width}x{height}")
+            debug("frames shown:", self.frames, f"{width}x{height}", "of", self.decoded, "decoded")
         return GLib.SOURCE_REMOVE
 
     def _gpu_texture(self, width, height, planes, color, sample) -> Gdk.Texture | None:
