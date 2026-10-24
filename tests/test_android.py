@@ -172,6 +172,18 @@ class FakePhone(unittest.TestCase):
         self.assertFalse(android.open_link("FAKE7", None, None).awake)
         self.assertIsInstance(android.open_link("SOMEONE-ELSE", None, None), str)
 
+    def test_finding_it_by_cable_or_wifi_at_once(self):
+        with open(os.path.join(self.tmp.name, "others"), "w") as file:
+            file.write("192.168.18.20:5555 FAKE7 0\n"  # the same phone over Wi-Fi
+                       "adb-PIXEL9-x1Yz._adb-tls-connect._tcp PIXEL9 0\n"
+                       "slow-one SLOW 3\n"
+                       "quick-one QUICK 0\n")
+        self.assertEqual(find_serial("FAKE7", "192.168.18.20", 5555), "FAKE7")  # the cable first
+        self.assertEqual(find_serial("PIXEL9"), "adb-PIXEL9-x1Yz._adb-tls-connect._tcp")
+        began = time.monotonic()
+        self.assertEqual(find_serial("QUICK"), "quick-one")
+        self.assertLess(time.monotonic() - began, 2.5)  # not waiting on the slow one first
+
     def test_live_video(self):
         frames, ended = [], []
         video = Video("FAKE7", (1080, 2400), 0, frames.append, ended.append)

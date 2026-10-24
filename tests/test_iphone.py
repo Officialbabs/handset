@@ -40,10 +40,13 @@ class PointsTest(unittest.TestCase):
 
 class WordsTest(unittest.TestCase):
     def test_an_unreachable_phone_said_plainly(self):
-        for why in ("No route to host (os error 113)", "adapter closed", "The iPhone went to sleep or left Wi-Fi."):
-            self.assertTrue(plainly(why).startswith("It went to sleep or left Wi-Fi"))
-        self.assertEqual(plainly("The iPhone isn't on this Wi-Fi: unlock it and keep it near."),
-                         "The iPhone isn't on this Wi-Fi: unlock it and keep it near.")
+        for why in ("No route to host (os error 113)", "adapter closed",
+                    "The iPhone went to sleep or left Wi-Fi: it didn't answer.",
+                    "The iPhone's link by cable went: it was unplugged, went to sleep or left Wi-Fi."):
+            self.assertTrue(plainly(why).startswith("It isn't plugged in, and it's asleep or off Wi-Fi"))
+        for why in ("The iPhone isn't plugged in or on this Wi-Fi: plug it in, or unlock it and keep it near.",
+                    "The iPhone is plugged in but its cable link didn't open (PasswordProtected): unlock it."):
+            self.assertEqual(plainly(why), why)
 
 
 class CropTest(unittest.TestCase):

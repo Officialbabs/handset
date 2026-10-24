@@ -3,13 +3,16 @@
 GStreamer's test picture as H.264 and whose uinput and input commands are written down. It
 keeps its state in FAKEADB_DIR: `rotation` (degrees, to turn the screen), `wakefulness` (Awake,
 Dozing… as `dumpsys power` says; the wake key wakes it), `log.jsonl` (what it
-was asked) and `uinput.jsonl` (the virtual touchscreen's commands). Never a real phone."""
+was asked) and `uinput.jsonl` (the virtual touchscreen's commands). `others`, if there, lists more
+connections adb has, one per line: "<serial> <serial number> <seconds to answer getprop>" (another
+phone, or FAKE7 over Wi-Fi); they answer nothing else. Never a real phone."""
 
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 
 HERE = os.environ.get("FAKEADB_DIR", ".")
 SERIAL = "FAKE7"
@@ -60,15 +63,31 @@ def uinput():
                               "syncToken": command.get("syncToken")}), flush=True)
 
 
+def others() -> dict[str, tuple[str, float]]:
+    try:
+        with open(os.path.join(HERE, "others")) as file:
+            lines = [line.split() for line in file if line.strip()]
+    except OSError:
+        return {}
+    return {serial: (number, float(seconds)) for serial, number, seconds in lines}
+
+
 def main(args):
     if args[:1] == ["-s"]:
         serial, args = args[1], args[2:]
+        if serial in others():
+            number, seconds = others()[serial]
+            if args == ["shell", "getprop ro.serialno"]:
+                time.sleep(seconds)
+                print(number)
+            return 0
         if serial != SERIAL:
             print(f"adb: device '{serial}' not found", file=sys.stderr)
             return 1
     log(args)
     if args == ["devices"]:
-        print(f"List of devices attached\n{SERIAL}\tdevice\n")
+        listed = "".join(f"{serial}\tdevice\n" for serial in others())
+        print(f"List of devices attached\n{SERIAL}\tdevice\n{listed}")
         return 0
     if args[:1] == ["exec-out"] and "screenrecord" in " ".join(args[1:]):
         screenrecord(" ".join(args[1:]))

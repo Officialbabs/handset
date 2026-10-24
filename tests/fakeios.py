@@ -23,7 +23,7 @@ def main(args):
         return 2
     with open(os.path.join(HERE, "args.json"), "w") as file:
         json.dump(args, file)
-    say(event="status", text="Connecting over Wi-Fi")
+    say(event="status", text="Looking for the iPhone on its cable and on Wi-Fi")
     say(event="video", codec="h264")
     width, height = os.environ.get("FAKEIOS_SIZE", "390x844").split("x")
     video = subprocess.Popen(

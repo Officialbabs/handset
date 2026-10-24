@@ -20,6 +20,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from queue import Queue
 
@@ -97,8 +98,10 @@ def parse_devices(text: str) -> list[str]:
 
 
 def find_serial(phone_id: str, address: str | None = None, port: int | None = None) -> str | None:
-    """The adb serial of the phone Ada's service calls `phone_id`. By cable the serial is the id;
-    over Wi-Fi adb lists it by address, so failing that each phone is asked its serial number."""
+    """The adb serial of the phone Ada's service calls `phone_id`, by cable or over Wi-Fi, from
+    one look at everything adb has. By cable the serial is the id, and it's taken first; over
+    Wi-Fi adb lists the phone by address, or by the name wireless debugging gives it (which
+    holds the id). Failing those, every other phone is asked its serial number, all at once."""
     try:
         serials = parse_devices(adb(None, "devices", timeout=5))
     except (OSError, subprocess.SubprocessError):
@@ -107,13 +110,24 @@ def find_serial(phone_id: str, address: str | None = None, port: int | None = No
         return phone_id
     if address and f"{address}:{port or 5555}" in serials:
         return f"{address}:{port or 5555}"
-    for serial in serials:
+    named = [serial for serial in serials if serial.startswith(f"adb-{phone_id}-")]
+    if named:
+        return named[0]
+
+    def number(serial: str) -> str | None:
         try:
-            if shell(serial, "getprop ro.serialno", timeout=5).strip() == phone_id:
-                return serial
+            return shell(serial, "getprop ro.serialno", timeout=5).strip()
         except (OSError, subprocess.SubprocessError):
-            continue
-    return None
+            return None
+
+    if not serials:
+        return None
+    pool = ThreadPoolExecutor(max_workers=len(serials))
+    try:
+        asked = {pool.submit(number, serial): serial for serial in serials}
+        return next((asked[done] for done in as_completed(asked) if done.result() == phone_id), None)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def parse_wm_size(text: str) -> tuple[int, int] | None:

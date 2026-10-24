@@ -29,7 +29,8 @@ screen.
 
 ## How it works
 
-On an Android phone, Handset uses the same adb connection Ada set up:
+On an Android phone, Handset uses the same adb connection Ada set up, by cable or over Wi-Fi,
+the cable when it's both:
 
 - **The screen** comes as live H.264 video. With the `scrcpy` package installed, Handset uses its
   small server, which is the smoothest and follows the phone as it turns. Without it, Handset uses
@@ -41,12 +42,14 @@ On an Android phone, Handset uses the same adb connection Ada set up:
 - **Keys and text** go in as key presses.
 - **What Ada is doing** comes from her phone service, which Handset only listens to.
 
-On an iPhone (iOS 27, set up with Ada for Wi-Fi), a small helper in Rust (`ios/`, built by
+On an iPhone (iOS 27, set up with Ada), a small helper in Rust (`ios/`, built by
 `install.sh` where Rust is installed) does the talking, with the same toolkit Ada's phone service
 uses (`idevice`):
 
-- **It finds the phone on Wi-Fi** and connects with the pairing Ada's desktop already made, so
-  there's nothing to tap on the phone.
+- **It looks for the phone by its cable and on Wi-Fi at the same time**, and uses whichever
+  answers first (the cable, when it's plugged in). By cable it goes through usbmuxd with the
+  phone's own "Trust This Computer" pairing; over Wi-Fi, with the pairing Ada's desktop already
+  made. Either way there's nothing to tap on the phone, and unplugging it carries on over Wi-Fi.
 - **The screen** is Apple's own live screen-sharing stream (H.265, up to 60 frames a second, as
   Xcode shows it). The stream pads its frames out to whole blocks; Handset keeps the screen's
   own size, by the phone's model.

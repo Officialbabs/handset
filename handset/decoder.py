@@ -75,6 +75,14 @@ def drm_format(text: str) -> tuple[int, int, int]:
     return fourcc, int(modifier, 16) if modifier else 0, DRM_PLANES.get(name, 1)
 
 
+def kept_size(made: tuple[int, int], native: tuple[int, int], crop: tuple[int, int]) -> tuple[int, int]:
+    """The screen's part of frames made `made` big from a stream whose own frames are `native`,
+    with the screen's part `crop`: as much smaller as the frames were made, in whole pairs of
+    pixels, since the colour planes are half size each way and GTK won't take an odd GPU frame."""
+    (mw, mh), (fw, fh), (cw, ch) = made, native, crop
+    return (min(mw - mw % 2, 2 * round(cw * mw / fw / 2)), min(mh - mh % 2, 2 * round(ch * mh / fh / 2)))
+
+
 class Decoder:
     """One stream's decoder. `push()` takes bytes from any thread; `on_frame(texture)` gets the
     newest frame (a slow window skips the ones in between); `on_broken()` says the decoder
@@ -272,12 +280,7 @@ class Decoder:
             what = GstVideo.VideoFormat.to_string(self.info.finfo.format)
         native = self.native or (self.width, self.height)
         self.color = color_state(colorimetry, native)
-        self.cropped = None
-        if self.native_crop:
-            # The screen's part, as much smaller as the frames were made.
-            (fw, fh), (cw, ch) = native, self.native_crop
-            self.cropped = (min(self.width, round(cw * self.width / fw)),
-                            min(self.height, round(ch * self.height / fh)))
+        self.cropped = kept_size((self.width, self.height), native, self.native_crop) if self.native_crop else None
         debug("video", what, self.width, self.height, "colours", colorimetry.to_string(), "kept", self.cropped)
 
     def _show(self):

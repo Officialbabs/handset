@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 
-from handset.decoder import Decoder, hardware  # first: it says which GTK
+from handset.decoder import Decoder, hardware, kept_size  # first: it says which GTK
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 # GPU frames reach GTK through its display: there's one only where GTK can start.
@@ -95,6 +95,15 @@ class ColoursTest(unittest.TestCase):
         width, height = decoder.scaled_size()
         self.assertAlmostEqual(width / 1184, 550 / 1170, places=2)
         self.assertAlmostEqual(height / 2576, 1190 / 2532, places=2)
+
+    def test_the_screens_part_is_even(self):
+        # An iPhone 12's frames made 556×1210: its screen's part, 549.4×1189.3, as 549×1189 GTK
+        # refused for the GPU (NV12 needs whole pairs of pixels).
+        self.assertEqual(kept_size((556, 1210), (1184, 2576), (1170, 2532)), (550, 1190))
+        self.assertEqual(kept_size((1184, 2576), (1184, 2576), (1170, 2532)), (1170, 2532))
+        width, height = kept_size((375, 813), (1184, 2576), (1170, 2532))
+        self.assertEqual((width % 2, height % 2), (0, 0))
+        self.assertLessEqual(width, 374)
 
     def test_scaled_frames_decode_at_that_size(self):
         frames, shown = [], []

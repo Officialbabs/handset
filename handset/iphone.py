@@ -1,5 +1,5 @@
-"""An iPhone, the way Ada's phone service reaches one: over Wi-Fi, with the pairing the desktop
-already made and Apple's developer services. A small helper (handset-ios, in ios/) does the
+"""An iPhone, the ways Ada's phone service reaches one: by its cable and over Wi-Fi, both tried at
+once, with the pairings the phone and the desktop already made and Apple's developer services. A small helper (handset-ios, in ios/) does the
 talking to the phone; Handset runs it and speaks to it in lines:
 
 - its standard output is the phone's screen as video, as the helper's first status line says
@@ -385,7 +385,7 @@ class IPhone:
 def plainly(why: str) -> str:
     """The helper's reasons, in the words a person needs: most mean the phone isn't reachable."""
     gone = ("No route to host", "adapter closed", "Connection refused", "timed out", "Network is unreachable",
-            "went to sleep", "device socket io failed")
+            "went to sleep", "device socket io failed", "unplugged")
     if any(word in why for word in gone):
-        return "It went to sleep or left Wi-Fi. It shows here again once it's back: unlock it."
+        return "It isn't plugged in, and it's asleep or off Wi-Fi. Plug it in or unlock it, and it shows here again."
     return why

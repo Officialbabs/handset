@@ -1,6 +1,7 @@
-//! Handset's iPhone helper: it reaches the iPhone over Wi-Fi with the pairing Ada's desktop
-//! already made, the way Ada's phone service does (Apple's remote pairing, a tunnel in user
-//! space, CoreDevice's services), and then:
+//! Handset's iPhone helper: it reaches the iPhone the ways Ada's phone service does, by its cable
+//! and over Wi-Fi at once, whichever answers first (a tunnel in user space to CoreDevice's
+//! services: by cable through usbmuxd and CoreDeviceProxy, over Wi-Fi with Apple's remote pairing
+//! and the pairing Ada's desktop already made), and then:
 //!
 //! - writes the phone's screen to standard output, as H.265 (Annex B) from the phone's own
 //!   screen-sharing stream;
@@ -19,7 +20,9 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use idevice::RsdService;
+use idevice::core_device_proxy::CoreDeviceProxy;
+use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection};
+use idevice::{IdeviceService, RsdService};
 use idevice::core_device::{
     CallInfoBlob, DisplayServiceClient, HevcDepacketizer, RtpPacket, build_screen_audio_offer,
     build_screen_video_offer, build_start_audio_parameters, build_start_video_parameters,
@@ -121,7 +124,7 @@ fn browse(address: Option<IpAddr>, verbose: bool) -> Fallible<(IpAddr, u16)> {
     found.dedup();
     match found.as_slice() {
         [one] => Ok(*one),
-        [] => Err("The iPhone isn't on this Wi-Fi: unlock it and keep it near.".into()),
+        [] => Err("The iPhone isn't plugged in or on this Wi-Fi: plug it in, or unlock it and keep it near.".into()),
         _ => Err("More than one iPhone is here: Handset needs the address Ada knows.".into()),
     }
 }
@@ -249,8 +252,81 @@ async fn work_input(
     }
 }
 
+/// The phone's developer services, reached: a tunnel to them with its own TCP in user space, and
+/// their handshake.
+type Reached = (idevice::tcp::handle::AdapterHandle, RsdHandshake);
+
+/// How a way to the phone missed it: the phone isn't there that way at all (no cable), or it is
+/// and something stopped it, in words.
+enum Missed {
+    Absent,
+    Failed(String),
+}
+
 async fn stream(options: Options) -> Fallible<()> {
-    status(&format!("Looking for {} on Wi-Fi", "the iPhone"));
+    status("Looking for the iPhone on its cable and on Wi-Fi");
+    let (way, (mut adapter, mut handshake)) = reach(&options).await?;
+    if options.verbose {
+        eprintln!("phone {} reached {way}", options.udid);
+    }
+    stream_screen(options, way, &mut adapter, &mut handshake).await
+}
+
+/// The phone both ways at once, by its cable and over Wi-Fi: the first way to reach its services
+/// is used and the other given up, the cable first when both are there together. Neither
+/// reaching it, the cable's reason counts when the phone is plugged in, Wi-Fi's otherwise.
+async fn reach(options: &Options) -> Fallible<(&'static str, Reached)> {
+    let cable = tokio::time::timeout(REACH_FOR, by_cable(&options.udid));
+    let wifi = by_wifi(options);
+    tokio::pin!(cable, wifi);
+    let (mut cable_missed, mut wifi_missed): (Option<Missed>, Option<String>) = (None, None);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut cable, if cable_missed.is_none() => match result {
+                Ok(Ok(reached)) => return Ok(("by cable", reached)),
+                Ok(Err(missed)) => cable_missed = Some(missed),
+                Err(_) => cable_missed = Some(Missed::Failed("The iPhone is plugged in but didn't answer: unlock it.".into())),
+            },
+            result = &mut wifi, if wifi_missed.is_none() => match result {
+                Ok(reached) => return Ok(("over Wi-Fi", reached)),
+                Err(why) => wifi_missed = Some(why.to_string()),
+            },
+        }
+        if let (Some(cable), Some(wifi)) = (&cable_missed, &wifi_missed) {
+            return Err(match cable {
+                Missed::Failed(why) => why.clone(),
+                Missed::Absent => wifi.clone(),
+            }
+            .into());
+        }
+    }
+}
+
+/// The phone by its cable: usbmuxd lists it while it's plugged in, and the pairing the phone keeps
+/// from trusting this computer opens CoreDeviceProxy, a tunnel to the same services as over
+/// Wi-Fi (as Ada's phone service does by cable). Nothing here asks the phone to trust anyone.
+async fn by_cable(udid: &str) -> Result<Reached, Missed> {
+    let plugged = async {
+        let mut usbmuxd = UsbmuxdConnection::default().await.ok()?;
+        usbmuxd.get_device(udid).await.ok().filter(|device| device.connection_type == Connection::Usb)
+    };
+    let device = plugged.await.ok_or(Missed::Absent)?;
+    let failed = |why: String| Missed::Failed(format!("The iPhone is plugged in but its cable link didn't open ({why}): unlock it."));
+    let proxy = CoreDeviceProxy::connect(&device.to_provider(UsbmuxdAddr::default(), "handset"))
+        .await
+        .map_err(|e| failed(e.to_string()))?;
+    let rsd_port = proxy.tunnel_info().server_rsd_port;
+    let mut adapter = proxy.create_software_tunnel().map_err(|e| failed(e.to_string()))?.to_async_handle();
+    let services = adapter.connect(rsd_port).await.map_err(|e| failed(e.to_string()))?;
+    let handshake = RsdHandshake::new(services).await.map_err(|e| failed(e.to_string()))?;
+    Ok((adapter, handshake))
+}
+
+/// The phone over Wi-Fi: found on the network (or where Ada's service last saw it), then reached
+/// with the pairing Ada's desktop made. Its reasons are only ever shown when the phone isn't
+/// plugged in either.
+async fn by_wifi(options: &Options) -> Fallible<Reached> {
     let (ip, port) = match (options.address, options.port) {
         (Some(ip), Some(port)) => (ip, port),
         (address, _) => {
@@ -265,18 +341,15 @@ async fn stream(options: Options) -> Fallible<()> {
     if options.verbose {
         eprintln!("phone {} at {ip}:{port}", options.udid);
     }
-
-    status("Connecting over Wi-Fi");
-    let (mut adapter, mut handshake) = tokio::time::timeout(REACH_FOR, reach(ip, port, &options.pairing))
+    tokio::time::timeout(REACH_FOR, over_wifi(ip, port, &options.pairing))
         .await
-        .map_err(|_| "The iPhone went to sleep or left Wi-Fi: it didn't answer.")??;
-    stream_screen(options, &mut adapter, &mut handshake).await
+        .map_err(|_| "The iPhone went to sleep or left Wi-Fi: it didn't answer.")?
 }
 
-/// The phone's developer services, reached: the pairing Ada's desktop made, checked again (never
-/// made anew here: that needs the person at the phone, and Ada's own card), then a tunnel with
-/// its own TCP in user space, and the services' handshake.
-async fn reach(ip: IpAddr, port: u16, pairing: &str) -> Fallible<(idevice::tcp::handle::AdapterHandle, RsdHandshake)> {
+/// The phone's developer services over Wi-Fi: the pairing Ada's desktop made, checked again
+/// (never made anew here: that needs the person at the phone, and Ada's own card), then a tunnel
+/// with its own TCP in user space, and the services' handshake.
+async fn over_wifi(ip: IpAddr, port: u16, pairing: &str) -> Fallible<Reached> {
     let mut pairing = RpPairingFile::read_from_file(pairing).await?;
     let unreachable = "The iPhone went to sleep or left Wi-Fi: it didn't answer.";
     let socket = RpPairingSocket::new(TcpStream::connect((ip, port)).await.map_err(|_| unreachable)?);
@@ -305,13 +378,14 @@ async fn reach(ip: IpAddr, port: u16, pairing: &str) -> Fallible<(idevice::tcp::
 
 async fn stream_screen(
     options: Options,
+    way: &str,
     adapter: &mut idevice::tcp::handle::AdapterHandle,
     handshake: &mut RsdHandshake,
 ) -> Fallible<()> {
 
     // The phone's screen, as its screen-sharing stream: sound first (it opens the session),
     // then the picture, in one session.
-    status("Starting the iPhone's screen");
+    status(&format!("Starting the iPhone's screen {way}"));
     let mut display = DisplayServiceClient::connect_rsd(&mut *adapter, &mut *handshake)
         .await
         .map_err(|e| format!("The iPhone's screen sharing isn't there ({e}): turn on Developer Mode."))?;
@@ -403,10 +477,10 @@ async fn stream_screen(
                     heard = Instant::now();
                     media_ssrc = 0; // and a keyframe is asked for again
                     if let Err(why) = start_screen(&mut display, &call, (&ours, audio_port, video_port), &theirs, our_ssrc).await {
-                        // The connection itself is gone (the phone slept, or left Wi-Fi): Handset
-                        // starts over, with a new one.
+                        // The connection itself is gone (the phone was unplugged, slept, or left
+                        // Wi-Fi): Handset starts over, with a new one, whichever way is there.
                         eprintln!("starting the stream again: {why}");
-                        return Err("The iPhone went to sleep or left Wi-Fi.".into());
+                        return Err(format!("The iPhone's link {way} went: it was unplugged, went to sleep or left Wi-Fi.").into());
                     }
                 }
             }

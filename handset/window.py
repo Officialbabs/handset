@@ -40,7 +40,7 @@ MOST_RETRY_MS = 30000
 # An awake phone that sends no picture this long after its video starts (or it wakes) is opened
 # again, this many times before Handset says so.
 PICTURE_WAIT_MS = 8000
-# An iPhone takes longer: found on Wi-Fi, a tunnel, then its screen's stream.
+# An iPhone takes longer: found by its cable or on Wi-Fi, a tunnel, then its screen's stream.
 IPHONE_PICTURE_WAIT_MS = 25000
 PICTURE_TRIES = 3
 
@@ -440,8 +440,8 @@ class Window(Adw.ApplicationWindow):
         self.set_title(f"{phone.name} – {status_line(phone)}")
         self._show_ada(phone)
         if phone.platform == "ios":
-            # Handset's helper finds an iPhone on Wi-Fi by itself; Ada's service seeing it come
-            # back is a good moment to try again, though.
+            # Handset's helper looks for an iPhone by its cable and on Wi-Fi by itself; Ada's service
+            # seeing it come back (plugged in, say) is a good moment to try again, though.
             if changed or (phone.online and not was_online and self.device is None and not self.opening):
                 self._open()
         elif not phone.online:
@@ -499,7 +499,7 @@ class Window(Adw.ApplicationWindow):
             self._turned()
             self.device.start()
             self._show_at()
-            self._show_status("phone-symbolic", f"Connecting to {name} over Wi-Fi…", "")
+            self._show_status("phone-symbolic", f"Connecting to {name}…", "")
             self._expect_picture(IPHONE_PICTURE_WAIT_MS)
             return GLib.SOURCE_REMOVE
         # The phone's own size when the GPU decodes; otherwise as sharp as the monitor can show
