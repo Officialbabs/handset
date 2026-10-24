@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import struct
@@ -1259,3 +1260,262 @@ class AppScreen:
     def type(self, text: str) -> int:
         self._send(text_messages(text))
         return 0
+
+
+# ---- The phone's clipboard ---------------------------------------------------------------------
+
+SET_CLIPBOARD = 9
+DEVICE_CLIPBOARD, DEVICE_ACK = 0, 1
+MOST_CLIPBOARD = 262130  # bytes: more than the phone's binder takes in one go
+
+
+def clipboard_message(text: str) -> bytes:
+    """SET_CLIPBOARD: no acknowledgement asked, nothing pasted; cut to what the phone takes,
+    never splitting a character."""
+    data = text.encode()
+    if len(data) > MOST_CLIPBOARD:
+        data = data[:MOST_CLIPBOARD].decode(errors="ignore").encode()
+    return struct.pack(">BQBI", SET_CLIPBOARD, 0, 0, len(data)) + data
+
+
+class ClipboardLink:
+    """The phone's clipboard, both ways, through scrcpy's server run for that alone (no video, no
+    display): `on_text(text)` on GLib's main loop whenever something is copied on the phone (by any
+    app; nothing while it's locked), and set(text) to put text on it. Text only. Android says on
+    the phone when its clipboard is read ("Shell pasted…") and opens its clipboard editor when
+    it's set. It starts again by itself if the link drops."""
+
+    def __init__(self, serial: str, on_text: Callable[[str], None]):
+        self.serial = serial
+        self.on_text = on_text
+        self.control: socket.socket | None = None
+        self.process: subprocess.Popen | None = None
+        self.port: int | None = None
+        self.stopped = False
+        self.last = None  # the text last seen either way, so neither side hears its own echo
+        self.lock = threading.Lock()
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self.stopped = True
+        control, self.control = self.control, None
+        if control:
+            try:
+                control.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            control.close()
+        process, self.process = self.process, None
+        if process and process.poll() is None:
+            process.kill()
+            process.wait()
+        if self.port:
+            try:
+                adb(self.serial, "forward", "--remove", f"tcp:{self.port}", timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    def set(self, text: str):
+        if not text or text == self.last:
+            return
+        self.last = text
+        control = self.control
+        if control:
+            try:
+                with self.lock:
+                    control.sendall(clipboard_message(text))
+            except OSError:
+                pass
+
+    def _run(self):
+        delay = 2
+        while not self.stopped:
+            started = time.monotonic()
+            self._session()
+            if self.stopped:
+                return
+            delay = 2 if time.monotonic() - started > 60 else min(delay * 2, 60)
+            time.sleep(delay)
+
+    def _session(self):
+        version = scrcpy_version()
+        if not version:
+            return
+        scid = f"{secrets.randbits(31):08x}"
+        try:
+            adb(self.serial, "push", SCRCPY_SERVER, PHONE_SERVER, timeout=30)
+            self.port = int(adb(self.serial, "forward", "tcp:0", f"localabstract:scrcpy_{scid}").strip())
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            debug("the phone's clipboard didn't open:", error)
+            return
+        options = (f"scid={scid} log_level=warn tunnel_forward=true video=false audio=false control=true "
+                   "clipboard_autosync=true power_on=false cleanup=false send_device_meta=false send_dummy_byte=true")
+        command = adb_command(self.serial, "shell", f"CLASSPATH={PHONE_SERVER} app_process / "
+                                                    f"com.genymobile.scrcpy.Server {version} {options}")
+        try:
+            self.process = subprocess.Popen(command, stdout=TOOL_ERRORS, stderr=TOOL_ERRORS)
+        except OSError:
+            return
+        control = None
+        for _ in range(60):  # the control socket is the first here: it sends the one byte
+            if self.stopped or self.process.poll() is not None:
+                break
+            try:
+                sock = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+                if sock.recv(1) == b"\0":
+                    control = sock
+                    break
+                sock.close()
+            except OSError:
+                pass
+            time.sleep(0.1)
+        if not control:
+            return
+        control.settimeout(None)
+        self.control = control
+        debug("the phone's clipboard is linked")
+        try:
+            while not self.stopped:
+                kind = read_exactly(control, 1)[0]
+                if kind == DEVICE_CLIPBOARD:
+                    (length,) = struct.unpack(">I", read_exactly(control, 4))
+                    text = read_exactly(control, length).decode(errors="replace")
+                    if text and text != self.last:
+                        self.last = text
+                        GLib.idle_add(self.on_text, text)
+                elif kind == DEVICE_ACK:
+                    read_exactly(control, 8)
+                else:
+                    break  # something this doesn't know: start afresh
+        except (OSError, ConnectionError):
+            pass
+        self.control = None
+        process, self.process = self.process, None
+        if process and process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+# ---- Files on the phone ----------------------------------------------------------------------
+
+DOWNLOADS = "/sdcard/Download"
+
+
+@dataclass
+class PhoneFile:
+    """One thing in a folder on the phone."""
+
+    name: str
+    path: str
+    folder: bool
+    size: int
+    modified: float  # seconds since the epoch
+
+
+def parse_listing(data: bytes, folder: str) -> list[PhoneFile]:
+    """`find -printf '%M\\t%s\\t%T@\\t%f\\0'` output: folders first, then by name; hidden ones left out."""
+    found = []
+    for entry in data.split(b"\0"):
+        parts = entry.decode(errors="surrogateescape").split("\t", 3)
+        if len(parts) != 4 or not parts[3] or parts[3].startswith("."):
+            continue
+        mode, size, when, name = parts
+        try:
+            found.append(PhoneFile(name, f"{folder.rstrip('/')}/{name}", mode.startswith("d"), int(size), float(when)))
+        except ValueError:
+            continue
+    return sorted(found, key=lambda f: (not f.folder, f.name.casefold()))
+
+
+def list_folder(serial: str, folder: str) -> list[PhoneFile] | str:
+    """What's in a folder on the phone, or why not, in words."""
+    quoted = shlex.quote(folder.rstrip("/") + "/")
+    try:
+        result = subprocess.run(adb_command(serial, "exec-out", f"find {quoted} -mindepth 1 -maxdepth 1 "
+                                                               "-printf '%M\\t%s\\t%T@\\t%f\\0' 2>/dev/null"),
+                                capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"The phone didn't answer ({error})."
+    if result.returncode:
+        return "The phone didn't list that folder."
+    return parse_listing(result.stdout, folder)
+
+
+def free_name(serial: str, folder: str, name: str) -> str:
+    """A name in the phone's folder that isn't taken: the name, or "name (2).ext" and on."""
+    stem, dot, ext = name.rpartition(".") if "." in name.strip(".") else (name, "", "")
+    listed = list_folder(serial, folder)
+    taken = {f.name for f in listed} if isinstance(listed, list) else set()
+    candidate, number = name, 2
+    while candidate in taken:
+        candidate = f"{stem} ({number}){dot}{ext}"
+        number += 1
+    return candidate
+
+
+def send_files(serial: str, paths: list[str], folder: str = DOWNLOADS) -> tuple[list[str], str | None]:
+    """Files (or folders) from this computer to a folder on the phone, under names not taken
+    there; then the phone's media index learns each file, so its apps show it now. The paths
+    they got on the phone, and why the rest didn't go."""
+    sent, trouble = [], None
+    for path in paths:
+        target = f"{folder.rstrip('/')}/{free_name(serial, folder, os.path.basename(path.rstrip('/')))}"
+        try:
+            result = subprocess.run(adb_command(serial, "push", path, target), capture_output=True, timeout=3600)
+        except (OSError, subprocess.SubprocessError) as error:
+            trouble = str(error)
+            continue
+        if result.returncode:
+            said = result.stderr.decode(errors="replace").strip().splitlines()
+            trouble = said[-1] if said else "adb push failed"
+            continue
+        sent.append(target)
+        if os.path.isfile(path):
+            try:
+                shell(serial, f"content call --uri content://media --method scan_file --arg {shlex.quote(target)}",
+                      timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return sent, trouble
+
+
+def fetch_file(serial: str, path: str, folder: str) -> str | None:
+    """A file from the phone into a folder here, under a name not taken there (its date kept):
+    where it went, or None."""
+    name = os.path.basename(path)
+    stem, dot, ext = name.rpartition(".") if "." in name.strip(".") else (name, "", "")
+    target, number = os.path.join(folder, name), 2
+    while os.path.exists(target):
+        target = os.path.join(folder, f"{stem} ({number}){dot}{ext}")
+        number += 1
+    os.makedirs(folder, exist_ok=True)
+    try:
+        result = subprocess.run(adb_command(serial, "pull", "-a", path, target), capture_output=True, timeout=3600)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return target if result.returncode == 0 and os.path.exists(target) else None
+
+
+class AdbFiles:
+    """An Android phone's files, as the Files dialog and dropped files use them (as
+    iphone.FilesSession): its storage, a folder at a time."""
+
+    top = "/sdcard"
+    downloads = DOWNLOADS
+
+    def __init__(self, serial: str):
+        self.serial = serial
+
+    def list_folder(self, folder: str) -> list[PhoneFile] | str:
+        return list_folder(self.serial, folder)
+
+    def fetch_file(self, path: str, folder: str) -> str | None:
+        return fetch_file(self.serial, path, folder)
+
+    def send_files(self, paths: list[str], folder: str) -> tuple[list[str], str | None]:
+        return send_files(self.serial, paths, folder)
+
+    def stop(self):
+        pass

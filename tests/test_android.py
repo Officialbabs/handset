@@ -10,7 +10,8 @@ import unittest
 from gi.repository import GLib
 
 from handset import android
-from handset.android import (Android, AppScreen, Link, Touch, Video, display_size, down_events, even_size,
+from handset.android import (Android, AppScreen, ClipboardLink, Link, clipboard_message, fetch_file, list_folder,
+                             parse_listing, send_files, Touch, Video, display_size, down_events, even_size,
                              find_serial, gesture_command, list_apps, parse_app_list, start_app_message,
                              text_messages, touch_message,
                              key_command, parse_awake, parse_devices, parse_locked, parse_rotation, parse_wm_size,
@@ -374,6 +375,97 @@ class AppScreenTest(FakeAdb):
         finally:
             screen.stop()
         self.assertEqual(ended, ["That app isn't on the phone any more."])
+
+
+class ClipboardTest(FakeAdb):
+    """The phone's clipboard both ways, through the stand-in for scrcpy's server."""
+
+    def setUp(self):
+        super().setUp()
+        self.version = android.scrcpy_version
+        android.scrcpy_version = lambda: "3.3.4"
+
+    def tearDown(self):
+        android.scrcpy_version = self.version
+        super().tearDown()
+
+    def test_the_message(self):
+        message = clipboard_message("héllo")
+        self.assertEqual(message[:14], bytes([9]) + bytes(8) + bytes([0]) + (6).to_bytes(4, "big"))
+        self.assertEqual(message[14:], "héllo".encode())
+        self.assertEqual(len(clipboard_message("é" * 200000)) - 14, android.MOST_CLIPBOARD)  # whole characters
+
+    def test_both_ways(self):
+        with open(os.path.join(self.tmp.name, "phone_clipboard"), "w") as file:
+            file.write("from before")  # there when it opens: not news
+        heard = []
+        link = ClipboardLink("FAKE7", heard.append)
+        link.start()
+        try:
+            spin(lambda: link.control is not None)
+            with open(os.path.join(self.tmp.name, "phone_clipboard"), "w") as file:
+                file.write("copied on the phone")
+            spin(lambda: heard)
+            self.assertEqual(heard, ["copied on the phone"])
+            link.set("copied on the computer")
+            link.set("copied on the computer")  # the same again: sent once
+            spin(lambda: self.logged("control.jsonl"))
+            time.sleep(0.5)
+            self.assertEqual(self.logged("control.jsonl"), [{"type": "set_clipboard", "text": "copied on the computer",
+                                                            "paste": 0}])
+            self.assertEqual(heard, ["copied on the phone"])  # its own isn't heard back
+            started = next(a[1] for a in self.logged("log.jsonl") if a[:1] == ["shell"] and "Server" in a[1])
+            self.assertIn("video=false", started)
+            self.assertIn("power_on=false", started)
+        finally:
+            link.stop()
+
+
+class FilesTest(FakeAdb):
+    """Files to and from the stand-in phone's storage (FAKEADB_DIR/sdcard)."""
+
+    def put(self, path, text="x"):
+        full = os.path.join(self.tmp.name, "sdcard", path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as file:
+            file.write(text)
+
+    def test_reading_a_listing(self):
+        data = (b"drwxrws---\t3452\t1768388897.605\tCamera\0-rw-rw----\t12\t1768388000.5\tb.txt\0"
+                b"-rw-rw----\t3\t1768388000.5\t.hidden\0-rw-rw----\t9\t1768388000.5\tA.jpg\0")
+        files = parse_listing(data, "/sdcard/DCIM/")
+        self.assertEqual([(f.name, f.folder, f.path) for f in files], [
+            ("Camera", True, "/sdcard/DCIM/Camera"), ("A.jpg", False, "/sdcard/DCIM/A.jpg"),
+            ("b.txt", False, "/sdcard/DCIM/b.txt")])
+
+    def test_a_folder_on_the_phone(self):
+        self.put("Download/notes.txt", "hello")
+        self.put("Download/Trips/one.jpg")
+        files = list_folder("FAKE7", "/sdcard/Download")
+        self.assertEqual([(f.name, f.folder) for f in files], [("Trips", True), ("notes.txt", False)])
+        self.assertEqual(files[1].size, 5)
+        self.assertIsInstance(list_folder("FAKE7", "/sdcard/Nowhere"), str)
+
+    def test_sending_files_never_overwrites(self):
+        self.put("Download/photo.jpg", "on the phone already")
+        here = os.path.join(self.tmp.name, "photo.jpg")
+        with open(here, "w") as file:
+            file.write("from the computer")
+        sent, trouble = send_files("FAKE7", [here, here])
+        self.assertIsNone(trouble)
+        self.assertEqual(sent, ["/sdcard/Download/photo (2).jpg", "/sdcard/Download/photo (3).jpg"])
+        with open(os.path.join(self.tmp.name, "sdcard", "Download", "photo.jpg")) as file:
+            self.assertEqual(file.read(), "on the phone already")
+        scanned = [a for a in self.logged("log.jsonl") if a[:1] == ["shell"] and "scan_file" in a[1]]
+        self.assertEqual(len(scanned), 2)  # the phone's apps show them now
+
+    def test_fetching_a_file(self):
+        self.put("Download/notes.txt", "hello")
+        folder = os.path.join(self.tmp.name, "Downloads")
+        first = fetch_file("FAKE7", "/sdcard/Download/notes.txt", folder)
+        second = fetch_file("FAKE7", "/sdcard/Download/notes.txt", folder)
+        self.assertEqual((os.path.basename(first), os.path.basename(second)), ("notes.txt", "notes (2).txt"))
+        self.assertIsNone(fetch_file("FAKE7", "/sdcard/Download/gone.txt", folder))
 
 
 if __name__ == "__main__":

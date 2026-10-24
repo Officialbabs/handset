@@ -17,19 +17,34 @@
 //! `apps` lists the phone's apps instead, one JSON object per line on standard output
 //! ({"name","bundle","icon"}), with each icon saved as a PNG in the --icons folder.
 //!
+//! `clipboard` shares the phone's clipboard: each text copied on it as a line on standard output
+//! ({"event":"clipboard","text"}), and {"op":"set","text"} on standard input put on it.
+//!
+//! `files` reaches the phone's media files (photos, Downloads, recordings: Apple's file service,
+//! AFC): a command per line on standard input, each answered by a line on standard output.
+//! {"op":"list","path"} → {"event":"list","path","entries":[{"name","folder","size","modified"}]};
+//! {"op":"fetch","path","to"} → {"event":"fetched","path"} (to: a file here);
+//! {"op":"send","from","path"} → {"event":"sent","path"} (from: a file here);
+//! or {"event":"error","op","path","message"}.
+//!
 //!     handset-ios stream --pairing FILE --udid UDID [--address IP] [--port PORT] [--verbose]
 //!     handset-ios apps --pairing FILE --udid UDID [--address IP] [--icons DIR] [--verbose]
+//!     handset-ios clipboard --pairing FILE --udid UDID [--address IP] [--verbose]
+//!     handset-ios files --pairing FILE --udid UDID [--address IP] [--verbose]
 
 use std::error::Error;
 use std::io::Write;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+use idevice::afc::AfcClient;
+use idevice::afc::opcode::AfcFopenMode;
 use idevice::core_device_proxy::CoreDeviceProxy;
 use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection};
 use idevice::{IdeviceService, RsdService};
 use idevice::core_device::{
-    AppIconTarget, AppServiceClient, CallInfoBlob, IconServiceClient, DisplayServiceClient, HevcDepacketizer, RtpPacket, build_screen_audio_offer,
+    AppIconTarget, AppServiceClient, CallInfoBlob, DataInclusionPolicy, GENERAL_PASTEBOARD, IconServiceClient,
+    PasteboardServiceClient, PasteboardSnapshot, DisplayServiceClient, HevcDepacketizer, RtpPacket, build_screen_audio_offer,
     build_screen_video_offer, build_start_audio_parameters, build_start_video_parameters,
 };
 use idevice::remote_pairing::{RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native};
@@ -87,8 +102,8 @@ struct Options {
 fn options() -> Result<Options, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().cloned().unwrap_or_default();
-    if command != "stream" && command != "apps" {
-        return Err("usage: handset-ios stream|apps --pairing FILE --udid UDID [--address IP] [--port PORT]".into());
+    if !["stream", "apps", "clipboard", "files"].contains(&command.as_str()) {
+        return Err("usage: handset-ios stream|apps|clipboard|files --pairing FILE --udid UDID [--address IP] [--port PORT]".into());
     }
     let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     Ok(Options {
@@ -322,6 +337,149 @@ async fn list_apps(options: Options) -> Fallible<()> {
         println!("{}", json!({"name": app.name, "bundle": app.bundle_identifier, "icon": icon}));
     }
     Ok(())
+}
+
+/// Text up to this size comes with a look at the clipboard; bigger, it's left on the phone.
+const CLIPBOARD_TEXT: i64 = 256 * 1024;
+/// How often the clipboard's change count is looked at, besides the phone's own word of changes.
+const CLIPBOARD_LOOK: Duration = Duration::from_secs(3);
+
+/// The phone's clipboard, both ways: the phone says when it changes (when it does: it's looked at
+/// every few seconds too, by its change count alone), and what's set here goes on it. What it
+/// holds when this starts isn't news; nor is what was just set from here.
+async fn clipboard(options: Options) -> Fallible<()> {
+    let (_way, (mut adapter, mut handshake)) = reach(&options).await?;
+    let mut watcher = PasteboardServiceClient::connect_rsd(&mut adapter, &mut handshake).await?;
+    let mut board = PasteboardServiceClient::connect_rsd(&mut adapter, &mut handshake).await?;
+    let first = board.get_with_policy(GENERAL_PASTEBOARD, DataInclusionPolicy::AllPromised).await?;
+    let (mut count, mut last): (Option<i64>, Option<String>) = (first.change_count, None);
+    let (pushed, mut pushes) = mpsc::channel::<PasteboardSnapshot>(8);
+    if watcher
+        .set_change_notifications(true, GENERAL_PASTEBOARD, Some(DataInclusionPolicy::Threshold(CLIPBOARD_TEXT)))
+        .await
+        .is_ok()
+    {
+        tokio::spawn(async move {
+            while let Ok(snapshot) = watcher.recv_push().await {
+                if pushed.send(snapshot).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let (sent, mut commands) = mpsc::channel::<Value>(16);
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(command) = serde_json::from_str::<Value>(&line) {
+                if sent.send(command).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    say(json!({"event": "clipboard", "ready": true}));
+    let mut look = tokio::time::interval(CLIPBOARD_LOOK);
+    let mut listening = true;
+    loop {
+        tokio::select! {
+            snapshot = pushes.recv(), if listening => match snapshot {
+                Some(snapshot) => news(snapshot, &mut count, &mut last),
+                None => listening = false,
+            },
+            command = commands.recv() => {
+                let Some(command) = command else { break };
+                if command.get("op").and_then(Value::as_str) == Some("set") {
+                    let text = command.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+                    if !text.is_empty() && last.as_deref() != Some(text.as_str()) {
+                        board.set_text(&text, GENERAL_PASTEBOARD).await?;
+                        last = Some(text);
+                        count = board.get_with_policy(GENERAL_PASTEBOARD, DataInclusionPolicy::AllPromised).await?.change_count;
+                    }
+                }
+            }
+            _ = look.tick() => {
+                let now = board.get_with_policy(GENERAL_PASTEBOARD, DataInclusionPolicy::AllPromised).await?;
+                if now.change_count.is_some() && now.change_count != count {
+                    let snapshot = board.get_with_policy(GENERAL_PASTEBOARD, DataInclusionPolicy::Threshold(CLIPBOARD_TEXT)).await?;
+                    news(snapshot, &mut count, &mut last);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The phone's media files, a command at a time (the module's head says which).
+async fn files(options: Options) -> Fallible<()> {
+    let (_way, (mut adapter, mut handshake)) = reach(&options).await?;
+    let mut afc = AfcClient::connect_rsd(&mut adapter, &mut handshake).await?;
+    say(json!({"event": "files", "ready": true}));
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(command) = serde_json::from_str::<Value>(&line) else { continue };
+        let field = |name: &str| command.get(name).and_then(Value::as_str).unwrap_or("").to_string();
+        let (op, path) = (field("op"), field("path"));
+        let answer = match op.as_str() {
+            "list" => list_folder(&mut afc, &path).await,
+            "fetch" => fetch_file(&mut afc, &path, &field("to")).await,
+            "send" => send_file(&mut afc, &field("from"), &path).await,
+            _ => continue,
+        };
+        let answer = answer.unwrap_or_else(|why| json!({"event": "error", "op": op, "path": path, "message": why.to_string()}));
+        println!("{answer}");
+    }
+    Ok(())
+}
+
+async fn list_folder(afc: &mut AfcClient, path: &str) -> Fallible<Value> {
+    let mut entries = Vec::new();
+    for name in afc.list_dir(path).await? {
+        if name == "." || name == ".." {
+            continue;
+        }
+        let full = format!("{}/{}", path.trim_end_matches('/'), name);
+        if let Ok(info) = afc.get_file_info(&full).await {
+            entries.push(json!({
+                "name": name,
+                "folder": info.st_ifmt == "S_IFDIR",
+                "size": info.size,
+                "modified": info.modified.and_utc().timestamp(),
+            }));
+        }
+    }
+    Ok(json!({"event": "list", "path": path, "entries": entries}))
+}
+
+async fn fetch_file(afc: &mut AfcClient, path: &str, to: &str) -> Fallible<Value> {
+    let mut file = afc.open(path, AfcFopenMode::RdOnly).await?;
+    let mut out = tokio::fs::File::create(to).await?;
+    tokio::io::copy(&mut file, &mut out).await?;
+    file.close().await?;
+    Ok(json!({"event": "fetched", "path": path, "to": to}))
+}
+
+async fn send_file(afc: &mut AfcClient, from: &str, path: &str) -> Fallible<Value> {
+    let mut input = tokio::fs::File::open(from).await?;
+    let mut file = afc.open(path, AfcFopenMode::WrOnly).await?;
+    tokio::io::copy(&mut input, &mut file).await?;
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    file.close().await?;
+    Ok(json!({"event": "sent", "path": path}))
+}
+
+/// A clipboard snapshot: its text said, if it's new.
+fn news(snapshot: PasteboardSnapshot, count: &mut Option<i64>, last: &mut Option<String>) {
+    if snapshot.change_count.is_some() && snapshot.change_count == *count {
+        return;
+    }
+    *count = snapshot.change_count;
+    if let Some(text) = snapshot.text() {
+        if last.as_deref() != Some(text.as_str()) {
+            println!("{}", json!({"event": "clipboard", "text": text}));
+            *last = Some(text);
+        }
+    }
 }
 
 async fn stream(options: Options) -> Fallible<()> {
@@ -586,7 +744,12 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let done = if options.command == "apps" { list_apps(options).await } else { stream(options).await };
+    let done = match options.command.as_str() {
+        "apps" => list_apps(options).await,
+        "clipboard" => clipboard(options).await,
+        "files" => files(options).await,
+        _ => stream(options).await,
+    };
     if let Err(why) = done {
         say(json!({"event": "error", "message": why.to_string()}));
         std::process::exit(1);

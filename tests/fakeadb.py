@@ -12,6 +12,7 @@ phone, or FAKE7 over Wi-Fi); they answer nothing else. Never a real phone."""
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -84,6 +85,8 @@ def scrcpy(command):
         return 0
     with open(os.path.join(HERE, f"forward_{options['scid']}")) as file:
         port = int(file.read())
+    if options.get("video") == "false":
+        return clipboard_server(port)
     width, height = (int(n) for n in options.get("new_display", f"{NATURAL[0]}x{NATURAL[1]}").split("/")[0].split("x"))
     server = socket.create_server(("127.0.0.1", port))
     video, _ = server.accept()
@@ -191,6 +194,27 @@ def notification(command):
     return 0
 
 
+def storage(path: str) -> str:
+    """The phone's /sdcard: FAKEADB_DIR/sdcard."""
+    return os.path.join(HERE, "sdcard", path.removeprefix("/sdcard").strip("/"))
+
+
+def listing(command):
+    """`find FOLDER -mindepth 1 -maxdepth 1 -printf '%M\t%s\t%T@\t%f\0'`, of the stand-in storage."""
+    import shlex
+
+    folder = storage(shlex.split(command)[1])
+    if not os.path.isdir(folder):
+        return 1
+    out = b""
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        mode = "drwxrwx---" if os.path.isdir(path) else "-rw-rw----"
+        out += f"{mode}\t{os.path.getsize(path)}\t{os.path.getmtime(path):.6f}\t{name}".encode() + b"\0"
+    sys.stdout.buffer.write(out)
+    return 0
+
+
 def versions() -> dict[str, int]:
     """The apps' versions (FAKEADB_DIR/versions.json, to say one was updated)."""
     try:
@@ -198,6 +222,54 @@ def versions() -> dict[str, int]:
             return json.load(file)
     except (OSError, ValueError):
         return {}
+
+
+def clipboard_server(port):
+    """scrcpy's server for the clipboard alone: FAKEADB_DIR/phone_clipboard is the phone's, sent on
+    when it changes; what's set on it is written to control.jsonl (and becomes the phone's)."""
+    server = socket.create_server(("127.0.0.1", port))
+    control, _ = server.accept()
+    control.sendall(b"\0")
+    path = os.path.join(HERE, "phone_clipboard")
+    said = [open(path).read() if os.path.exists(path) else None]  # what's there already isn't news
+
+    def watch():
+        while True:
+            time.sleep(0.1)
+            text = open(path).read() if os.path.exists(path) else None
+            if text is not None and text != said[0]:
+                said[0] = text
+                data = text.encode()
+                try:
+                    control.sendall(bytes([0]) + struct.pack(">I", len(data)) + data)
+                except OSError:
+                    return
+
+    threading.Thread(target=watch, daemon=True).start()
+
+    def take(count):
+        data = b""
+        while len(data) < count:
+            chunk = control.recv(count - len(data))
+            if not chunk:
+                raise EOFError
+            data += chunk
+        return data
+
+    try:
+        while True:
+            kind = take(1)[0]
+            if kind == 9:
+                _sequence, paste, length = struct.unpack(">QBI", take(13))
+                text = take(length).decode()
+                said[0] = text  # its own: not sent back
+                with open(path, "w") as file:
+                    file.write(text)
+                with open(os.path.join(HERE, "control.jsonl"), "a") as file:
+                    file.write(json.dumps({"type": "set_clipboard", "text": text, "paste": paste}) + "\n")
+    except (EOFError, OSError):
+        pass
+    return 0
 
 
 def others() -> dict[str, tuple[str, float]]:
@@ -231,8 +303,21 @@ def main(args):
     if args[:2] == ["shell", "-T"] and args[2:] == ["uinput", "-"]:
         uinput()
         return 0
+    if args[:1] == ["push"] and args[2].startswith("/sdcard"):
+        target = storage(args[2])
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(args[1], target)
+        return 0
     if args[:1] == ["push"]:
         return 0
+    if args[:2] == ["pull", "-a"]:
+        if not os.path.exists(storage(args[2])):
+            print(f"adb: error: failed to stat remote object '{args[2]}'", file=sys.stderr)
+            return 1
+        shutil.copy2(storage(args[2]), args[3])
+        return 0
+    if args[:1] == ["exec-out"] and args[1].startswith("find "):
+        return listing(args[1])
     if args[:2] == ["forward", "tcp:0"] and args[2].startswith("localabstract:scrcpy_"):
         free = socket.socket()
         free.bind(("127.0.0.1", 0))

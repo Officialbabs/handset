@@ -458,3 +458,168 @@ def plainly(why: str) -> str:
     if any(word in why for word in gone):
         return "It isn't plugged in, and it's asleep or off Wi-Fi. Plug it in or unlock it, and it shows here again."
     return why
+
+
+class ClipboardLink:
+    """The iPhone's clipboard, both ways, through the helper (`handset-ios clipboard`): `on_text`
+    on GLib's main loop for each text copied on the phone, set(text) to put text on it. As
+    android.ClipboardLink: it starts again by itself if the phone sleeps or goes."""
+
+    def __init__(self, link: Link, on_text: Callable[[str], None]):
+        self.link = link
+        self.on_text = on_text
+        self.process: subprocess.Popen | None = None
+        self.stopped = False
+        self.last: str | None = None
+        self.lock = threading.Lock()
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self.stopped = True
+        process, self.process = self.process, None
+        if process and process.poll() is None:
+            process.kill()
+            process.wait()
+
+    def set(self, text: str):
+        if not text or text == self.last:
+            return
+        self.last = text
+        process = self.process
+        if process and process.poll() is None:
+            try:
+                with self.lock:
+                    process.stdin.write((json.dumps({"op": "set", "text": text}) + "\n").encode())
+                    process.stdin.flush()
+            except OSError:
+                pass
+
+    def _run(self):
+        delay = 3
+        while not self.stopped:
+            started = time.monotonic()
+            command = [self.link.helper, "clipboard", "--pairing", self.link.pairing, "--udid", self.link.udid]
+            if self.link.address:
+                command += ["--address", self.link.address]
+            try:
+                self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                                stderr=subprocess.DEVNULL)
+            except OSError:
+                return
+            for raw in self.process.stdout:
+                try:
+                    event = json.loads(raw)
+                except ValueError:
+                    continue
+                text = event.get("text") if isinstance(event, dict) and event.get("event") == "clipboard" else None
+                if text and text != self.last:
+                    self.last = text
+                    GLib.idle_add(self.on_text, text)
+            if self.process:
+                self.process.wait()
+            if self.stopped:
+                return
+            delay = 3 if time.monotonic() - started > 60 else min(delay * 2, 60)
+            time.sleep(delay)
+
+
+class FilesSession:
+    """An iPhone's media files (its photos, Downloads, recordings), through the helper's `files`
+    session: one helper while it's open, a command at a time. Slow calls: off the main loop. The
+    same calls as android.AdbFiles."""
+
+    top = "/"
+    downloads = "/Downloads"
+
+    def __init__(self, link: Link):
+        self.link = link
+        self.process: subprocess.Popen | None = None
+        self.lock = threading.Lock()
+
+    def _ask(self, command: dict) -> dict | str:
+        """One command's answer, or why there's none, in words."""
+        with self.lock:
+            if not self.process or self.process.poll() is not None:
+                started = [self.link.helper, "files", "--pairing", self.link.pairing, "--udid", self.link.udid]
+                if self.link.address:
+                    started += ["--address", self.link.address]
+                try:
+                    self.process = subprocess.Popen(started, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                                    stderr=subprocess.PIPE)
+                except OSError as error:
+                    return str(error)
+            try:
+                self.process.stdin.write((json.dumps(command) + "\n").encode())
+                self.process.stdin.flush()
+                line = self.process.stdout.readline()
+            except OSError as error:
+                return str(error)
+            if not line:
+                why = self.process.stderr.read().decode(errors="replace") if self.process.poll() is not None else ""
+                message = next((json.loads(l).get("message") for l in why.splitlines()
+                                if l.startswith("{") and '"error"' in l), None)
+                self.process = None
+                return plainly(message or "The iPhone didn't answer.")
+            try:
+                answer = json.loads(line)
+            except ValueError:
+                return "The iPhone helper said something odd."
+            if answer.get("event") == "error":
+                return str(answer.get("message") or "It didn't work.")
+            return answer
+
+    def list_folder(self, folder: str) -> list | str:
+        from .android import PhoneFile
+
+        answer = self._ask({"op": "list", "path": folder})
+        if isinstance(answer, str):
+            return answer
+        found = [PhoneFile(e["name"], f"{folder.rstrip('/')}/{e['name']}", bool(e.get("folder")),
+                           int(e.get("size") or 0), float(e.get("modified") or 0))
+                 for e in answer.get("entries", []) if e.get("name") and not e["name"].startswith(".")]
+        return sorted(found, key=lambda f: (not f.folder, f.name.casefold()))
+
+    def fetch_file(self, path: str, folder: str) -> str | None:
+        name = os.path.basename(path)
+        stem, dot, ext = name.rpartition(".") if "." in name.strip(".") else (name, "", "")
+        target, number = os.path.join(folder, name), 2
+        while os.path.exists(target):
+            target = os.path.join(folder, f"{stem} ({number}){dot}{ext}")
+            number += 1
+        os.makedirs(folder, exist_ok=True)
+        answer = self._ask({"op": "fetch", "path": path, "to": target})
+        return target if isinstance(answer, dict) and os.path.exists(target) else None
+
+    def send_files(self, paths: list[str], folder: str) -> tuple[list[str], str | None]:
+        listed = self.list_folder(folder)
+        taken = {f.name for f in listed} if isinstance(listed, list) else set()
+        sent, trouble = [], None
+        for path in paths:
+            if not os.path.isfile(path):
+                trouble = "folders don't go to an iPhone"
+                continue
+            name = os.path.basename(path)
+            stem, dot, ext = name.rpartition(".") if "." in name.strip(".") else (name, "", "")
+            candidate, number = name, 2
+            while candidate in taken:
+                candidate = f"{stem} ({number}){dot}{ext}"
+                number += 1
+            taken.add(candidate)
+            target = f"{folder.rstrip('/')}/{candidate}"
+            answer = self._ask({"op": "send", "from": path, "path": target})
+            if isinstance(answer, str):
+                trouble = answer
+            else:
+                sent.append(target)
+        return sent, trouble
+
+    def stop(self):
+        process, self.process = self.process, None
+        if process and process.poll() is None:
+            try:
+                process.stdin.close()
+                process.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                process.kill()

@@ -9,10 +9,10 @@ publish = false
 [dependencies]
 # The crate Ada's phone service is built on, at the same version, with ring for TLS: the default,
 # aws-lc, needs cmake to build.
-idevice = { version = "=0.1.68", default-features = false, features = ["ring", "remote_pairing", "usbmuxd", "core_device_proxy", "tunnel_tcp_stack", "rsd", "display_stream"] }
+idevice = { version = "=0.1.68", default-features = false, features = ["ring", "remote_pairing", "usbmuxd", "core_device_proxy", "tunnel_tcp_stack", "rsd", "display_stream", "afc"] }
 mdns-sd = "0.19"
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "io-std", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "io-std", "signal", "sync", "fs"] }
 uuid = { version = "1", features = ["v4"] }
 
 [profile.release]

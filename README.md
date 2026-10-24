@@ -73,6 +73,22 @@ desk isn't possible, and clearing one here leaves it on the phone.
   notification.
 - Off: `"phone_notifications": false` in `~/.config/handset/settings.json`.
 
+## The clipboard and files
+
+- **The clipboard is shared** with the phones Handset shows: copy on the computer, then click into
+  a phone's window, and it's on the phone; copy on the phone and it's on the computer, at once if
+  a Handset window is in front, else as soon as one comes forward (the desktop lets only the window
+  in front touch the clipboard). Text only. On Android each copy the computer reads shows the
+  phone's "pasted from your clipboard" note, and setting it opens Android's clipboard editor;
+  "Show clipboard access" in the phone's privacy settings turns the note off.
+- **Drop files on a phone's window** to send them to its Downloads (never over a file that's
+  there); on Android its apps see them straight away.
+- **Phone Files…** (right-click the bezel, or Ctrl+Shift+F) looks through the phone's files: a
+  file can be saved in Downloads here, opened with this computer's apps, and files from here sent
+  into the folder looked at. An Android phone's storage, over adb; an iPhone's media files (its
+  photos in DCIM, Downloads, recordings) through Handset's helper (Apple's file service, AFC).
+  Photos copied into an iPhone's DCIM don't join its Photos library.
+
 ## How it works
 
 On an Android phone, Handset uses the same adb connection Ada set up, by cable or over Wi-Fi,

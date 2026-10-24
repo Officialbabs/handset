@@ -97,6 +97,7 @@ SHORTCUTS = (
     ("win.notifications", ["<Control>n"]),
     ("win.next-phone", ["<Control>p"]),
     ("win.phone-apps", ["<Control><Shift>a"]),
+    ("win.phone-files", ["<Control><Shift>f"]),
     ("win.fullscreen", ["F11"]),
     ("window.close", ["<Control>w"]),
     ("app.quit", ["<Control>q"]),
@@ -243,6 +244,8 @@ class Window(Adw.ApplicationWindow):
             self.connect(f"notify::{name}", self._resized)
         self.watch = Watch(self._phones_changed, self._service_gone)
         self.watch.start()
+        if app.clipboard:
+            app.clipboard.watch(self)
         self._show_status("phone-symbolic", "Looking for your phones…", "")
 
     def _mapped(self, _window):
@@ -376,6 +379,12 @@ class Window(Adw.ApplicationWindow):
         wheel.connect("scroll", self._wheel)
         wheel.connect("scroll-end", lambda _c: self._lift_scroll())
         self.screen.add_controller(wheel)
+        # Files dropped on the window go to the phone (its Download folder).
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("drop", self._dropped)
+        drop.connect("enter", lambda *_a: (self.ring.set_visible(True), Gdk.DragAction.COPY)[1])
+        drop.connect("leave", lambda *_a: self.phone and self._show_ada(self.phone))
+        self.toasts.add_controller(drop)
         keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
         keys.connect("key-pressed", self._key_pressed)
         self.add_controller(keys)
@@ -384,6 +393,7 @@ class Window(Adw.ApplicationWindow):
             self._action(name, lambda _a, _p, key=name: self._key(key))
         self._action("next-phone", lambda _a, _p: self._next_phone())
         self._action("phone-apps", lambda _a, _p: self.show_phone_apps())
+        self._action("phone-files", lambda _a, _p: self.show_phone_files())
         self._action("pair-iphone", lambda _a, _p: self._pair_iphone())
         self._action("pin", lambda _a, _p: self._pin_this(True))
         self._action("unpin", lambda _a, _p: self._pin_this(False))
@@ -411,8 +421,10 @@ class Window(Adw.ApplicationWindow):
             pinned = apps.is_pinned(self.phone_app.phone_id, self.phone_app.app)
             menu.append("Unpin from the Dock" if pinned else "Pin to the Dock", "win.unpin" if pinned else "win.pin")
             menu.append("Show the Whole Phone", "win.whole-phone")
+            menu.append("Phone Files…", "win.phone-files")
         else:
             menu.append("Phone Apps…", "win.phone-apps")
+            menu.append("Phone Files…", "win.phone-files")
             menu.append("Pair an iPhone for Notifications…", "win.pair-iphone")
             menu.append("New Window", "app.new-window")
         popover = Gtk.PopoverMenu(menu_model=menu, has_arrow=False, halign=Gtk.Align.START)
@@ -651,6 +663,7 @@ class Window(Adw.ApplicationWindow):
                                         self._video_ended, self._awake_changed,
                                         on_status=self._helper_status)
             self.device.looks_dark = self.picture.is_dark
+            self._link_clipboard(lambda on_text: iphone.ClipboardLink(link, on_text))
             if self.phone_app:
                 self.device.on_launched = self._launched
                 self.device.launch(self.phone_app.app)
@@ -669,6 +682,7 @@ class Window(Adw.ApplicationWindow):
         else:
             edge = android.stream_edge(round(min(self._monitor()) * self._monitor_scale()), link.natural)
         debug("asking the phone for video", edge or "at its own size")
+        self._link_clipboard(lambda on_text: android.ClipboardLink(link.serial, on_text))
         if self.phone_app:
             self.device = android.AppScreen(link, self.phone_app.app, self._frame, self._turned,
                                             self._touch_changed, self._video_ended, self._awake_changed)
@@ -689,6 +703,66 @@ class Window(Adw.ApplicationWindow):
             self._show_status("phone-symbolic", f"Waking {name}…", "Its screen was off.")
         self._expect_picture()
         return GLib.SOURCE_REMOVE
+
+    def _serial(self) -> str | None:
+        """The adb serial of this window's phone, when it's an Android phone that's open."""
+        link = getattr(self.device, "link", None)
+        return getattr(link, "serial", None)
+
+    def _files(self):
+        """This window's phone's files (android.AdbFiles, iphone.FilesSession), while it's open."""
+        from . import android, iphone
+
+        serial = self._serial()
+        if serial:
+            return android.AdbFiles(serial)
+        link = getattr(self.device, "link", None)
+        if isinstance(link, iphone.Link):
+            return iphone.FilesSession(link)
+        return None
+
+    def _dropped(self, _target, value, _x, _y) -> bool:
+        if self.phone:
+            self._show_ada(self.phone)
+        paths = [f.get_path() for f in value.get_files() if f.get_path()]
+        files = self._files()
+        if not paths or not self.phone:
+            return False
+        if not files:
+            self.say(f"{self.phone.name} isn't connected")
+            return False
+        name = self.phone.name
+        count = f"{len(paths)} files" if len(paths) > 1 else os.path.basename(paths[0].rstrip("/"))
+        self.say(f"Sending {count} to {name}…")
+
+        def send():
+            sent, trouble = files.send_files(paths, files.downloads)
+            files.stop()
+            if sent and not trouble:
+                words = f"In {name}'s Downloads: {count}"
+            elif sent:
+                words = f"Some went to {name}'s Downloads; the rest didn't ({trouble})"
+            else:
+                words = f"{count} didn't go to {name} ({trouble})"
+            GLib.idle_add(self.say, words)
+
+        threading.Thread(target=send, daemon=True).start()
+        return True
+
+    def show_phone_files(self):
+        """The phone's files: to look through, save here, open, or send to."""
+        if not self.phone:
+            return
+        from .filesdialog import FilesDialog
+
+        FilesDialog(self, self.phone, self._files()).present(self)
+
+    def _link_clipboard(self, make_link):
+        """The clipboard shared with this window's phone (one link per phone, however many
+        windows show it)."""
+        clipboard = self.get_application().clipboard
+        if clipboard and self.phone:
+            clipboard.attach(self.phone.id, make_link)
 
     def _launched(self, opened: bool, why: str):
         """The iPhone opened this window's app (or didn't: locked, mostly)."""
@@ -839,7 +913,10 @@ class Window(Adw.ApplicationWindow):
         if self.size_timer:
             GLib.source_remove(self.size_timer)
         self._remember_size()
-        self.get_application().remember_windows(closing=self)
+        app = self.get_application()
+        app.remember_windows(closing=self)
+        if app.clipboard:
+            app.clipboard.release({w.phone.id for w in app.handset_windows() if w.phone and w is not self})
         self.watch.stop()
         self._close_phone()
         return False

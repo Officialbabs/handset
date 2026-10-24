@@ -10,7 +10,7 @@ from gi.repository import GLib
 
 from handset import iphone
 from handset.gestures import Gesture
-from handset.iphone import SPAN, IPhone, Link, list_apps, normalized, plainly, screen_crop
+from handset.iphone import SPAN, ClipboardLink, FilesSession, IPhone, Link, list_apps, normalized, plainly, screen_crop
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_HELPER = os.path.join(HERE, "fakeios.py")
@@ -135,6 +135,44 @@ class FakeHelper(unittest.TestCase):
         self.assertEqual(launched, [(True, ""), (False, "Unlock the iPhone to open it.")])
         self.assertEqual([c["bundle"] for c in self.commands() if c["op"] == "launch"],
                          ["org.example.chat", "org.example.gone"])
+
+    def test_its_clipboard_both_ways(self):
+        heard = []
+        clip = ClipboardLink(Link("UDID-1", "/p.rppairing", "192.168.18.10", FAKE_HELPER), heard.append)
+        clip.start()
+        try:
+            spin(lambda: clip.process is not None and os.path.exists(os.path.join(self.tmp.name, "commands.jsonl")))
+            with open(os.path.join(self.tmp.name, "phone_clipboard"), "w") as file:
+                file.write("copied on the iPhone")
+            spin(lambda: heard)
+            clip.set("copied on the computer")
+            spin(lambda: any(c.get("op") == "set" for c in self.commands()))
+            time.sleep(0.4)
+            self.assertEqual(heard, ["copied on the iPhone"])  # its own isn't heard back
+            self.assertEqual([c["text"] for c in self.commands() if c.get("op") == "set"], ["copied on the computer"])
+        finally:
+            clip.stop()
+
+    def test_its_files(self):
+        media = os.path.join(self.tmp.name, "media")
+        os.makedirs(os.path.join(media, "DCIM", "100APPLE"))
+        os.makedirs(os.path.join(media, "Downloads"))
+        with open(os.path.join(media, "Downloads", "notes.txt"), "w") as file:
+            file.write("from the iPhone")
+        session = FilesSession(Link("UDID-1", "/p.rppairing", "192.168.18.10", FAKE_HELPER))
+        try:
+            self.assertEqual([(f.name, f.folder) for f in session.list_folder("/")], [("DCIM", True), ("Downloads", True)])
+            here = os.path.join(self.tmp.name, "notes.txt")
+            with open(here, "w") as file:
+                file.write("from the computer")
+            sent, trouble = session.send_files([here], "/Downloads")
+            self.assertEqual((sent, trouble), (["/Downloads/notes (2).txt"], None))  # not over the phone's own
+            got = session.fetch_file("/Downloads/notes.txt", os.path.join(self.tmp.name, "back"))
+            with open(got) as file:
+                self.assertEqual(file.read(), "from the iPhone")
+            self.assertIsInstance(session.list_folder("/Nowhere"), str)
+        finally:
+            session.stop()
 
     def test_its_apps_and_their_icons(self):
         icons = os.path.join(self.tmp.name, "icons")
