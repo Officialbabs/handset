@@ -4,6 +4,10 @@ on it when she is.
 The mouse is a finger on the glass (press, drag, let go; the wheel scrolls; the right button goes
 back; the middle button goes home, and moves the window when dragged), and the keyboard types on
 the phone. The phone's buttons are shortcuts: see SHORTCUTS.
+
+A window can also show one of the phone's apps (apps.py): on Android on a screen of its own
+(android.AppScreen), on an iPhone the phone's screen with that app opened in front. It carries
+the app's own id, so the dock counts it as that app.
 """
 
 from __future__ import annotations
@@ -20,7 +24,15 @@ gi.require_version("Adw", "1")
 gi.require_version("Graphene", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk  # noqa: E402
 
+try:
+    # Before any window exists: a surface wrapped before this is loaded lacks its methods.
+    gi.require_version("GdkWayland", "4.0")
+    from gi.repository import GdkWayland  # noqa: E402
+except (ImportError, ValueError):
+    GdkWayland = None
+
 from . import NAME  # noqa: E402
+from .apps import PhoneApp  # noqa: E402
 from .gestures import Fit, Gesture, classify, inside, scroll, to_edge  # noqa: E402
 from .log import debug  # noqa: E402
 from .screen import Screen  # noqa: E402
@@ -74,6 +86,7 @@ SHORTCUTS = (
     ("win.recents", ["<Control>r"]),
     ("win.notifications", ["<Control>n"]),
     ("win.next-phone", ["<Control>p"]),
+    ("win.phone-apps", ["<Control><Shift>a"]),
     ("win.fullscreen", ["F11"]),
     ("window.close", ["<Control>w"]),
     ("app.quit", ["<Control>q"]),
@@ -168,14 +181,15 @@ def choose(phones: list[Phone], wanted: str | None, taken=(), free_only: bool = 
 
 
 class Window(Adw.ApplicationWindow):
-    def __init__(self, app, wanted: str | None = None):
-        super().__init__(application=app, title=NAME)
+    def __init__(self, app, wanted: str | None = None, phone_app: PhoneApp | None = None):
+        super().__init__(application=app, title=phone_app.name if phone_app else NAME)
         self.add_css_class("handset-window")
+        self.phone_app = phone_app  # the one app this window shows, if it shows one
         # libadwaita's windows are at least 360 wide: narrower than that is a phone's own shape.
         self.set_size_request(160, 240)
         self.settings = app.settings  # shared by the app's windows
         self.size_timer = 0
-        self.wanted = wanted
+        self.wanted = phone_app.phone_id if phone_app else wanted
         self.phones: list[Phone] = []
         self.phone: Phone | None = None
         self.device = None
@@ -202,8 +216,9 @@ class Window(Adw.ApplicationWindow):
         self.moving = False
         self.shown_at: tuple[int, int] | None = None
         self.resize_timer = 0
-        self._take_size(wanted)
+        self._take_size(self.wanted)
         GLib.timeout_add(1000, self._check_hidden)
+        self.connect_after("realize", self._realized)
 
         provider = Gtk.CssProvider()
         provider.load_from_data(CSS)
@@ -216,6 +231,25 @@ class Window(Adw.ApplicationWindow):
         self.watch = Watch(self._phones_changed, self._service_gone)
         self.watch.start()
         self._show_status("phone-symbolic", "Looking for your phones…", "")
+
+    def _realized(self, _window):
+        """An app's window goes by the app's own id, so the dock counts it as that app."""
+        if not self.phone_app or GdkWayland is None:
+            return
+        surface = self.get_surface()
+        if isinstance(surface, GdkWayland.WaylandToplevel):
+            try:
+                GdkWayland.WaylandToplevel.set_application_id(surface, self.phone_app.id)
+            except (TypeError, AttributeError) as error:
+                debug("the window keeps Handset's id:", error)
+
+    def own_screen(self) -> bool:
+        """Whether this window shows an app on a screen of its own (no edges to swipe from)."""
+        return bool(self.phone_app) and self.device is not None and hasattr(self.device, "package")
+
+    def size_key(self, phone_id: str | None) -> str | None:
+        """What this window's size is remembered by: its app, or its phone."""
+        return self.phone_app.id if self.phone_app else phone_id
 
     # ---- Layout ---------------------------------------------------------------------------
 
@@ -277,8 +311,12 @@ class Window(Adw.ApplicationWindow):
         self.stack.add_named(self.frame, "screen")
         grip = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
         grip.add_css_class("handset-grip")
-        self.bezel = Gtk.WindowHandle(child=grip, height_request=BEZEL, tooltip_text="Drag to move")
+        self.bezel = Gtk.WindowHandle(child=grip, height_request=BEZEL,
+                                      tooltip_text="Drag to move · Right-click for more")
         self.bezel.add_css_class("handset-bezel")
+        menu_click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        menu_click.connect("pressed", self._bezel_menu)
+        self.bezel.add_controller(menu_click)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         content.append(self.bezel)
         content.append(self.stack)
@@ -313,13 +351,66 @@ class Window(Adw.ApplicationWindow):
         for name in ("back", "home", "recents", "notifications"):
             self._action(name, lambda _a, _p, key=name: self._key(key))
         self._action("next-phone", lambda _a, _p: self._next_phone())
+        self._action("phone-apps", lambda _a, _p: self.show_phone_apps())
+        self._action("pin", lambda _a, _p: self._pin_this(True))
+        self._action("unpin", lambda _a, _p: self._pin_this(False))
+        self._action("whole-phone", lambda _a, _p: self.phone and self.get_application().open_window(self.phone.id))
         self._action("fullscreen", lambda _a, _p: self.unfullscreen() if self.is_fullscreen() else self.fullscreen())
         for action, accels in SHORTCUTS:
             self.get_application().set_accels_for_action(action, accels)
 
+    def _bezel_menu(self, gesture, _n, x, y):
+        """Right-click on the bezel: the phone's apps (or, for an app's window, its pin)."""
+        from . import apps
+
+        menu = Gio.Menu()
+        if self.phone_app:
+            pinned = apps.is_pinned(self.phone_app.phone_id, self.phone_app.app)
+            menu.append("Unpin from the Dock" if pinned else "Pin to the Dock", "win.unpin" if pinned else "win.pin")
+            menu.append("Show the Whole Phone", "win.whole-phone")
+        else:
+            menu.append("Phone Apps…", "win.phone-apps")
+            menu.append("New Window", "app.new-window")
+        popover = Gtk.PopoverMenu(menu_model=menu, has_arrow=False, halign=Gtk.Align.START)
+        popover.set_parent(self.bezel)
+        point = Gdk.Rectangle()
+        point.x, point.y, point.width, point.height = int(x), int(y), 1, 1
+        popover.set_pointing_to(point)
+        popover.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        popover.popup()
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def show_phone_apps(self):
+        """The phone's apps, to open one in a window of its own or pin it to the dock."""
+        if self.phone_app or not self.phone:
+            return
+        from .appsdialog import AppsDialog
+
+        AppsDialog(self, self.phone).present(self)
+
+    def _pin_this(self, wanted: bool):
+        from . import apps
+
+        app = self.phone_app
+        if not app:
+            return
+        if not wanted:
+            apps.unpin(app.phone_id, app.app)
+            self.say(f"{app.name} is out of the dock")
+            return
+        icon = None
+        try:
+            with open(apps.icon_path(app.phone_id, app.app), "rb") as file:
+                icon = file.read()
+        except OSError:
+            pass
+        docked = apps.pin(app, icon)
+        self.say(f"{app.name} is in the dock" if docked else "Pinned: it's in your apps, to put in the dock from there")
+
     def _take_size(self, phone_id: str | None):
-        """The size the person gave this phone's window last time, as the monitor allows."""
+        """The size the person gave this phone's (or app's) window last time, as the monitor allows."""
         sizes, maximized = self.settings.get("sizes", {}), self.settings.get("maximized", {})
+        phone_id = self.size_key(phone_id)
         saved = sizes.get(phone_id) if phone_id else None
         if not isinstance(saved, int) or saved <= 0:
             saved = None
@@ -373,6 +464,17 @@ class Window(Adw.ApplicationWindow):
         self.phones = phones
         if [p.id for p in phones] != ids:
             self._fill_picker()
+        if self.phone_app:
+            # An app's window is that phone's, or nothing.
+            phone = next((p for p in phones if p.id == self.phone_app.phone_id), None)
+            if phone is None:
+                self._close_phone()
+                self.phone = None
+                self._show_status("phone-symbolic", f"{self.phone_app.phone_name} isn't here",
+                                  "Set it up with Ada (Settings › Phones), and plug it in.")
+                return
+            self._show_phone(phone)
+            return
         taken = self.get_application().shown(besides=self)
         phone = choose(phones, self.phone.id if self.phone else self.wanted, taken)
         self._show_phone(phone)
@@ -385,11 +487,13 @@ class Window(Adw.ApplicationWindow):
     def _fill_picker(self):
         self.filling = True  # a new list selects its first row: that's not the person's choice
         self.picker.set_model(Gtk.StringList.new([p.name for p in self.phones]))
-        self.picker.set_visible(len(self.phones) > 1)
+        self.picker.set_visible(len(self.phones) > 1 and not self.phone_app)
         self.filling = False
 
     def _next_phone(self):
         """The next phone no other window shows."""
+        if self.phone_app:
+            return
         taken = self.get_application().shown(besides=self)
         count = len(self.phones)
         for step in range(1, count):
@@ -437,7 +541,10 @@ class Window(Adw.ApplicationWindow):
         index = next(i for i, p in enumerate(self.phones) if p.id == phone.id)
         if self.picker.get_selected() != index:
             self.picker.set_selected(index)
-        self.set_title(f"{phone.name} – {status_line(phone)}")
+        if self.phone_app:
+            self.set_title(f"{self.phone_app.name} – {phone.name}")
+        else:
+            self.set_title(f"{phone.name} – {status_line(phone)}")
         self._show_ada(phone)
         if phone.platform == "ios":
             # Handset's helper looks for an iPhone by its cable and on Wi-Fi by itself; Ada's service
@@ -452,11 +559,12 @@ class Window(Adw.ApplicationWindow):
             self._open()
 
     def _show_ada(self, phone: Phone):
-        line = ada_line(phone)
+        # Ada works on the phone's own screen, not on an app's screen of its own.
+        line = "" if (self.phone_app and phone.platform == "android") else ada_line(phone)
         if line:
             self.ada.set_label(line)
         self.ada_shown.set_reveal_child(bool(line))
-        self.ring.set_visible(phone.ada_working and not phone.ada_paused)
+        self.ring.set_visible(bool(line) and phone.ada_working and not phone.ada_paused)
 
     # ---- The phone's screen ---------------------------------------------------------------
 
@@ -496,6 +604,9 @@ class Window(Adw.ApplicationWindow):
                                         self._video_ended, self._awake_changed,
                                         on_status=self._helper_status)
             self.device.looks_dark = self.picture.is_dark
+            if self.phone_app:
+                self.device.on_launched = self._launched
+                self.device.launch(self.phone_app.app)
             self._turned()
             self.device.start()
             self._show_at()
@@ -511,6 +622,15 @@ class Window(Adw.ApplicationWindow):
         else:
             edge = android.stream_edge(round(min(self._monitor()) * self._monitor_scale()), link.natural)
         debug("asking the phone for video", edge or "at its own size")
+        if self.phone_app:
+            self.device = android.AppScreen(link, self.phone_app.app, self._frame, self._turned,
+                                            self._touch_changed, self._video_ended, self._awake_changed)
+            self._turned()
+            self.device.start()
+            self._show_at()
+            self._show_status("phone-symbolic", f"Opening {self.phone_app.name}…", "")
+            self._expect_picture()
+            return GLib.SOURCE_REMOVE
         self.device = android.Android(link, self._frame, self._turned, self._touch_changed,
                                       self._video_ended, self._awake_changed, edge=edge)
         self._turned()
@@ -522,6 +642,16 @@ class Window(Adw.ApplicationWindow):
             self._show_status("phone-symbolic", f"Waking {name}…", "Its screen was off.")
         self._expect_picture()
         return GLib.SOURCE_REMOVE
+
+    def _launched(self, opened: bool, why: str):
+        """The iPhone opened this window's app (or didn't: locked, mostly)."""
+        if not opened and self.phone_app:
+            self.say(f"{self.phone_app.name} didn't open. {why}")
+
+    def open_app(self, app: str):
+        """Opens an app on this window's iPhone, in front."""
+        if self.device and hasattr(self.device, "launch"):
+            self.device.launch(app)
 
     def _expect_picture(self, wait: int = PICTURE_WAIT_MS):
         """A picture should come soon: if none does while the phone is awake, open it again."""
@@ -648,12 +778,13 @@ class Window(Adw.ApplicationWindow):
         if not self.phone:
             return GLib.SOURCE_REMOVE
         maximized = self.is_maximized()
+        key = self.size_key(self.phone.id)
         if not (maximized or self.is_fullscreen()):
             width, height = self.get_default_size()
             longer = max(width, height - FRAME)
             if longer > 0:
-                self.settings["sizes"][self.phone.id] = longer
-        self.settings["maximized"][self.phone.id] = maximized
+                self.settings["sizes"][key] = longer
+        self.settings["maximized"][key] = maximized
         save_settings(self.settings)
         return GLib.SOURCE_REMOVE
 
@@ -684,6 +815,8 @@ class Window(Adw.ApplicationWindow):
             gesture.set_state(Gtk.EventSequenceState.DENIED)
             return
         raw = fit.to_screen(x, y)
+        if self.own_screen():
+            point = raw  # an app's own screen has no edges to swipe in from
         self.snap = (point[0] - raw[0], point[1] - raw[1])
         self.screen.grab_focus()
         self.down_at = (x, y)
@@ -766,6 +899,9 @@ class Window(Adw.ApplicationWindow):
         device = self.device
         hidden = bool(device and getattr(device, "locked", False) and device.awake
                       and self.stack.get_visible_child_name() == "screen" and self.picture.is_dark())
+        if hidden and self.own_screen() and self.phone:
+            # An app's own screen is black while the phone is locked; its PIN goes to the phone.
+            self.hidden.set_label(f"{self.phone.name} is locked.\nUnlock it to use {self.phone_app.name} here.")
         if hidden != self.hidden.get_visible():
             debug("PIN pad note", "shown" if hidden else "hidden")
             self.hidden.set_visible(hidden)

@@ -9,8 +9,13 @@ talking to the phone; Handset runs it and speaks to it in lines:
   "message":…}; anything else is the helper's log;
 - its standard input takes commands, one JSON object each: {"op":"down"|"move","x","y"} with x
   and y from 0 to 65535 across the screen, {"op":"up"}, {"op":"button","name":…} (home, lock,
-  volume_up, volume_down), {"op":"key","name":…} (enter, delete, tab, escape, the arrows) and
-  {"op":"text","text":…}.
+  volume_up, volume_down), {"op":"key","name":…} (enter, delete, tab, escape, the arrows),
+  {"op":"text","text":…} and {"op":"launch","bundle":…} (an app to the front, said back as
+  {"event":"launch","ok":…}).
+
+`handset-ios apps` lists the phone's apps instead (list_apps here). An iPhone shows one app at
+a time on its one screen, so an iPhone app "in a window of its own" is the phone's screen with
+that app opened in front.
 
 The phone takes touches only while its screen is being sent, which Handset keeps doing anyway.
 """
@@ -173,6 +178,15 @@ class IPhone:
         self.process: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self.error: str | None = None
+        self.launching: str | None = None  # an app to open once the phone takes input
+        self.on_launched: Callable[[bool, str], None] | None = None  # (opened, why not)
+
+    def launch(self, bundle: str):
+        """Opens an app on the phone, in front: now, or once the phone takes input."""
+        if self.live_touch:
+            self._send({"op": "launch", "bundle": bundle})
+        else:
+            self.launching = bundle
 
     def start(self):
         command = [self.link.helper, "stream", "--pairing", self.link.pairing, "--udid", self.link.udid]
@@ -343,6 +357,12 @@ class IPhone:
         elif kind == "input":
             self.live_touch = bool(event.get("ready"))
             self.on_touch(self.live_touch)
+            if self.live_touch and self.launching:
+                self._send({"op": "launch", "bundle": self.launching})
+                self.launching = None
+        elif kind == "launch" and self.on_launched:
+            opened = bool(event.get("ok"))
+            self.on_launched(opened, "" if opened else launch_trouble(str(event.get("message") or "")))
         elif kind == "status" and self.on_status:
             self.on_status(str(event.get("text") or ""))
         elif kind == "error":
@@ -380,6 +400,44 @@ class IPhone:
         if not self.stopped:
             self.on_ended(plainly(why))
         return GLib.SOURCE_REMOVE
+
+
+def launch_trouble(why: str) -> str:
+    """Why an app didn't open, in words: mostly a locked phone."""
+    if "lock" in why.lower() or "FBSOpenApplicationErrorDomain" in why:
+        return "Unlock the iPhone to open it."
+    return why or "The iPhone didn't open it."
+
+
+def list_apps(link: Link, icons: str) -> list[tuple[str, str, str | None]] | str:
+    """The phone's apps as its home screen has them, (name, bundle id, icon file or None), with
+    their icons saved in the folder `icons`; or why not, in words. Slow: run it off the main loop."""
+    command = [link.helper, "apps", "--pairing", link.pairing, "--udid", link.udid, "--icons", icons]
+    if link.address:
+        command += ["--address", link.address]
+    os.makedirs(icons, exist_ok=True)
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=90, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"The iPhone helper didn't list its apps ({error})."
+    apps = []
+    for line in result.stdout.decode(errors="replace").splitlines():
+        try:
+            app = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(app, dict) and app.get("bundle"):
+            apps.append((str(app.get("name") or app["bundle"]), str(app["bundle"]), app.get("icon") or None))
+    if not apps and result.returncode:
+        for line in result.stderr.decode(errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict) and event.get("event") == "error":
+                return plainly(str(event.get("message") or ""))
+        return "The iPhone didn't list its apps."
+    return apps
 
 
 def plainly(why: str) -> str:

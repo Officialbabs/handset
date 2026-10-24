@@ -805,3 +805,408 @@ class Android:
         self.video.turned(rotation)
         self.on_turned()
         return GLib.SOURCE_REMOVE
+
+
+# ---- One app on a screen of its own -----------------------------------------------------------
+
+def parse_app_list(text: str) -> list[tuple[str, str]]:
+    """(name, package) for each app scrcpy's server lists (`list_apps=true`): after "List of
+    apps:", a line per app, " * " (the system's) or " - " (the person's), the name padded to 30
+    and the package; a name that long puts the package on the next line."""
+    apps, waiting = [], None
+    lines = text.splitlines()
+    start = next((i + 1 for i, line in enumerate(lines) if "List of apps:" in line), len(lines))
+    for line in lines[start:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped[:2] in ("* ", "- "):
+            rest = stripped[2:].rstrip()
+            name, _, package = rest.rpartition(" ")
+            if name.strip() and re.fullmatch(r"[A-Za-z][\w.]*\.[\w.]+", package):
+                apps.append((name.strip(), package))
+                waiting = None
+            else:
+                waiting = rest.strip()
+        elif waiting and re.fullmatch(r"[A-Za-z][\w.]*\.[\w.]+", stripped):
+            apps.append((waiting, stripped))
+            waiting = None
+    return apps
+
+
+def list_apps(serial: str) -> list[tuple[str, str]] | str:
+    """The phone's apps that open from its launcher, (name, package) by name; or why not, in
+    words. Through scrcpy's server, which asks the phone for each app's name."""
+    version = scrcpy_version()
+    if not version:
+        return "Install the scrcpy package to open the phone's apps on the desk."
+    try:
+        adb(serial, "push", SCRCPY_SERVER, PHONE_SERVER, timeout=30)
+        text = adb(serial, "shell", f"CLASSPATH={PHONE_SERVER} app_process / com.genymobile.scrcpy.Server "
+                                    f"{version} log_level=info cleanup=false list_apps=true", timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"The phone didn't list its apps ({error})."
+    return sorted(parse_app_list(text), key=lambda app: app[0].casefold())
+
+
+# scrcpy's control socket takes these (big-endian): keys, text, touches, and an app to start.
+INJECT_KEYCODE, INJECT_TEXT, INJECT_TOUCH, START_APP, RESET_VIDEO = 0, 1, 2, 16, 17
+DOWN, UP, MOVE = 0, 1, 2
+FINGER = -2  # scrcpy's "generic finger" pointer
+KEYCODES = {
+    "back": 4, "enter": 66, "delete": 67, "forward_delete": 112, "tab": 61, "escape": 111,
+    "space": 62, "up": 19, "down": 20, "left": 21, "right": 22, "move_home": 122, "move_end": 123,
+    "volume_up": 24, "volume_down": 25,
+}
+MOST_TEXT = 300  # bytes of text in one message
+
+
+def touch_message(action: int, x: int, y: int, size: tuple[int, int]) -> bytes:
+    """A finger down, moving or up at (x, y) of a video `size` big: the server drops one whose
+    size isn't the video's as it is now."""
+    width, height = size
+    pressure = 0 if action == UP else 0xFFFF
+    return struct.pack(">BBqiiHHHii", INJECT_TOUCH, action, FINGER, x, y, width, height, pressure, 0, 0)
+
+
+def key_messages(code: int) -> bytes:
+    return b"".join(struct.pack(">BBiii", INJECT_KEYCODE, action, code, 0, 0) for action in (DOWN, UP))
+
+
+def text_messages(text: str) -> bytes:
+    """Text in pieces the server takes, never splitting a character."""
+    out, piece = b"", b""
+    for char in text:
+        data = char.encode()
+        if len(piece) + len(data) > MOST_TEXT:
+            out += struct.pack(">BI", INJECT_TEXT, len(piece)) + piece
+            piece = b""
+        piece += data
+    if piece:
+        out += struct.pack(">BI", INJECT_TEXT, len(piece)) + piece
+    return out
+
+
+def start_app_message(package: str) -> bytes:
+    name = package.encode()[:255]
+    return struct.pack(">BB", START_APP, len(name)) + name
+
+
+def display_size(natural: tuple[int, int]) -> tuple[int, int]:
+    """An app's own screen: the phone's, upright, in whole blocks of 8 (as the video is made)."""
+    width, height = sorted(natural)
+    return max(8, width // 8 * 8), max(8, height // 8 * 8)
+
+
+class AppScreen:
+    """One app of an Android phone on a screen of its own: a virtual display scrcpy's server
+    makes on the phone, as big as the phone's own, that only that app shows on. Its picture
+    comes here, and touches, keys and text go back to it through scrcpy's control socket; the
+    phone's own screen carries on as it was (an app open there moves over). Closing it closes
+    the app. The same calls and callbacks as Android; positions are the video's pixels.
+
+    The screen goes on and off with the phone's own (Android puts it in the phone's display
+    group), and shows nothing while the phone is locked: so it wakes the phone when it opens,
+    and watches it, as Android does (`awake`, `locked`)."""
+
+    def __init__(self, link: Link, package: str, on_frame, on_turned, on_touch, on_ended, on_awake=None,
+                 edge: int | None = None):
+        self.link = link
+        self.package = package
+        self.on_frame = on_frame
+        self.on_turned = on_turned
+        self.on_touch = on_touch
+        self.on_ended = on_ended
+        self.size = display_size(link.natural)
+        self.shown = self.size
+        self.decoder = Decoder("h264", self._frame, self._decoder_broken)
+        self.version = scrcpy_version()
+        self.process: subprocess.Popen | None = None
+        self.video: socket.socket | None = None
+        self.control: socket.socket | None = None
+        self.forward_port: int | None = None
+        self.lock = threading.Lock()  # one control message at a time
+        self.on_awake = on_awake
+        self.awake = link.awake
+        self.woken_at = 0.0
+        self.locked = False
+        self.live_touch = False
+        self.pressed = False
+        self.finger = (0, 0)  # where the finger is (or was last)
+        self.stopped = False
+        self.problem: str | None = None  # what the server said went wrong
+
+    def start(self):
+        if not self.version:
+            GLib.idle_add(self._ended, "Install the scrcpy package to open the phone's apps on the desk.")
+            return
+        if not self.decoder.start():
+            GLib.idle_add(self._ended, "Install gstreamer1.0-libav to show the phone's screen.")
+            return
+        if not self.awake:
+            self.wake()
+        threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._watch_screen, daemon=True).start()
+
+    def stop(self):
+        self.stopped = True
+        if self.pressed:
+            self.release()
+        for sock in (self.control, self.video):
+            if sock:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                sock.close()
+        self.control = self.video = None
+        threading.Thread(target=self._end_server, args=(self.process, self.forward_port), daemon=True).start()
+        self.process = None
+        self.decoder.stop()
+
+    def _end_server(self, process: subprocess.Popen | None, port: int | None):
+        """The server ends by itself once its sockets close, giving its display back (and the app
+        with it); one that doesn't is stopped."""
+        if process:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        if port:
+            try:
+                adb(self.link.serial, "forward", "--remove", f"tcp:{port}", timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    def wake(self):
+        """Wakes the phone (its screen and this one with it), counted awake straight away."""
+        def press():
+            try:
+                shell(self.link.serial, "input keyevent KEYCODE_WAKEUP", timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+        threading.Thread(target=press, daemon=True).start()
+        self.woken_at = time.monotonic()
+        if not self.awake:
+            self._awake_changed(True)
+
+    def show_at(self, width: int, height: int):
+        self.decoder.show_at(width, height)
+
+    def _watch_screen(self):
+        """Whether the phone is awake and locked, as Android._watch_screen watches it."""
+        while not self.stopped:
+            time.sleep(ROTATION_POLL_S)
+            try:
+                state = shell(self.link.serial, SCREEN_STATE, timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if self.stopped:
+                return
+            awake, locked = parse_awake(state), parse_locked(state)
+            if locked is not None:
+                self.locked = locked
+            if awake is False and time.monotonic() - self.woken_at < WAKING_S:
+                continue  # still waking
+            if awake is not None and awake != self.awake:
+                GLib.idle_add(self._awake_changed, awake)
+
+    def _awake_changed(self, awake: bool):
+        if awake != self.awake and not self.stopped:
+            debug("phone", "awake" if awake else "asleep", "under an app's screen")
+            self.awake = awake
+            if not awake and self.pressed:
+                self.release()
+            if self.on_awake:
+                self.on_awake(awake)
+        return GLib.SOURCE_REMOVE
+
+    # ---- Its server --------------------------------------------------------------------------
+
+    def _run(self):
+        scid = f"{secrets.randbits(31):08x}"
+        serial = self.link.serial
+        try:
+            adb(serial, "push", SCRCPY_SERVER, PHONE_SERVER, timeout=30)
+            self.forward_port = int(adb(serial, "forward", "tcp:0", f"localabstract:scrcpy_{scid}").strip())
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            GLib.idle_add(self._ended, f"The phone's video didn't start ({error}).")
+            return
+        width, height = self.size
+        options = (f"scid={scid} log_level=info tunnel_forward=true audio=false control=true cleanup=false "
+                   "clipboard_autosync=false send_device_meta=false send_frame_meta=false "
+                   "send_dummy_byte=true send_codec_meta=true video_codec=h264 max_size=0 "
+                   f"video_bit_rate={BIT_RATE} max_fps=60 new_display={width}x{height} "
+                   "vd_system_decorations=false display_ime_policy=hide")
+        command = adb_command(serial, "shell", f"CLASSPATH={PHONE_SERVER} app_process / "
+                                               f"com.genymobile.scrcpy.Server {self.version} {options}")
+        try:
+            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except OSError as error:
+            GLib.idle_add(self._ended, str(error))
+            return
+        threading.Thread(target=self._read_log, args=(self.process,), daemon=True).start()
+        video = self._connect(self.process, first=True)
+        control = video and self._connect(self.process, first=False)
+        if not (video and control):
+            if video:
+                video.close()
+            if not self.stopped:
+                GLib.idle_add(self._ended, self.problem or "scrcpy's server didn't answer.")
+            return
+        if self.stopped:
+            video.close()
+            control.close()
+            return
+        self.video, self.control = video, control
+        try:
+            codec, width, height = struct.unpack(">III", read_exactly(video, 12))
+            debug("app video", hex(codec), width, height)
+            if codec != 0x68323634:  # "h264"
+                raise ConnectionError("the phone can't send H.264 video")
+            self.shown = (width, height)
+            # The server knows its display only once the video starts; the app goes on it then.
+            self._send(start_app_message(self.package))
+            GLib.idle_add(self._touch_ready)
+            while not self.stopped:
+                chunk = video.recv(65536)
+                if not chunk:
+                    break
+                self.decoder.push(chunk)
+        except OSError:
+            pass
+        if not self.stopped:
+            GLib.idle_add(self._ended, self.problem or "The app's video stopped.")
+
+    def _connect(self, process: subprocess.Popen, first: bool) -> socket.socket | None:
+        """The video socket (the server's first, which sends one byte when it's there), then the
+        control one."""
+        for _ in range(60):
+            if self.stopped or process.poll() is not None:
+                return None
+            try:
+                sock = socket.create_connection(("127.0.0.1", self.forward_port), timeout=2)
+            except OSError:
+                time.sleep(0.1)
+                continue
+            if not first:
+                sock.settimeout(None)
+                return sock
+            try:
+                if sock.recv(1):
+                    sock.settimeout(None)
+                    return sock
+            except OSError:
+                pass
+            sock.close()
+            time.sleep(0.1)
+        return None
+
+    def _read_log(self, process: subprocess.Popen):
+        """What the server says: its trouble (an app that isn't there) in words for the window."""
+        for raw in process.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            debug("scrcpy:", line)
+            if "No app found" in line:
+                self.problem = "That app isn't on the phone any more."
+                GLib.idle_add(self._ended, self.problem)
+            elif "ERROR" in line and not self.problem:
+                self.problem = line.split("ERROR:", 1)[-1].strip() or line
+        process.stdout.close()
+
+    def _send(self, message: bytes):
+        control = self.control
+        if not control or not message:
+            return
+        try:
+            with self.lock:
+                control.sendall(message)
+        except OSError:
+            pass
+
+    def _touch_ready(self):
+        if not self.stopped:
+            self.live_touch = True
+            self.on_touch(True)
+        return GLib.SOURCE_REMOVE
+
+    def _frame(self, texture):
+        native = self.decoder.native
+        if native and native != self.shown:
+            # The app turned its screen (a video, a game): the same screen, sideways.
+            self.shown = native
+            if self.pressed:
+                self.release()
+            self.on_turned()
+        self.on_frame(texture)
+
+    def _decoder_broken(self):
+        """The decoder started afresh (copying its frames, say, where the GPU's weren't taken):
+        the phone starts its video afresh too, so there's a picture to begin from. Starting the
+        server again would close the app."""
+        if self.stopped:
+            return
+        if self.control:
+            self._send(bytes([RESET_VIDEO]))
+        else:
+            self._ended("The app's video broke off.")
+
+    def _ended(self, why: str):
+        debug("app screen ended:", why)
+        if not self.stopped:
+            self.on_ended(why)
+        return GLib.SOURCE_REMOVE
+
+    # ---- Touches, keys and text ------------------------------------------------------------
+
+    def _at(self, x: int, y: int) -> tuple[int, int]:
+        width, height = self.shown
+        return min(max(int(x), 0), width - 1), min(max(int(y), 0), height - 1)
+
+    def press(self, x: int, y: int):
+        if self.live_touch:
+            self.pressed = True
+            self.finger = self._at(x, y)
+            self._send(touch_message(DOWN, *self.finger, self.shown))
+
+    def drag(self, x: int, y: int):
+        if self.live_touch and self.pressed:
+            self.finger = self._at(x, y)
+            self._send(touch_message(MOVE, *self.finger, self.shown))
+
+    def release(self):
+        if self.pressed:
+            self.pressed = False
+            self._send(touch_message(UP, *self.finger, self.shown))
+
+    def gesture(self, gesture: Gesture):
+        if gesture.kind == "swipe":
+            threading.Thread(target=self._swipe, args=(gesture,), daemon=True).start()
+        else:
+            self.press(*gesture.start)
+            GLib.timeout_add(max(gesture.ms, 40), self._lift)
+
+    def _lift(self):
+        self.release()
+        return GLib.SOURCE_REMOVE
+
+    def _swipe(self, gesture: Gesture):
+        (x0, y0), (x1, y1) = gesture.start, gesture.end
+        steps = max(4, gesture.ms // 16)
+        self._send(touch_message(DOWN, *self._at(x0, y0), self.shown))
+        for i in range(1, steps + 1):
+            time.sleep(gesture.ms / 1000 / steps)
+            x, y = x0 + (x1 - x0) * i // steps, y0 + (y1 - y0) * i // steps
+            self._send(touch_message(MOVE, *self._at(x, y), self.shown))
+        self._send(touch_message(UP, *self._at(x1, y1), self.shown))
+
+    def key(self, name: str):
+        """The keys an app takes; the phone's own (home, recents, its shade) aren't on this screen."""
+        code = KEYCODES.get(name)
+        if code:
+            self._send(key_messages(code))
+
+    def type(self, text: str) -> int:
+        self._send(text_messages(text))
+        return 0

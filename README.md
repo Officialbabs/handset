@@ -20,12 +20,32 @@ screen.
 - **The keyboard types on the phone.** Enter, Backspace, Tab, the arrows, Home and End do what
   they do there, and Escape goes back. (Android types plain letters, digits and punctuation only.)
 - **Shortcuts:** Ctrl+B back, Ctrl+H home, Ctrl+R recent apps, Ctrl+N notifications, F11 full
-  screen, Ctrl+P the next phone, Ctrl+W close.
+  screen, Ctrl+P the next phone, Ctrl+Shift+A the phone's apps, Ctrl+W close.
 - **When Ada is working on the phone**, a small badge at the top says what she's doing and a ring
   goes round the screen. She waits while you use the phone; the window's touches are meant to
   count for that as your finger's do (not yet checked on a real phone).
 - With more than one phone, Ctrl+P switches, or pick one on the page shown while a phone isn't
   connected. `handset --phone "Pixel 7"` opens that one.
+
+## The phone's apps in the dock
+
+Right-click the bezel and choose **Phone Apps…** (or press Ctrl+Shift+A) to see the phone's apps.
+Click one to open it in a window of its own, or press its pin to put it in the dock. A pinned
+app is an app like any other on the desk: it's in the dock and in search, with its own icon and
+name ("WhatsApp (Pixel 7)"), and its window counts as that app, not as Handset. Opening it while
+the phone isn't connected waits for the phone. Right-click an app window's bezel to unpin it.
+
+- **On Android** the app gets a screen of its own on the phone, as big as the phone's, and only
+  that app shows on it: the phone's own screen carries on as it was, and an app that was open
+  there moves over. Closing the window closes the app. This needs the `scrcpy` package. Apps that
+  hide their screen from sharing (banking, some video apps) show black, as they do when mirrored.
+- **On an iPhone** the phone has one screen, so the app opens in front on it and the window shows
+  the phone's screen with that app. A locked iPhone doesn't open apps: unlock it first.
+- Icons come from the phone: on Android read out of each app's package (drawn as the launcher
+  draws them, its first letter on a colour when one can't be read), on an iPhone from the phone.
+- Each pin is a menu entry in `~/.local/share/applications` (`io.github.Officialbabs.Handset.App.…`)
+  and a line in the dock's pins (`~/.config/os-ai/dock.ini`). `handset --phone ID --app APP` is
+  what it runs.
 
 ## How it works
 

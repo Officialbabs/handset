@@ -10,7 +10,9 @@ import unittest
 from gi.repository import GLib
 
 from handset import android
-from handset.android import (Android, Link, Touch, Video, down_events, even_size, find_serial, gesture_command,
+from handset.android import (Android, AppScreen, Link, Touch, Video, display_size, down_events, even_size,
+                             find_serial, gesture_command, list_apps, parse_app_list, start_app_message,
+                             text_messages, touch_message,
                              key_command, parse_awake, parse_devices, parse_locked, parse_rotation, parse_wm_size,
                              shown_size,
                              stream_edge, text_command, to_natural, touch_device, up_events)
@@ -135,8 +137,8 @@ class CommandsTest(unittest.TestCase):
         self.assertEqual(up_events()[-3:], ["EV_SYN", "SYN_REPORT", 0])
 
 
-class FakePhone(unittest.TestCase):
-    """Tests that talk to the stand-in adb."""
+class FakeAdb(unittest.TestCase):
+    """The stand-in adb, for tests that talk to it."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -162,6 +164,8 @@ class FakePhone(unittest.TestCase):
         with open(path) as file:
             return [json.loads(line) for line in file if line.strip()]
 
+
+class FakePhone(FakeAdb):
     def test_finding_the_phone(self):
         self.assertEqual(find_serial("FAKE7"), "FAKE7")
         self.assertIsNone(find_serial("SOMEONE-ELSE"))
@@ -286,6 +290,90 @@ class FakePhone(unittest.TestCase):
         phone.stop()
         shells = [a[1] for a in self.logged("log.jsonl") if a[:1] == ["shell"] and "dumpsys" not in a[1]]
         self.assertEqual(shells, ["input text 'hello'", "input keyevent KEYCODE_ENTER"])
+
+
+class AppMessagesTest(unittest.TestCase):
+    def test_the_app_list(self):
+        text = ("[server] INFO: Device: [Google] google Pixel 7 (Android 17)\n"
+                "[server] INFO: List of apps:\n"
+                " * Settings                       com.android.settings\n"
+                " - WhatsApp                       com.whatsapp\n"
+                " - An Application With A Long Name\n"
+                "   org.example.long\n")
+        self.assertEqual(parse_app_list(text), [("Settings", "com.android.settings"), ("WhatsApp", "com.whatsapp"),
+                                                ("An Application With A Long Name", "org.example.long")])
+
+    def test_messages(self):
+        touch = touch_message(0, 10, 20, (1080, 2400))
+        self.assertEqual(len(touch), 32)
+        self.assertEqual(touch[:2], bytes([2, 0]))
+        self.assertEqual(start_app_message("com.whatsapp"), bytes([16, 12]) + b"com.whatsapp")
+        long = text_messages("é" * 200)  # 400 bytes: two messages, no character split
+        self.assertEqual(long[:5], bytes([1, 0, 0, 1, 44]))
+        self.assertEqual(len(long), 5 + 300 + 5 + 100)
+
+    def test_its_screen_is_the_phones_upright(self):
+        self.assertEqual(display_size((1080, 2400)), (1080, 2400))
+        self.assertEqual(display_size((2400, 1080)), (1080, 2400))
+        self.assertEqual(display_size((1179, 2556)), (1176, 2552))
+
+
+class AppScreenTest(FakeAdb):
+    """One app on a screen of its own, through the stand-in for scrcpy's server."""
+
+    def setUp(self):
+        super().setUp()
+        self.version = android.scrcpy_version
+        android.scrcpy_version = lambda: "3.3.4"
+
+    def tearDown(self):
+        android.scrcpy_version = self.version
+        super().tearDown()
+
+    def test_listing_the_apps(self):
+        self.assertEqual(list_apps("FAKE7"), [("A Very Long Application Name Indeed", "org.example.long"),
+                                              ("Fake Chat", "org.example.chat"), ("Settings", "com.android.settings")])
+
+    def test_an_app_on_its_own_screen(self):
+        frames, touch, ended = [], [], []
+        screen = AppScreen(Link("FAKE7", (1080, 2400), 0), "org.example.chat", frames.append, lambda: None,
+                           touch.append, ended.append)
+        screen.start()
+        try:
+            spin(lambda: (touch and frames) or ended, seconds=20)
+            self.assertEqual(ended, [])
+            screen.press(100, 200)
+            screen.drag(300, 400)
+            screen.release()
+            screen.key("back")
+            screen.key("home")  # the phone's own: not on this screen
+            screen.type("hi")
+            screen._decoder_broken()  # a decoder started afresh: the phone's video does too
+            spin(lambda: len(self.logged("control.jsonl")) >= 8)
+        finally:
+            screen.stop()
+        sent = self.logged("control.jsonl")
+        self.assertEqual(sent[0], {"type": "start_app", "package": "org.example.chat"})
+        self.assertEqual([(m["action"], m["x"], m["y"], m["size"]) for m in sent if m["type"] == "touch"],
+                         [(0, 100, 200, [1080, 2400]), (2, 300, 400, [1080, 2400]), (1, 300, 400, [1080, 2400])])
+        self.assertEqual([(m["action"], m["code"]) for m in sent if m["type"] == "key"], [(0, 4), (1, 4)])
+        self.assertEqual([m["text"] for m in sent if m["type"] == "text"], ["hi"])
+        self.assertEqual(sent[-1], {"type": "reset_video"})
+        self.assertEqual(ended, [])  # the app stays open
+        started = next(a[1] for a in self.logged("log.jsonl") if a[:1] == ["shell"] and "Server" in a[1])
+        self.assertIn("new_display=1080x2400", started)
+        self.assertIn("control=true", started)
+
+    def test_an_app_thats_gone(self):
+        ended = []
+        screen = AppScreen(Link("FAKE7", (1080, 2400), 0), "org.example.gone", lambda t: None, lambda: None,
+                           lambda live: None, ended.append)
+        screen.start()
+        try:
+            spin(lambda: ended, seconds=20)
+        finally:
+            screen.stop()
+        self.assertEqual(ended, ["That app isn't on the phone any more."])
 
 
 if __name__ == "__main__":

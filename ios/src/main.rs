@@ -11,9 +11,14 @@
 //! - says what it's doing on standard error, one JSON object per line: {"event":"status"},
 //!   {"event":"video","codec":"h265"}, {"event":"input","ready":true}, {"event":"error"}.
 //!
-//! The end of standard input stops the phone's stream and ends the helper.
+//! The end of standard input stops the phone's stream and ends the helper. {"op":"launch",
+//! "bundle"} opens an app on the phone (said back as {"event":"launch","ok"}).
+//!
+//! `apps` lists the phone's apps instead, one JSON object per line on standard output
+//! ({"name","bundle","icon"}), with each icon saved as a PNG in the --icons folder.
 //!
 //!     handset-ios stream --pairing FILE --udid UDID [--address IP] [--port PORT] [--verbose]
+//!     handset-ios apps --pairing FILE --udid UDID [--address IP] [--icons DIR] [--verbose]
 
 use std::error::Error;
 use std::io::Write;
@@ -24,7 +29,7 @@ use idevice::core_device_proxy::CoreDeviceProxy;
 use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection};
 use idevice::{IdeviceService, RsdService};
 use idevice::core_device::{
-    CallInfoBlob, DisplayServiceClient, HevcDepacketizer, RtpPacket, build_screen_audio_offer,
+    AppIconTarget, AppServiceClient, CallInfoBlob, IconServiceClient, DisplayServiceClient, HevcDepacketizer, RtpPacket, build_screen_audio_offer,
     build_screen_video_offer, build_start_audio_parameters, build_start_video_parameters,
 };
 use idevice::remote_pairing::{RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native};
@@ -70,6 +75,8 @@ fn status(text: &str) {
 }
 
 struct Options {
+    command: String,
+    icons: Option<String>,
     pairing: String,
     udid: String,
     address: Option<IpAddr>,
@@ -79,11 +86,14 @@ struct Options {
 
 fn options() -> Result<Options, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) != Some("stream") {
-        return Err("usage: handset-ios stream --pairing FILE --udid UDID [--address IP] [--port PORT]".into());
+    let command = args.first().cloned().unwrap_or_default();
+    if command != "stream" && command != "apps" {
+        return Err("usage: handset-ios stream|apps --pairing FILE --udid UDID [--address IP] [--port PORT]".into());
     }
     let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     Ok(Options {
+        command,
+        icons: value("--icons"),
         pairing: value("--pairing").ok_or("--pairing FILE is needed")?,
         udid: value("--udid").ok_or("--udid UDID is needed")?,
         address: value("--address").map(|a| a.parse().map_err(|_| format!("{a} isn't an address"))).transpose()?,
@@ -202,6 +212,7 @@ fn button_usage(name: &str) -> Option<(u64, u64)> {
 async fn work_input(
     mut touch: UniversalHidServiceClient<Box<dyn idevice::ReadWrite>>,
     mut keys: IndigoHidClient<Box<dyn idevice::ReadWrite>>,
+    mut apps: Option<AppServiceClient<Box<dyn idevice::ReadWrite>>>,
     mut commands: mpsc::Receiver<Value>,
 ) {
     let (mut last_x, mut last_y) = (0u16, 0u16);
@@ -241,6 +252,18 @@ async fn work_input(
                         tokio::time::sleep(Duration::from_millis(12)).await;
                     }
                 }
+                "launch" => {
+                    // In front, as it was if it was open: FrontBoard brings it forward.
+                    let bundle = command.get("bundle").and_then(Value::as_str).unwrap_or("").to_string();
+                    match apps.as_mut() {
+                        Some(apps) => match apps.launch_application(bundle.clone(), &[], false, false, None, None, None).await {
+                            Ok(_) => say(json!({"event": "launch", "ok": true, "bundle": bundle})),
+                            Err(why) => say(json!({"event": "launch", "ok": false, "bundle": bundle, "message": why.to_string()})),
+                        },
+                        None => say(json!({"event": "launch", "ok": false, "bundle": bundle,
+                                           "message": "The iPhone didn't let Handset open apps."})),
+                    }
+                }
                 _ => {}
             }
             Ok(())
@@ -261,6 +284,44 @@ type Reached = (idevice::tcp::handle::AdapterHandle, RsdHandshake);
 enum Missed {
     Absent,
     Failed(String),
+}
+
+/// The phone's apps that show on its home screen, a line each, with their icons saved to the
+/// --icons folder as BUNDLE.png.
+async fn list_apps(options: Options) -> Fallible<()> {
+    let (_way, (mut adapter, mut handshake)) = reach(&options).await?;
+    let mut apps = AppServiceClient::connect_rsd(&mut adapter, &mut handshake).await?;
+    let mut listed: Vec<_> = apps
+        .list_apps(false, true, false, false, true)
+        .await?
+        .into_iter()
+        .filter(|app| !app.is_hidden && !app.is_app_clip)
+        .collect();
+    listed.sort_by_key(|app| app.name.to_lowercase());
+    let mut icons = match &options.icons {
+        Some(_) => IconServiceClient::connect_rsd(&mut adapter, &mut handshake).await.ok(),
+        None => None,
+    };
+    for app in listed {
+        let mut icon = Value::Null;
+        if let (Some(client), Some(folder)) = (icons.as_mut(), &options.icons) {
+            let target = AppIconTarget::BundleIdentifier(app.bundle_identifier.clone());
+            match client.fetch_icon(target, 60.0, 60.0, 3.0, false).await {
+                Ok(fetched) if !fetched.is_placeholder => {
+                    let path = std::path::Path::new(folder).join(format!("{}.png", app.bundle_identifier));
+                    let png: Vec<u8> = fetched.png_data.into();
+                    if std::fs::write(&path, png).is_ok() {
+                        icon = json!(path.to_string_lossy());
+                    }
+                }
+                Ok(_) => {}
+                Err(why) if options.verbose => eprintln!("no icon for {}: {why}", app.bundle_identifier),
+                Err(_) => {}
+            }
+        }
+        println!("{}", json!({"name": app.name, "bundle": app.bundle_identifier, "icon": icon}));
+    }
+    Ok(())
 }
 
 async fn stream(options: Options) -> Fallible<()> {
@@ -414,7 +475,8 @@ async fn stream_screen(
         IndigoHidClient::connect_rsd(&mut *adapter, &mut *handshake).await,
     ) {
         (Ok(touch), Ok(keys)) => {
-            tokio::spawn(work_input(touch, keys, commands));
+            let apps = AppServiceClient::connect_rsd(&mut *adapter, &mut *handshake).await.ok();
+            tokio::spawn(work_input(touch, keys, apps, commands));
             say(json!({"event": "input", "ready": true}));
         }
         (touch, keys) => {
@@ -524,7 +586,8 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(why) = stream(options).await {
+    let done = if options.command == "apps" { list_apps(options).await } else { stream(options).await };
+    if let Err(why) = done {
         say(json!({"event": "error", "message": why.to_string()}));
         std::process::exit(1);
     }

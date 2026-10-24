@@ -3,6 +3,8 @@ per phone: two phones, two windows, side by side.
 
   handset                 open Handset: the windows open last time (or bring them forward)
   handset --phone NAME    show that phone (its name or id), in a window of its own
+  handset --phone ID --app APP
+                          one of its apps in a window of its own (what a pinned app runs)
   handset --new-window    another window, for a phone no window shows yet
   handset --off           close every window and quit (the same windows open next time)
 
@@ -60,21 +62,44 @@ class App(Adw.Application):
 
     # ---- Which window shows which phone -----------------------------------------------------
 
-    def handset_windows(self) -> list:
+    def handset_windows(self, apps: bool = True) -> list:
+        """Handset's windows: the phones', and (`apps`) the ones showing one app each."""
         from .window import Window
 
-        return [w for w in self.get_windows() if isinstance(w, Window)]
+        return [w for w in self.get_windows() if isinstance(w, Window) and (apps or not w.phone_app)]
 
     def shown(self, besides=None) -> set[str]:
         """The phones other windows show (their ids)."""
-        return {w.phone.id for w in self.handset_windows() if w is not besides and w.phone}
+        return {w.phone.id for w in self.handset_windows(apps=False) if w is not besides and w.phone}
 
     def window_for(self, wanted: str):
         """The window that shows the phone `wanted` (its id or name), if any."""
-        for window in self.handset_windows():
+        for window in self.handset_windows(apps=False):
             if window.phone and wanted in (window.phone.id, window.phone.name):
                 return window
         return None
+
+    def open_app(self, phone_id: str, app: str, phone_app=None):
+        """One app of a phone in a window of its own (the one showing it comes forward). An
+        iPhone has one screen, so its app opens in front in a window showing that iPhone."""
+        from .apps import PhoneApp, find
+        from .window import Window
+
+        for window in self.handset_windows():
+            if window.phone_app and (window.phone_app.phone_id, window.phone_app.app) == (phone_id, app):
+                window.present()
+                return window
+        phone_app = phone_app or find(phone_id, app) or PhoneApp(phone_id, phone_id, "", app, app)
+        if phone_app.platform == "ios":
+            for window in self.handset_windows():
+                if window.phone and window.phone.id == phone_id:
+                    window.present()
+                    window.open_app(app)
+                    return window
+        window = Window(self, phone_app=phone_app)
+        window.present()
+        say_on(True)
+        return window
 
     def open_window(self, wanted: str | None = None, new: bool = False):
         """A window for `wanted`, or (new) for a phone no window shows yet; the one already
@@ -105,18 +130,33 @@ class App(Adw.Application):
 
         if self.turning_off:
             return
-        windows = [w for w in self.handset_windows() if w is not closing or len(self.handset_windows()) == 1]
+        phones = self.handset_windows(apps=False)
+        windows = [w for w in phones if w is not closing or len(self.handset_windows()) == 1]
         self.settings["windows"] = [w.phone.id for w in windows if w.phone]
         save_settings(self.settings)
 
     # ---- Starting -----------------------------------------------------------------------------
 
     def do_command_line(self, command_line):
-        args = command_line.get_arguments()[1:]
+        try:
+            return self._command_line(command_line.get_arguments()[1:])
+        finally:
+            # A traceback a signal handler printed meanwhile (a window being made, say) keeps its
+            # frames, this call's among them, and so the command line: the process that sent it
+            # would wait for it for good.
+            sys.last_type = sys.last_value = sys.last_traceback = None
+            if hasattr(sys, "last_exc"):
+                sys.last_exc = None
+
+    def _command_line(self, args: list[str]) -> int:
         if "--phone" in args:
             index = args.index("--phone")
             if index + 1 < len(args):
-                self.open_window(args[index + 1])
+                app = args.index("--app") if "--app" in args else -1
+                if 0 <= app < len(args) - 1:
+                    self.open_app(args[index + 1], args[app + 1])
+                else:
+                    self.open_window(args[index + 1])
                 return 0
         if "--new-window" in args:
             self.open_window(new=True)

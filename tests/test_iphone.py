@@ -10,7 +10,7 @@ from gi.repository import GLib
 
 from handset import iphone
 from handset.gestures import Gesture
-from handset.iphone import SPAN, IPhone, Link, normalized, plainly, screen_crop
+from handset.iphone import SPAN, IPhone, Link, list_apps, normalized, plainly, screen_crop
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_HELPER = os.path.join(HERE, "fakeios.py")
@@ -124,6 +124,25 @@ class FakeHelper(unittest.TestCase):
         self.assertEqual(args[:5], ["stream", "--pairing", "/p.rppairing", "--udid", "UDID-1"])
         self.assertIn("192.168.18.10", args)
 
+    def test_an_app_opened_once_it_takes_input(self):
+        launched = []
+        self.phone.on_launched = lambda ok, why: launched.append((ok, why))
+        self.phone.launch("org.example.chat")  # before it takes input: kept for then
+        self.phone.start()
+        spin(lambda: launched)
+        self.phone.launch("org.example.gone")
+        spin(lambda: len(launched) >= 2)
+        self.assertEqual(launched, [(True, ""), (False, "Unlock the iPhone to open it.")])
+        self.assertEqual([c["bundle"] for c in self.commands() if c["op"] == "launch"],
+                         ["org.example.chat", "org.example.gone"])
+
+    def test_its_apps_and_their_icons(self):
+        icons = os.path.join(self.tmp.name, "icons")
+        apps = list_apps(Link("UDID-1", "/p.rppairing", "192.168.18.10", FAKE_HELPER), icons)
+        self.assertEqual(apps, [("Fake Chat", "org.example.chat", os.path.join(icons, "org.example.chat.png")),
+                                ("Maps", "com.apple.Maps", None)])
+        self.assertTrue(os.path.isfile(apps[0][2]))
+
     def test_touches_buttons_and_typing(self):
         self.phone.start()
         spin(lambda: self.frames and self.phone.live_touch)
@@ -156,12 +175,12 @@ class FakeHelper(unittest.TestCase):
         changes = []
         self.phone.on_awake = changes.append
         self.phone.looks_dark = lambda: True  # as the window finds a black picture
-        os.environ["FAKEIOS_DARK_AFTER"] = "1"
+        os.environ["FAKEIOS_DARK_AFTER"] = "6"  # time for a first picture, however busy the machine
         saved = iphone.DARK_AFTER_S
         iphone.DARK_AFTER_S = 0.6
         try:
             self.phone.start()
-            spin(lambda: changes == [False])
+            spin(lambda: changes == [False], seconds=20)
             self.assertFalse(self.phone.awake)
             self.phone.wake()
             spin(lambda: {"op": "button", "name": "home"} in self.commands())
@@ -173,14 +192,14 @@ class FakeHelper(unittest.TestCase):
         changes = []
         self.phone.on_awake = changes.append
         self.phone.looks_dark = lambda: False  # frames stopped, but the picture is lit
-        os.environ["FAKEIOS_DARK_AFTER"] = "1"
+        os.environ["FAKEIOS_DARK_AFTER"] = "6"  # time for a first picture, however busy the machine
         saved = iphone.DARK_AFTER_S
         iphone.DARK_AFTER_S = 0.6
         try:
             self.phone.start()
-            spin(lambda: self.frames)
-            end = time.monotonic() + 3
-            spin(lambda: time.monotonic() > end, seconds=5)
+            spin(lambda: self.frames, seconds=20)
+            end = time.monotonic() + 7  # past the pictures stopping, and then some
+            spin(lambda: time.monotonic() > end, seconds=9)
             self.assertTrue(self.phone.awake)
             self.assertEqual(changes, [])
         finally:
