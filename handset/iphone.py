@@ -29,13 +29,24 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 from dataclasses import dataclass
 
 from gi.repository import GLib
 
-from .decoder import Decoder
 from .gestures import Gesture
 from .log import DEBUG, debug
+
+if TYPE_CHECKING:
+    from .decoder import Decoder
+
+
+def _decoder(*args, **kwargs) -> Decoder:
+    """A video decoder: GStreamer is loaded only once a screen shows (not to list apps, say)."""
+    from .decoder import Decoder
+
+    return Decoder(*args, **kwargs)
+
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The helper, as install.sh puts it, or as `cargo build --release` leaves it in the checkout.
@@ -348,7 +359,7 @@ class IPhone:
         kind = event.get("event")
         debug("iphone helper says", event)
         if kind == "video" and self.decoder is None and not self.stopped:
-            self.decoder = Decoder(str(event.get("codec") or "h265"), self._frame,
+            self.decoder = _decoder(str(event.get("codec") or "h265"), self._frame,
                                    crop=lambda size: screen_crop(self.link.model, size))
             if self.shown_at:
                 self.decoder.show_at(*self.shown_at)

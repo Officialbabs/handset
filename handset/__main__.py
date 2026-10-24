@@ -7,6 +7,8 @@ per phone: two phones, two windows, side by side.
                           one of its apps in a window of its own (what a pinned app runs)
   handset --new-window    another window, for a phone no window shows yet
   handset --off           close every window and quit (the same windows open next time)
+  handset --sync          keep connected phones' apps among the desk's apps (from sign-in)
+  handset --forget-apps   take every phone app off the desk and out of the dock
 
 While Handset runs it keeps a file, $XDG_RUNTIME_DIR/handset.on, so others can show whether
 it's on (a switch in the desktop's Control Center, say) without asking it.
@@ -55,6 +57,9 @@ class App(Adw.Application):
         self.connect("shutdown", lambda _app: say_on(False))
 
     def _started(self, _app):
+        from .appsync import start_if_needed
+
+        start_if_needed()  # the phones' apps among the desk's, whether or not it ran at sign-in
         action = Gio.SimpleAction.new("new-window", None)
         action.connect("activate", lambda *_a: self.open_window(new=True))
         self.add_action(action)
@@ -82,7 +87,7 @@ class App(Adw.Application):
     def open_app(self, phone_id: str, app: str, phone_app=None):
         """One app of a phone in a window of its own (the one showing it comes forward). An
         iPhone has one screen, so its app opens in front in a window showing that iPhone."""
-        from .apps import PhoneApp, find
+        from .apps import PhoneApp, find, write_entry
         from .window import Window
 
         for window in self.handset_windows():
@@ -90,6 +95,9 @@ class App(Adw.Application):
                 window.present()
                 return window
         phone_app = phone_app or find(phone_id, app) or PhoneApp(phone_id, phone_id, "", app, app)
+        if phone_app.platform:
+            # An entry of its own, so its window counts as that app (in the dock, say).
+            write_entry(phone_app, None, replace=False)
         if phone_app.platform == "ios":
             for window in self.handset_windows():
                 if window.phone and window.phone.id == phone_id:
@@ -188,7 +196,21 @@ class App(Adw.Application):
 
 
 def main(argv=None) -> int:
-    return App().run(argv if argv is not None else sys.argv)
+    argv = argv if argv is not None else sys.argv
+    if "--sync" in argv[1:]:
+        from .appsync import main as sync
+
+        return sync()
+    if argv[1:2] == ["--sync-icons"] and len(argv) == 4:
+        from .appsync import icons_worker
+
+        return icons_worker(argv[2], argv[3])
+    if "--forget-apps" in argv[1:]:
+        from .appsync import forget_all
+
+        forget_all()
+        return 0
+    return App().run(argv)
 
 
 if __name__ == "__main__":

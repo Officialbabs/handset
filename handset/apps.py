@@ -1,7 +1,9 @@
-"""A phone's apps on the desk. Each app pinned from Handset gets a menu entry of its own (its
-name, the phone's name, its icon) and a place in the desktop's dock; opening it runs
-`handset --phone PHONE --app APP`, which shows that one app in a window of its own. Its window
-carries the entry's id, so the dock counts it as that app, not as Handset.
+"""A phone's apps on the desk. While a phone is connected each of its apps has a menu entry of its
+own (its name, the phone's name, its icon), so it's in search and among the desk's apps like any
+other; opening it runs `handset --phone PHONE --app APP`, which shows that one app in a window of
+its own. Its window carries the entry's id, so the dock counts it as that app, not as Handset. An
+app pinned to the dock keeps its entry when the phone goes; the others go with it (appsync.py
+keeps them).
 
 The entries live in ~/.local/share/applications as io.github.Officialbabs.Handset.App.*.desktop,
 their icons in ~/.local/share/handset/icons. The dock's pins are a list in the desktop's own
@@ -10,9 +12,11 @@ settings (~/.config/os-ai/dock.ini, [Dock] Pinned), which the dock follows as it
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import io
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -66,8 +70,21 @@ def entry_path(phone_id: str, app: str) -> str:
     return os.path.join(applications_dir(), f"{app_id(phone_id, app)}.desktop")
 
 
-def icon_path(phone_id: str, app: str) -> str:
-    return os.path.join(icons_dir(), f"{app_id(phone_id, app)}.png")
+def icon_files(phone_id: str, app: str) -> list[str]:
+    """The app's icon as it's kept: named by what's in it too, so a new icon is a new file, which
+    the desktop sees (it keeps a picture it has read by its path)."""
+    return glob.glob(os.path.join(glob.escape(icons_dir()), f"{app_id(phone_id, app)}*.png"))
+
+
+def cache_dir(phone_id: str) -> str:
+    """Where a phone's app icons are kept, as they're read from it."""
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(cache, "handset", "apps", hashlib.sha1(phone_id.encode()).hexdigest()[:16])
+
+
+def cached_icon(folder: str, app: str) -> str:
+    """An app's kept icon: its package (or bundle id) is the name, made plain."""
+    return os.path.join(folder, f"{re.sub(r'[^A-Za-z0-9._-]', '_', app)}.png")
 
 
 def dock_path() -> str:
@@ -76,7 +93,10 @@ def dock_path() -> str:
 
 
 def launcher() -> str:
-    """How the menu entries start Handset: as it was started now, when that was its launcher."""
+    """How the menu entries start Handset: as it was started now, when that was its launcher
+    (or HANDSET_LAUNCHER says)."""
+    if os.environ.get("HANDSET_LAUNCHER"):
+        return os.environ["HANDSET_LAUNCHER"]
     started = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
     if os.path.basename(started) == "handset" and os.access(started, os.X_OK):
         return started
@@ -90,10 +110,10 @@ def quoted(arg: str) -> str:
     return '"' + "".join("\\" + c if c in '"`$\\' else c for c in arg) + '"'
 
 
-# ---- The pins ---------------------------------------------------------------------------------
+# ---- The entries ------------------------------------------------------------------------------
 
-def pinned() -> list[PhoneApp]:
-    """The phone apps pinned from Handset, from their menu entries."""
+def entries(phone_id: str | None = None) -> list[PhoneApp]:
+    """The phone apps with menu entries (of one phone, or all), from the entries themselves."""
     found = []
     try:
         names = sorted(os.listdir(applications_dir()))
@@ -105,36 +125,47 @@ def pinned() -> list[PhoneApp]:
         entry = GLib.KeyFile()
         try:
             entry.load_from_file(os.path.join(applications_dir(), name), GLib.KeyFileFlags.NONE)
-            found.append(PhoneApp(entry.get_string(ENTRY, "X-Handset-Phone"),
-                                  entry.get_string(ENTRY, "X-Handset-Phone-Name"),
-                                  entry.get_string(ENTRY, "X-Handset-Platform"),
-                                  entry.get_string(ENTRY, "X-Handset-App"),
-                                  entry.get_string(ENTRY, "X-Handset-App-Name")))
+            app = PhoneApp(entry.get_string(ENTRY, "X-Handset-Phone"),
+                           entry.get_string(ENTRY, "X-Handset-Phone-Name"),
+                           entry.get_string(ENTRY, "X-Handset-Platform"),
+                           entry.get_string(ENTRY, "X-Handset-App"),
+                           entry.get_string(ENTRY, "X-Handset-App-Name"))
         except GLib.Error:
             continue
+        if phone_id is None or app.phone_id == phone_id:
+            found.append(app)
     return found
 
 
-def is_pinned(phone_id: str, app: str) -> bool:
+def has_entry(phone_id: str, app: str) -> bool:
     return os.path.exists(entry_path(phone_id, app))
 
 
 def find(phone_id: str, app: str) -> PhoneApp | None:
-    return next((p for p in pinned() if p.phone_id == phone_id and p.app == app), None)
+    return next((p for p in entries(phone_id) if p.app == app), None)
 
 
-def pin(app: PhoneApp, icon: bytes | None) -> bool:
-    """The app's icon and menu entry, then its place at the end of the dock. False when the
-    dock's pins couldn't be changed (the entry is there all the same: it can be pinned from the
-    dock's own menu while its window is open)."""
+def write_entry(app: PhoneApp, icon: bytes | None = None, replace: bool = True) -> bool:
+    """The app's menu entry, with its icon (with none: the one it has, or a letter). Nothing is
+    written when the entry is there already as it would be, or when it's there and `replace`
+    is False. True when something changed."""
+    if has_entry(app.phone_id, app.app) and not replace:
+        return False
     os.makedirs(icons_dir(), exist_ok=True)
     os.makedirs(applications_dir(), exist_ok=True)
-    picture = icon_path(app.phone_id, app.app)
-    GLib.file_set_contents(picture, icon or letter_icon(app.name))
+    kept = icon_files(app.phone_id, app.app)
+    if icon is None and kept:
+        picture = kept[0]
+    else:
+        data = icon or letter_icon(app.name)
+        picture = os.path.join(icons_dir(), f"{app.id}-{hashlib.sha1(data).hexdigest()[:10]}.png")
+        if not os.path.exists(picture):
+            GLib.file_set_contents(picture, data)  # the picture before the entry that names it
     entry = GLib.KeyFile()
     entry.set_string(ENTRY, "Type", "Application")
     entry.set_string(ENTRY, "Name", app.title)
     entry.set_string(ENTRY, "Comment", f"{app.name} on {app.phone_name}, through Handset")
+    entry.set_string(ENTRY, "Keywords", f"{app.name};{app.phone_name};phone;")
     entry.set_string(ENTRY, "Exec", " ".join(quoted(a) for a in
                                              (launcher(), "--phone", app.phone_id, "--app", app.app)))
     entry.set_string(ENTRY, "Icon", picture)
@@ -146,18 +177,52 @@ def pin(app: PhoneApp, icon: bytes | None) -> bool:
     entry.set_string(ENTRY, "X-Handset-App", app.app)
     entry.set_string(ENTRY, "X-Handset-App-Name", app.name)
     data, _length = entry.to_data()
-    GLib.file_set_contents(entry_path(app.phone_id, app.app), data.encode())
-    return dock(f"{app.id}.desktop", True)
+    path = entry_path(app.phone_id, app.app)
+    try:
+        with open(path) as file:
+            if file.read() == data:
+                return False
+    except OSError:
+        pass
+    GLib.file_set_contents(path, data.encode())
+    for old in kept:
+        if old != picture:
+            os.unlink(old)
+    return True
 
 
-def unpin(phone_id: str, app: str):
-    """Out of the dock, and its entry and icon gone."""
-    dock(f"{app_id(phone_id, app)}.desktop", False)
-    for path in (entry_path(phone_id, app), icon_path(phone_id, app)):
+def remove_entry(phone_id: str, app: str):
+    """The app's entry and icon gone (it stays in the dock's list if it's pinned)."""
+    for path in [entry_path(phone_id, app)] + icon_files(phone_id, app):
         try:
             os.unlink(path)
         except FileNotFoundError:
             pass
+
+
+# ---- The pins ---------------------------------------------------------------------------------
+
+def pinned() -> list[PhoneApp]:
+    """The phone apps pinned to the dock."""
+    docked_ids = set(docked())
+    return [app for app in entries() if f"{app.id}.desktop" in docked_ids]
+
+
+def is_pinned(phone_id: str, app: str) -> bool:
+    return f"{app_id(phone_id, app)}.desktop" in docked()
+
+
+def pin(app: PhoneApp, icon: bytes | None) -> bool:
+    """The app's entry (its icon too, when given), then its place at the end of the dock. False
+    when the dock's pins couldn't be changed (the entry is there all the same: it can be pinned
+    from the dock's own menu while its window is open)."""
+    write_entry(app, icon)
+    return dock(f"{app.id}.desktop", True)
+
+
+def unpin(phone_id: str, app: str):
+    """Out of the dock. Its entry stays while it's one of a connected phone's apps."""
+    dock(f"{app_id(phone_id, app)}.desktop", False)
 
 
 def docked() -> list[str]:

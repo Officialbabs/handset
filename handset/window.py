@@ -63,6 +63,7 @@ SCREEN_SHARE = 0.8
 # The bezel above the screen, held to move the window (there's no title bar).
 BEZEL = 22
 FRAME = BEZEL  # what the window has besides the screen
+BORDER = 2  # an app's window: a thin frame round its sides and bottom, in the bezel's colour
 # The phone's shape until the phone says (a Pixel 7's, upright).
 FIRST_RATIO = 1080 / 2400
 
@@ -77,6 +78,15 @@ CSS = b"""
 .handset-grip { background: alpha(white, 0.32); border-radius: 3px; min-width: 44px; min-height: 5px; }
 .handset-window:not(.on-screen) .handset-bezel { background: none; }
 .handset-window:not(.on-screen) .handset-grip { background: alpha(currentColor, 0.2); }
+.handset-bezel-button { min-width: 18px; min-height: 18px; padding: 0; margin: 0 4px; border-radius: 999px;
+                        background: none; box-shadow: none; color: alpha(white, 0.5); -gtk-icon-size: 12px; }
+.handset-bezel-button:hover { background: alpha(white, 0.14); color: white; }
+.handset-bezel-button.close:hover { background: #e01b24; color: white; }
+.handset-window:not(.on-screen) .handset-bezel-button { color: inherit; opacity: 0.6; }
+.handset-window:not(.on-screen) .handset-bezel-button:hover { opacity: 1; background: alpha(currentColor, 0.1); }
+.handset-app-body { padding: 0 2px 2px 2px; }
+.handset-window.on-screen .handset-app-body { background: #101012; }
+.handset-window.maximized .handset-app-body, .handset-window.fullscreen .handset-app-body { padding: 0; }
 """
 
 # The phone's buttons and the window's own, as shortcuts: (action, accelerators).
@@ -154,10 +164,12 @@ def fitted(ratio: float, screen: tuple[int, int], longer: float | None = None) -
     return max(1, int(w * scale)), max(1, int(h * scale))  # down, so it always fits
 
 
-def window_size(ratio: float, screen: tuple[int, int], longer: float | None = None) -> tuple[int, int]:
-    """The window's size: the phone's screen as fitted() makes it, with the bezel above it."""
-    width, height = fitted(ratio, (screen[0], screen[1] - FRAME), longer)
-    return width, height + FRAME
+def window_size(ratio: float, screen: tuple[int, int], longer: float | None = None,
+                border: int = 0) -> tuple[int, int]:
+    """The window's size: the phone's screen as fitted() makes it, with the bezel above it (and
+    an app's window, its frame round the rest)."""
+    width, height = fitted(ratio, (screen[0] - 2 * border, screen[1] - FRAME - border), longer)
+    return width + 2 * border, height + FRAME + border
 
 
 def choose(phones: list[Phone], wanted: str | None, taken=(), free_only: bool = False) -> Phone | None:
@@ -185,6 +197,7 @@ class Window(Adw.ApplicationWindow):
         super().__init__(application=app, title=phone_app.name if phone_app else NAME)
         self.add_css_class("handset-window")
         self.phone_app = phone_app  # the one app this window shows, if it shows one
+        self.border = BORDER if phone_app else 0
         # libadwaita's windows are at least 360 wide: narrower than that is a phone's own shape.
         self.set_size_request(160, 240)
         self.settings = app.settings  # shared by the app's windows
@@ -218,7 +231,7 @@ class Window(Adw.ApplicationWindow):
         self.resize_timer = 0
         self._take_size(self.wanted)
         GLib.timeout_add(1000, self._check_hidden)
-        self.connect_after("realize", self._realized)
+        self.connect_after("map", self._mapped)
 
         provider = Gtk.CssProvider()
         provider.load_from_data(CSS)
@@ -232,8 +245,10 @@ class Window(Adw.ApplicationWindow):
         self.watch.start()
         self._show_status("phone-symbolic", "Looking for your phones…", "")
 
-    def _realized(self, _window):
-        """An app's window goes by the app's own id, so the dock counts it as that app."""
+    def _mapped(self, _window):
+        """An app's window goes by the app's own id, so the dock counts it as that app. Set once
+        it's mapped: GTK gives every window the application's id as it maps it, and the
+        compositor takes the id it has when the window's first picture comes, just after."""
         if not self.phone_app or GdkWayland is None:
             return
         surface = self.get_surface()
@@ -311,7 +326,13 @@ class Window(Adw.ApplicationWindow):
         self.stack.add_named(self.frame, "screen")
         grip = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
         grip.add_css_class("handset-grip")
-        self.bezel = Gtk.WindowHandle(child=grip, height_request=BEZEL,
+        top = grip
+        if self.phone_app:
+            # An app's window: the whole phone on the left, closing on the right, quiet until hovered.
+            top = Gtk.CenterBox(center_widget=grip)
+            top.set_start_widget(self._bezel_button("phone-symbolic", "Show the whole phone", "win.whole-phone"))
+            top.set_end_widget(self._bezel_button("window-close-symbolic", "Close", "window.close", "close"))
+        self.bezel = Gtk.WindowHandle(child=top, height_request=BEZEL,
                                       tooltip_text="Drag to move · Right-click for more")
         self.bezel.add_css_class("handset-bezel")
         menu_click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
@@ -319,7 +340,14 @@ class Window(Adw.ApplicationWindow):
         self.bezel.add_controller(menu_click)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         content.append(self.bezel)
-        content.append(self.stack)
+        if self.phone_app:
+            body = Gtk.Box(vexpand=True)
+            body.add_css_class("handset-app-body")
+            self.stack.set_hexpand(True)
+            body.append(self.stack)
+            content.append(body)
+        else:
+            content.append(self.stack)
         self.toasts = Adw.ToastOverlay(child=content)
         self.set_content(self.toasts)
 
@@ -358,6 +386,16 @@ class Window(Adw.ApplicationWindow):
         self._action("fullscreen", lambda _a, _p: self.unfullscreen() if self.is_fullscreen() else self.fullscreen())
         for action, accels in SHORTCUTS:
             self.get_application().set_accels_for_action(action, accels)
+
+    @staticmethod
+    def _bezel_button(icon: str, tip: str, action: str, *classes: str) -> Gtk.Button:
+        """A small round button on the bezel, that never takes the keys from the phone."""
+        button = Gtk.Button(icon_name=icon, tooltip_text=tip, action_name=action, valign=Gtk.Align.CENTER,
+                            can_focus=False, focus_on_click=False)
+        button.add_css_class("handset-bezel-button")
+        for name in classes:
+            button.add_css_class(name)
+        return button
 
     def _bezel_menu(self, gesture, _n, x, y):
         """Right-click on the bezel: the phone's apps (or, for an app's window, its pin)."""
@@ -398,13 +436,7 @@ class Window(Adw.ApplicationWindow):
             apps.unpin(app.phone_id, app.app)
             self.say(f"{app.name} is out of the dock")
             return
-        icon = None
-        try:
-            with open(apps.icon_path(app.phone_id, app.app), "rb") as file:
-                icon = file.read()
-        except OSError:
-            pass
-        docked = apps.pin(app, icon)
+        docked = apps.pin(app, None)  # with the icon its entry has
         self.say(f"{app.name} is in the dock" if docked else "Pinned: it's in your apps, to put in the dock from there")
 
     def _take_size(self, phone_id: str | None):
@@ -415,7 +447,7 @@ class Window(Adw.ApplicationWindow):
         if not isinstance(saved, int) or saved <= 0:
             saved = None
         ratio = (lambda w, h: w / h)(*self.device.shown) if self.device else FIRST_RATIO
-        self.set_default_size(*window_size(ratio, self._monitor(), saved))
+        self.set_default_size(*window_size(ratio, self._monitor(), saved, self.border))
         if phone_id and maximized.get(phone_id):
             self.maximize()
 
@@ -743,8 +775,8 @@ class Window(Adw.ApplicationWindow):
         # The window takes the phone's shape and turns with it, keeping the size the person gave
         # it as far as the monitor allows, unless they made it fill the screen.
         if not (self.is_maximized() or self.is_fullscreen()):
-            longer = max(self.get_width(), self.get_height() - FRAME) or None
-            self.set_default_size(*window_size(ratio, self._monitor(), longer))
+            longer = max(self.get_width() - 2 * self.border, self.get_height() - FRAME - self.border) or None
+            self.set_default_size(*window_size(ratio, self._monitor(), longer, self.border))
         GLib.timeout_add(300, self._sync_shown_size)  # once the window has turned
 
     def _touch_changed(self, live: bool):
@@ -781,7 +813,7 @@ class Window(Adw.ApplicationWindow):
         key = self.size_key(self.phone.id)
         if not (maximized or self.is_fullscreen()):
             width, height = self.get_default_size()
-            longer = max(width, height - FRAME)
+            longer = max(width - 2 * self.border, height - FRAME - self.border)
             if longer > 0:
                 self.settings["sizes"][key] = longer
         self.settings["maximized"][key] = maximized

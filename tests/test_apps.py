@@ -60,18 +60,35 @@ class PinTest(unittest.TestCase):
         self.assertEqual(apps.pinned(), [CHAT])
         self.assertTrue(apps.is_pinned("FAKE7", "org.example.chat"))
 
-    def test_unpinning_takes_it_all_away(self):
+    def test_unpinning_keeps_it_among_the_apps(self):
         apps.pin(CHAT, None)
         apps.unpin("FAKE7", "org.example.chat")
         self.assertEqual(apps.docked(), ["ada-files.desktop", "zen.desktop"])
         self.assertEqual(apps.pinned(), [])
-        self.assertFalse(os.path.exists(apps.icon_path("FAKE7", "org.example.chat")))
+        self.assertEqual(apps.entries(), [CHAT])  # still one of the phone's apps
+        apps.remove_entry("FAKE7", "org.example.chat")
+        self.assertEqual(apps.entries(), [])
+        self.assertEqual(apps.icon_files("FAKE7", "org.example.chat"), [])
+
+    def test_a_new_icon_is_a_new_file(self):
+        apps.write_entry(CHAT)
+        letter = self.entry().get_string("Desktop Entry", "Icon")
+        self.assertFalse(apps.write_entry(CHAT))  # as it was: nothing written
+        with open(letter, "rb") as file:
+            self.assertFalse(apps.write_entry(CHAT, file.read()))
+        own = apps.letter_icon("Something else")
+        self.assertTrue(apps.write_entry(CHAT, own))
+        icon = self.entry().get_string("Desktop Entry", "Icon")
+        self.assertNotEqual(icon, letter)  # the desk sees a new picture by its new name
+        self.assertEqual(apps.icon_files("FAKE7", "org.example.chat"), [icon])
+        apps.write_entry(CHAT)  # no icon given: the one it has stays
+        self.assertEqual(self.entry().get_string("Desktop Entry", "Icon"), icon)
 
     def test_without_the_docks_settings_nothing_is_made_up(self):
         os.unlink(apps.dock_path())
         self.assertFalse(apps.pin(CHAT, None))
         self.assertFalse(os.path.exists(apps.dock_path()))  # the dock's own first pins stay
-        self.assertTrue(apps.is_pinned("FAKE7", "org.example.chat"))  # the entry is there to pin by hand
+        self.assertTrue(apps.has_entry("FAKE7", "org.example.chat"))  # the entry is there to pin by hand
 
     def test_ids_are_app_ids(self):
         self.assertRegex(CHAT.id, r"^io\.github\.Officialbabs\.Handset\.App\.p[0-9a-f]{16}$")

@@ -20,16 +20,26 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from queue import Queue
 
 from gi.repository import GLib  # noqa: E402
 
-from .decoder import Decoder  # noqa: E402
 from .gestures import Gesture  # noqa: E402
-
 from .log import DEBUG, debug  # noqa: E402
+
+if TYPE_CHECKING:
+    from .decoder import Decoder
+
+
+def _decoder(*args, **kwargs) -> Decoder:
+    """A video decoder: GStreamer is loaded only once a screen shows (not to list apps, say)."""
+    from .decoder import Decoder
+
+    return Decoder(*args, **kwargs)
+
 
 # Where the phone-side tools' own complaints go: nowhere, or Handset's stderr when debugging.
 TOOL_ERRORS = None if DEBUG else subprocess.DEVNULL
@@ -454,7 +464,7 @@ class Video:
         self.on_ended = on_ended
         self.version = scrcpy_version()
         self.kind = "scrcpy" if self.version else "screenrecord"
-        self.decoder = Decoder("h264", on_frame, self._decoder_broken)
+        self.decoder = _decoder("h264", on_frame, self._decoder_broken)
         self.process: subprocess.Popen | None = None
         self.sock: socket.socket | None = None
         self.forward_port: int | None = None
@@ -834,9 +844,26 @@ def parse_app_list(text: str) -> list[tuple[str, str]]:
     return apps
 
 
+def parse_drawer(text: str) -> set[str]:
+    """The packages in `cmd package query-activities --brief --components` lines (pkg/activity)."""
+    return {line.strip().split("/", 1)[0] for line in text.splitlines() if "/" in line}
+
+
+def drawer(serial: str) -> set[str] | None:
+    """The packages the phone's app drawer shows (a launcher activity each); None: not known."""
+    try:
+        found = parse_drawer(shell(serial, "cmd package query-activities --brief --components "
+                                           "-a android.intent.action.MAIN -c android.intent.category.LAUNCHER",
+                                   timeout=15))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return found or None
+
+
 def list_apps(serial: str) -> list[tuple[str, str]] | str:
-    """The phone's apps that open from its launcher, (name, package) by name; or why not, in
-    words. Through scrcpy's server, which asks the phone for each app's name."""
+    """The phone's apps as its app drawer has them, (name, package) by name; or why not, in
+    words. Through scrcpy's server, which asks the phone for each app's name; the system's parts
+    that open but have no place in the drawer (accessibility tools, say) are left out."""
     version = scrcpy_version()
     if not version:
         return "Install the scrcpy package to open the phone's apps on the desk."
@@ -846,7 +873,29 @@ def list_apps(serial: str) -> list[tuple[str, str]] | str:
                                     f"{version} log_level=info cleanup=false list_apps=true", timeout=30)
     except (OSError, subprocess.SubprocessError) as error:
         return f"The phone didn't list its apps ({error})."
-    return sorted(parse_app_list(text), key=lambda app: app[0].casefold())
+    listed = parse_app_list(text)
+    shown = drawer(serial)
+    if shown:
+        listed = [(name, package) for name, package in listed if package in shown]
+    return sorted(listed, key=lambda app: app[0].casefold())
+
+
+def parse_versions(text: str) -> dict[str, str]:
+    """{package: versionCode} from `pm list packages --show-versioncode`."""
+    found = {}
+    for line in text.splitlines():
+        match = re.match(r"package:(\S+) versionCode:(\d+)", line.strip())
+        if match:
+            found[match[1]] = match[2]
+    return found
+
+
+def app_versions(serial: str) -> dict[str, str]:
+    """Every app's version, in one look: an icon kept from before is read again once it's changed."""
+    try:
+        return parse_versions(shell(serial, "pm list packages --show-versioncode", timeout=15))
+    except (OSError, subprocess.SubprocessError):
+        return {}
 
 
 # scrcpy's control socket takes these (big-endian): keys, text, touches, and an app to start.
@@ -919,7 +968,7 @@ class AppScreen:
         self.on_ended = on_ended
         self.size = display_size(link.natural)
         self.shown = self.size
-        self.decoder = Decoder("h264", self._frame, self._decoder_broken)
+        self.decoder = _decoder("h264", self._frame, self._decoder_broken)
         self.version = scrcpy_version()
         self.process: subprocess.Popen | None = None
         self.video: socket.socket | None = None

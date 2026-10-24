@@ -7,9 +7,7 @@ are kept in ~/.cache/handset/apps so the next look is quick.
 
 from __future__ import annotations
 
-import hashlib
 import os
-import re
 import threading
 
 import gi
@@ -19,23 +17,12 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from . import apps  # noqa: E402
-from .apps import PhoneApp  # noqa: E402
+from .apps import PhoneApp, cache_dir, cached_icon  # noqa: E402
 from .log import debug  # noqa: E402
 from .service import Phone  # noqa: E402
 
 ICON_SIZE = 192  # pixels, for the dock as much as for this list
 FALLBACK_ICON = "application-x-executable-symbolic"
-
-
-def cache_dir(phone_id: str) -> str:
-    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    return os.path.join(cache, "handset", "apps", hashlib.sha1(phone_id.encode()).hexdigest()[:16])
-
-
-def cached_icon(folder: str, app: str) -> str:
-    """Where an app's icon is kept: its package (or bundle id) is the name, when it's a plain one."""
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", app)
-    return os.path.join(folder, f"{safe}.png")
 
 
 class AppsDialog(Adw.Dialog):

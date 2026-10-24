@@ -12,6 +12,16 @@ HANDSET_DIR = ""  # empty: the checkout this script is in
 
 sys.path.insert(0, HANDSET_DIR or os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
+if "--sync" in sys.argv[1:]:
+    # The phones' apps kept among the desk's apps, in the background: no window, no GTK.
+    from handset.appsync import main as sync  # noqa: E402
+
+    sys.exit(sync())
+if sys.argv[1:2] == ["--sync-icons"] and len(sys.argv) == 4:
+    from handset.appsync import icons_worker  # noqa: E402
+
+    sys.exit(icons_worker(sys.argv[2], sys.argv[3]))
+
 from handset.__main__ import main  # noqa: E402
 
 sys.exit(main(sys.argv))

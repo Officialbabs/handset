@@ -1,6 +1,7 @@
 #!/bin/sh
 # Handset for one user, run from this checkout: the `handset` command, the menu entry and the
-# icon. `./install.sh --uninstall` removes them.
+# icon, and the sync that keeps connected phones' apps among the desk's apps (from sign-in).
+# `./install.sh --uninstall` removes them, and the phone apps with them.
 set -e
 APP_ID=io.github.Officialbabs.Handset
 APP_NAME=Handset
@@ -11,6 +12,13 @@ LAUNCHER="$BIN/handset"
 APPS="$DATA/applications"
 ENTRY="$APPS/$APP_ID.desktop"
 ICONS="$DATA/icons/hicolor/scalable/apps"
+AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP_ID.Sync.desktop"
+
+# The running sync (its lock's holder), stopped: by the lock, never by a pattern.
+stop_sync() {
+    LOCK="${XDG_RUNTIME_DIR:-/tmp/handset-$(id -u)}/handset-sync.lock"
+    if [ -e "$LOCK" ] && command -v fuser >/dev/null; then fuser -k -TERM "$LOCK" >/dev/null 2>&1 || true; fi
+}
 
 # $1 made safe as the replacement in a sed s|…|…| command.
 sed_escape() { printf '%s\n' "$1" | sed -e 's/[\\&|]/\\&/g'; }
@@ -38,7 +46,9 @@ HELPER_DIR="$HOME/.local/lib/handset"
 case "${1:-}" in
     "") ;;
     --uninstall)
-        rm -f "$LAUNCHER" "$ENTRY" "$ICONS/$APP_ID.svg" "$HELPER_DIR/handset-ios"
+        stop_sync
+        if [ -x "$LAUNCHER" ]; then "$LAUNCHER" --forget-apps || true; fi
+        rm -f "$LAUNCHER" "$ENTRY" "$AUTOSTART" "$ICONS/$APP_ID.svg" "$HELPER_DIR/handset-ios"
         rmdir "$HELPER_DIR" 2>/dev/null || true
         refresh_caches
         echo "$APP_NAME removed."
@@ -93,5 +103,24 @@ sed -e "s|@EXEC@|$(sed_escape "$(exec_quote "$LAUNCHER")")|" -e "s|^Icon=.*|Icon
     "$HERE/handset.desktop.in" > "$ENTRY.new"
 mv "$ENTRY.new" "$ENTRY"
 refresh_caches
+
+echo "==> Keeping connected phones' apps among your apps, from sign-in"
+mkdir -p "$(dirname "$AUTOSTART")"
+{
+    echo "[Desktop Entry]"
+    echo "Type=Application"
+    echo "Name=$APP_NAME phone apps"
+    echo "Comment=Your connected phones' apps among your apps"
+    echo "Exec=$(exec_quote "$LAUNCHER") --sync"
+    echo "Icon=$ICONS/$APP_ID.svg"
+    echo "Terminal=false"
+    echo "NoDisplay=true"
+    echo "X-GNOME-Autostart-enabled=true"
+} > "$AUTOSTART.new"
+mv "$AUTOSTART.new" "$AUTOSTART"
+# Now too, with this copy: the one running goes first.
+stop_sync
+sleep 0.5
+setsid -f "$LAUNCHER" --sync </dev/null >/dev/null 2>&1 || true
 
 echo "Done. Open $APP_NAME from your apps, or run 'handset'."

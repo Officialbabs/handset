@@ -25,6 +25,8 @@ NATURAL = (1080, 2400)
 # The apps scrcpy's server lists: (name, package, the system's).
 APPS = [("Settings", "com.android.settings", True), ("Fake Chat", "org.example.chat", False),
         ("A Very Long Application Name Indeed", "org.example.long", False)]
+# Listed by scrcpy's server, but with no place in the app drawer (a system tool).
+HIDDEN = ("Sound Thing", "com.example.hidden", True)
 
 
 def log(entry):
@@ -76,7 +78,7 @@ def scrcpy(command):
     options = dict(word.split("=", 1) for word in command.split()[4:] if "=" in word)
     if options.get("list_apps") == "true":
         print("[server] INFO: List of apps:")
-        for name, package, system in APPS:
+        for name, package, system in APPS + [HIDDEN]:
             mark = "*" if system else "-"
             print(f" {mark} {name}\n   {package}" if len(name) >= 30 else f" {mark} {name:<30} {package}")
         return 0
@@ -162,6 +164,15 @@ def scrcpy(command):
     return 0
 
 
+def versions() -> dict[str, int]:
+    """The apps' versions (FAKEADB_DIR/versions.json, to say one was updated)."""
+    try:
+        with open(os.path.join(HERE, "versions.json")) as file:
+            return json.load(file)
+    except (OSError, ValueError):
+        return {}
+
+
 def others() -> dict[str, tuple[str, float]]:
     try:
         with open(os.path.join(HERE, "others")) as file:
@@ -212,6 +223,12 @@ def main(args):
         command = " ".join(args[1:])
         if command == "getprop ro.serialno":
             print(SERIAL)
+        elif command.startswith("cmd package query-activities --brief --components"):
+            for _name, package, _system in APPS:
+                print(f"{package}/.Main")
+        elif command == "pm list packages --show-versioncode":
+            for _name, package, _system in APPS:
+                print(f"package:{package} versionCode:{versions().get(package, 1)}")
         elif command == "wm size":
             print(f"Physical size: {NATURAL[0]}x{NATURAL[1]}")
         if "Viewport INTERNAL" in command:
