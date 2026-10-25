@@ -13,6 +13,7 @@ APPS="$DATA/applications"
 ENTRY="$APPS/$APP_ID.desktop"
 ICONS="$DATA/icons/hicolor/scalable/apps"
 AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP_ID.Sync.desktop"
+SEARCH="$DATA/gnome-shell/search-providers/$APP_ID.search-provider.ini"
 
 # The running sync (its lock's holder), stopped: by the lock, never by a pattern.
 stop_sync() {
@@ -48,7 +49,7 @@ case "${1:-}" in
     --uninstall)
         stop_sync
         if [ -x "$LAUNCHER" ]; then "$LAUNCHER" --forget-apps || true; fi
-        rm -f "$LAUNCHER" "$ENTRY" "$AUTOSTART" "$ICONS/$APP_ID.svg" "$HELPER_DIR/handset-ios"
+        rm -f "$LAUNCHER" "$ENTRY" "$AUTOSTART" "$SEARCH" "$ICONS/$APP_ID.svg" "$HELPER_DIR/handset-ios"
         rmdir "$HELPER_DIR" 2>/dev/null || true
         refresh_caches
         echo "$APP_NAME removed."
@@ -103,6 +104,19 @@ sed -e "s|@EXEC@|$(sed_escape "$(exec_quote "$LAUNCHER")")|" -e "s|^Icon=.*|Icon
     "$HERE/handset.desktop.in" > "$ENTRY.new"
 mv "$ENTRY.new" "$ENTRY"
 refresh_caches
+
+echo "==> Putting the phones' files in the desktop's search"
+# Answered by the sync (phonesearch.py), while it runs: never started for a search.
+mkdir -p "$(dirname "$SEARCH")"
+{
+    echo "[Shell Search Provider]"
+    echo "DesktopId=$APP_ID.desktop"
+    echo "BusName=$APP_ID.Sync"
+    echo "ObjectPath=/io/github/Officialbabs/Handset/SearchProvider"
+    echo "Version=2"
+    echo "AutoStart=false"
+} > "$SEARCH.new"
+mv "$SEARCH.new" "$SEARCH"
 
 echo "==> Keeping connected phones' apps among your apps, from sign-in"
 mkdir -p "$(dirname "$AUTOSTART")"

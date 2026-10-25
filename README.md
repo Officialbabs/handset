@@ -147,8 +147,9 @@ desk isn't possible, and clearing one here leaves it on the phone.
   iPhone › LocalSend › Handset) and Save to Photo Album (Handset). Handset puts the photos in that
   folder, runs the shortcut (the iPhone must be unlocked), and once Photos has them takes them out
   of the folder and takes the phone back to the app it was in (an app's window: that app; the
-  phone's window: the app used before Shortcuts). Without the shortcut they wait in the folder, and
-  Handset shows how to make it.
+  phone's window: the app Shortcuts came in front of, as the phone says through Apple's developer
+  services, or the home screen). Without the shortcut they wait in the folder, and Handset shows
+  how to make it.
 - **Each phone is a folder** while it's connected, in `~/Phones` (Phones, in your home folder):
   any file manager, and any app's Open and Save dialogs, see its files as they'd see a USB stick's.
   It's a file system of Handset's own (FUSE, spoken straight to the kernel; nothing to install
@@ -157,6 +158,13 @@ desk isn't possible, and clearing one here leaves it on the phone.
   file is fetched whole when it's opened (and kept a day, for a second look), and one written is
   sent when it's closed. **Open in Files** on a phone's page; off with Phone Files in the File
   Manager.
+- **The phones' files in the desktop's search:** type a file's name in the launcher and the
+  connected phones' files and folders named so come up, under Handset, each with its phone and
+  folder; picking one opens it in the app for its kind, from the phone's folder. Searching never
+  waits on a phone: Handset keeps an index of each phone's names, made when its folder comes and
+  again every half hour (an Android phone's storage in one `find`, under a second; an iPhone's
+  walked by the helper). Hidden files and Android's apps' own data are left out. The sync answers
+  (GNOME's search provider interface, which the launcher asks), while it runs.
 - **Phone Files…** (right-click the bezel, or Ctrl+Shift+F) looks through the phone's files: a
   file can be saved in Downloads here, opened with this computer's apps, and files from here sent
   into the folder looked at. **Search** (Ctrl+F, or just type) narrows the folder at once, then
@@ -196,6 +204,23 @@ moment (a message's tone) only lowers the phones' sound meanwhile, and pauses no
 - **An iPhone** tells it over Bluetooth, as it does a car (Apple Media Service), with no cover:
   the cover is looked up in Apple's music catalog by artist and album (its public search, no
   account), and kept in `~/.cache/handset/covers`.
+
+## With KDE Connect
+
+Handset and KDE Connect do different jobs, and run side by side. Handset is for using a phone
+from the computer: its screen, its apps, its sound and its files, over the links the phone
+already has (adb, Apple's developer services, Bluetooth), with nothing installed on it. KDE
+Connect is for the phone and the computer working together, with its app on the phone: the phone
+as the computer's touchpad, presentation remote or media and volume controls, commands run from
+the phone, texts and contacts on the computer, and ringing a lost phone.
+
+A few things both do, so with both on they come twice. Keep one of each:
+
+- **Notifications:** Handset's Notifications switch (in Phones and Settings), or Notification
+  sync in KDE Connect's app on the phone.
+- **The clipboard:** either one shares it; KDE Connect's is its Clipboard plugin.
+- **What the phone plays** shows twice in the desktop's media controls; KDE Connect's comes from
+  its multimedia plugin.
 
 ## How it works
 

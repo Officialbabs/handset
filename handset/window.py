@@ -949,9 +949,10 @@ class Window(Adw.ApplicationWindow):
 
         def send():
             sent, where, trouble = files.deliver(paths)
+            if getattr(files, "opened_shortcuts", False) and \
+                    not files.go_back(self.phone_app.app if self.phone_app else None):
+                GLib.idle_add(self._back_to_app, files.was)
             files.stop()
-            if getattr(files, "opened_shortcuts", False):
-                GLib.idle_add(self._back_to_app)
             if "set up" in where:
                 GLib.idle_add(self._photos_setup)
                 where = where.replace("set up", f"Files › On My iPhone, waiting for Photos")
@@ -966,16 +967,14 @@ class Window(Adw.ApplicationWindow):
         threading.Thread(target=send, daemon=True).start()
         return True
 
-    def _back_to_app(self):
-        """After a drop put Shortcuts in front: the phone back in the app it was in (this window's
-        own app, or the one used before Shortcuts)."""
+    def _back_to_app(self, was):
+        """After a drop put Shortcuts in front, and the phone couldn't open the app it was in
+        again (FilesSession.go_back): the home screen if that was in front, else the app used
+        before Shortcuts, by the swipe along the bottom."""
         device = self.device
         if device is None or not getattr(device, "live_touch", False):
             return GLib.SOURCE_REMOVE
-        if self.phone_app:
-            device.launch(self.phone_app.app)
-        else:
-            device.key("previous_app")
+        device.key("home" if was is None else "previous_app")
         return GLib.SOURCE_REMOVE
 
     def _photos_setup(self):

@@ -159,6 +159,8 @@ SWIPES = {
 }
 
 
+UNSAID = "?"  # FilesSession.was when the phone didn't say which app it was in
+
 @dataclass
 class Link:
     """What Handset needs to start the helper for an iPhone."""
@@ -649,6 +651,9 @@ class FilesSession:
     def __init__(self, link: Link):
         self.link = link
         self.opened_shortcuts = False  # Shortcuts came in front for a drop: the phone goes back after
+        # The app Shortcuts came in front of, as the phone said: its bundle id; None, the home
+        # screen; UNSAID when it didn't say.
+        self.was: str | None = UNSAID
         self.process: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self._sharing: dict[str, str] | None = None
@@ -744,10 +749,11 @@ class FilesSession:
         before = self.photo_count()
         names = self._ask({"op": "names", "path": folder})
         there = [n for n in names.get("names", []) if not n.startswith(".")] if isinstance(names, dict) else []
-        opened = self._ask({"op": "open-url", "bundle": "com.apple.shortcuts", "url": self.PHOTOS_URL})
+        opened = self._ask({"op": "open-url", "bundle": "com.apple.shortcuts", "url": self.PHOTOS_URL, "front": True})
         if isinstance(opened, str):
             return f"{waiting} (unlock the iPhone to put them in Photos)"
         self.opened_shortcuts = True
+        self.was = opened.get("was", UNSAID)
         deadline = time.monotonic() + self.PHOTOS_WAIT_S
         while time.monotonic() < deadline:
             time.sleep(1.5)
@@ -756,6 +762,15 @@ class FilesSession:
                     self._ask({"op": "remove", "path": f"{folder}/{name}"})
                 return True
         return "set up"
+
+    def go_back(self, app: str | None = None) -> bool:
+        """The iPhone back in the app it was in before Shortcuts came in front (or `app`): whether
+        it went. Not for the home screen (no app to open), nor when the phone didn't say."""
+        bundle = app or self.was
+        if not bundle or bundle == UNSAID:
+            return False
+        answer = self._ask({"op": "launch", "bundle": bundle})
+        return isinstance(answer, dict) and answer.get("event") == "launched"
 
     def photo_count(self) -> int | None:
         """How many files Photos keeps in its newest folders (DCIM/1xxAPPLE: a new one each
@@ -879,3 +894,6 @@ class FilesSession:
                 process.wait(timeout=3)
             except (OSError, subprocess.TimeoutExpired):
                 process.kill()
+        if process:
+            for pipe in (process.stdout, process.stderr):
+                pipe.close()

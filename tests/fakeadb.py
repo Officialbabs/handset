@@ -496,6 +496,16 @@ def main(args):
                 print(f"package:{package} versionCode:{versions().get(package, 1)}")
         elif command == "wm size":
             print(f"Physical size: {NATURAL[0]}x{NATURAL[1]}")
+        elif command.startswith("cd /sdcard && find ."):
+            # The phone's whole storage, as phonesearch.ANDROID_FIND lists it.
+            top = storage("/sdcard")
+            print(f"d\t0\t{os.path.getmtime(top)}\t.")
+            for folder, names, files in os.walk(top):
+                names[:] = [n for n in names if not n.startswith(".") and (folder != top or n != "Android")]
+                for name in names + [f for f in files if not f.startswith(".")]:
+                    full = os.path.join(folder, name)
+                    kind, size = ("d", 0) if os.path.isdir(full) else ("f", os.path.getsize(full))
+                    print(f"{kind}\t{size}\t{os.path.getmtime(full)}\t./{os.path.relpath(full, top)}")
         if "Viewport INTERNAL" in command:
             r = rotation()
             print(f"  Viewport INTERNAL: displayId=0, uniqueId=local:1, port=1, orientation={r // 90}, "

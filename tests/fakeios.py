@@ -102,7 +102,19 @@ def files():
                         waiting = os.path.join(shared, app, "Handset")
                         for name in os.listdir(waiting) if os.path.isdir(waiting) else []:
                             shutil.copyfile(os.path.join(waiting, name), os.path.join(dcim, "IMG_" + name))
-                print(json.dumps({"event": "opened", "url": command.get("url")}), flush=True)
+                opened = {"event": "opened", "url": command.get("url")}
+                # The app it came in front of, when the test says (FAKEIOS_DIR/front: a bundle id,
+                # or "home" for the home screen).
+                if command.get("front") and os.path.exists(os.path.join(HERE, "front")):
+                    with open(os.path.join(HERE, "front")) as file:
+                        front = file.read().strip()
+                    opened["was"] = None if front == "home" else front
+                print(json.dumps(opened), flush=True)
+                continue
+            if op == "launch":
+                with open(os.path.join(HERE, "launched"), "a") as file:
+                    file.write(command["bundle"] + "\n")
+                print(json.dumps({"event": "launched", "bundle": command["bundle"]}), flush=True)
                 continue
             if op == "names":
                 print(json.dumps({"event": "names", "path": path, "names": os.listdir(here)}), flush=True)
@@ -139,10 +151,10 @@ def files():
                     for name in names + files_in:
                         if wanted in name.lower():
                             full = os.path.join(folder, name)
-                            entries.append({"name": name, "path": "/" + os.path.relpath(full, root),
+                            entries.append({"name": name, "path": path.rstrip("/") + "/" + os.path.relpath(full, here),
                                             "folder": os.path.isdir(full), "size": os.path.getsize(full),
                                             "modified": int(os.path.getmtime(full))})
-                answer = {"event": "found", "path": path, "entries": entries}
+                answer = {"event": "found", "path": path, "entries": entries[:command.get("most", 300)]}
             else:
                 continue
         except OSError as error:

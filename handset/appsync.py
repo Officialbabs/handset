@@ -137,6 +137,7 @@ class AppSync:
         self.ancs = None
         self.away_timer = 0  # the iPhones went: their notifications stop when it's done
         self.mounts: dict[str, object] = {}  # a phone's id → its folder here (phonefs.FileSystem)
+        self.search = None  # the phones' files in the desktop's search (phonesearch.PhoneSearch)
         self.mounting: set[str] = set()
         self.phones_now: list[Phone] = []
         self.phone_names: dict[str, str] = {}
@@ -159,6 +160,8 @@ class AppSync:
         for mounted in self.mounts.values():
             mounted.stop()
         self.mounts = {}
+        if self.search:
+            self.search.stop()
 
     def start(self):
         self.watch.start()
@@ -422,7 +425,18 @@ class AppSync:
             threading.Thread(target=mounted.stop, daemon=True).start()
         else:
             self.mounts[phone_id] = mounted
+            if self.search:
+                self.search.phone_here(phone_id)
         return GLib.SOURCE_REMOVE
+
+    def searchable(self) -> dict:
+        """The phones whose folders are here, for the desktop's search: each one's id → its
+        name, its folder, and how to list all its files."""
+        from .phonesearch import lister
+
+        return {phone_id: (self.online[phone_id].name if phone_id in self.online else "Phone", mounted.mountpoint,
+                           lister(mounted.phone))
+                for phone_id, mounted in self.mounts.items()}
 
     def _phone_entries(self, phones: list[Phone]):
         """Each phone an entry of its own, opening its window (so the dock shows each under its own
@@ -642,6 +656,10 @@ def main() -> int:
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, number, loop.quit)
     sync = AppSync()
     sync.start()
+    from .phonesearch import PhoneSearch
+
+    sync.search = PhoneSearch(sync.searchable)
+    sync.search.start()
     loop.run()
     sync.stop()
     held.close()

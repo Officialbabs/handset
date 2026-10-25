@@ -28,9 +28,12 @@
 //! {"op":"remove","path"} → {"event":"removed","path"}; {"op":"mkdir","path"} → {"event":"made","path"};
 //! {"op":"names","path"} → {"event":"names","path","names"} (a folder's names only: quick);
 //! {"op":"open-url","bundle","url"} → {"event":"opened"} (the app opened with the URL, as a link
-//! is: a shortcut run by Shortcuts' URL, say);
+//! is: a shortcut run by Shortcuts' URL, say); with "front": true, also "was", the app it came in
+//! front of (its bundle id; null for the home screen), when the phone said;
+//! {"op":"launch","bundle"} → {"event":"launched","bundle"} (in front, as it was if it was open);
 //! {"op":"find","path","text"} → {"event":"found","path","entries":[{"name","path","folder","size","modified"}]}
-//! (named like the text, in any case, in the folder and the folders in it);
+//! (named like the text, in any case, in the folder and the folders in it; "most" of them, 300
+//! unless asked);
 //! or {"event":"error","op","path","message"}.
 //!
 //!     handset-ios stream --udid UDID [--pairing FILE] [--address IP] [--port PORT] [--verbose]
@@ -47,6 +50,8 @@ use std::time::{Duration, Instant};
 use idevice::afc::AfcClient;
 use idevice::afc::opcode::AfcFopenMode;
 use idevice::core_device_proxy::CoreDeviceProxy;
+use idevice::dvt::notifications::NotificationsClient;
+use idevice::dvt::remote_server::RemoteServerClient;
 use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection};
 use idevice::{IdeviceService, RsdService};
 use idevice::core_device::{
@@ -624,7 +629,21 @@ async fn files(options: Options) -> Fallible<()> {
         let field = |name: &str| command.get(name).and_then(Value::as_str).unwrap_or("").to_string();
         let (op, path) = (field("op"), field("path"));
         let answer = match op.as_str() {
-            "open-url" => open_url(&mut adapter, &handshake, &field("bundle"), &field("url")).await,
+            "open-url" => {
+                let front = command.get("front").and_then(Value::as_bool).unwrap_or(false);
+                open_url(&mut adapter, &mut handshake, &field("bundle"), &field("url"), front).await
+            }
+            "launch" => {
+                let bundle = field("bundle");
+                match AppServiceClient::connect_rsd(&mut adapter, &mut handshake).await {
+                    Ok(mut apps) => apps
+                        .launch_application(bundle.clone(), &[], false, false, None, None, None)
+                        .await
+                        .map(|_| json!({"event": "launched", "bundle": bundle}))
+                        .map_err(Into::into),
+                    Err(why) => Err(why.into()),
+                }
+            }
             "rename" => {
                 // Within one place (the media folders, or one app's files): the phone renames there.
                 let to = field("to");
@@ -649,7 +668,10 @@ async fn files(options: Options) -> Fallible<()> {
                         "remove" => files.remove(&inside).await.map(|_| json!({"event": "removed"})).map_err(Into::into),
                         "mkdir" => files.mk_dir(&inside).await.map(|_| json!({"event": "made"})).map_err(Into::into),
                         "names" => files.list_dir(&inside).await.map(|names| json!({"event": "names", "names": names})).map_err(Into::into),
-                        _ => find_files(files, &inside, &field("text")).await.map(|found| outside(found, &inside, &path)),
+                        _ => {
+                            let most = command.get("most").and_then(Value::as_u64).map_or(MOST_FOUND, |n| n as usize);
+                            find_files(files, &inside, &field("text"), most).await.map(|found| outside(found, &inside, &path))
+                        }
                     }
                     .map(|mut answer| {
                         answer["path"] = json!(path);
@@ -668,7 +690,8 @@ async fn files(options: Options) -> Fallible<()> {
     Ok(())
 }
 
-/// A search gives at most this many of what it finds, and looks through at most this many folders.
+/// A search gives at most this many of what it finds (unless asked for more: everything, for
+/// Handset's index of the phone's files), and looks through at most this many folders.
 const MOST_FOUND: usize = 300;
 const MOST_FOLDERS: usize = 2000;
 /// The media folders iOS keeps for itself (Photos' own database and thumbnails, iTunes' copies
@@ -686,13 +709,13 @@ fn looks_like_a_file(name: &str) -> bool {
 
 /// What's named like `text` (any case) in `path` and the folders in it, nearest first; hidden
 /// ones left out.
-async fn find_files(afc: &mut AfcClient, path: &str, text: &str) -> Fallible<Value> {
+async fn find_files(afc: &mut AfcClient, path: &str, text: &str, most: usize) -> Fallible<Value> {
     let wanted = text.to_lowercase();
     let mut folders = std::collections::VecDeque::from([path.trim_end_matches('/').to_string()]);
     let (mut found, mut looked) = (Vec::new(), 0);
     while let Some(folder) = folders.pop_front() {
         looked += 1;
-        if looked > MOST_FOLDERS || found.len() >= MOST_FOUND {
+        if looked > MOST_FOLDERS || found.len() >= most {
             break;
         }
         let Ok(names) = afc.list_dir(if folder.is_empty() { "/" } else { folder.as_str() }).await else {
@@ -709,7 +732,7 @@ async fn find_files(afc: &mut AfcClient, path: &str, text: &str) -> Fallible<Val
             let full = format!("{folder}/{name}");
             let Ok(info) = afc.get_file_info(&full).await else { continue };
             let is_folder = info.st_ifmt == "S_IFDIR";
-            if matches && found.len() < MOST_FOUND {
+            if matches && found.len() < most {
                 found.push(json!({
                     "name": name,
                     "path": full,
@@ -728,12 +751,31 @@ async fn find_files(afc: &mut AfcClient, path: &str, text: &str) -> Fallible<Val
 
 /// An app on the phone opened with a URL (CoreDevice's launch, as Xcode's `devicectl device
 /// process launch --payload-url`): Shortcuts running a shortcut, say. The phone must be unlocked.
+/// With `front`, the app it came in front of too ("was"), so Handset can take the phone back there:
+/// the phone's own word on its apps going in front and behind (Instruments' app state
+/// notifications), heard from just before it opens.
 async fn open_url(
     adapter: &mut idevice::tcp::handle::AdapterHandle,
-    handshake: &RsdHandshake,
+    handshake: &mut RsdHandshake,
     bundle: &str,
     url: &str,
+    front: bool,
 ) -> Fallible<Value> {
+    let mut instruments = match front {
+        true => tokio::time::timeout(WATCH_FOR, RemoteServerClient::connect_rsd(&mut *adapter, &mut *handshake)).await.ok().and_then(Result::ok),
+        false => None,
+    };
+    let mut states = match instruments.as_mut() {
+        Some(instruments) => tokio::time::timeout(WATCH_FOR, async {
+            let mut states = NotificationsClient::new(instruments).await.ok()?;
+            states.start_notifications().await.ok()?;
+            Some(states)
+        })
+        .await
+        .ok()
+        .flatten(),
+        None => None,
+    };
     let port = handshake.services.get("com.apple.coredevice.appservice").ok_or("the phone has no app service")?.port;
     let mut apps = CoreDeviceServiceClient::new(adapter.connect(port).await?).await?;
     let mut nothing = Vec::new();
@@ -757,8 +799,102 @@ async fn open_url(
         ("standardIOIdentifiers", dictionary(Vec::new())),
     ]);
     let plist::Value::Dictionary(launch) = launch else { unreachable!() };
-    apps.invoke_with_plist("com.apple.coredevice.feature.launchapplication", launch).await?;
-    Ok(json!({"event": "opened", "url": url}))
+    let launched = apps.invoke_with_plist("com.apple.coredevice.feature.launchapplication", launch).await?;
+    let mut answer = json!({"event": "opened", "url": url});
+    let Some(states) = states.as_mut() else {
+        return Ok(answer);
+    };
+    let opened = launched
+        .as_dictionary()
+        .and_then(|reply| reply.get("processToken"))
+        .and_then(plist::Value::as_dictionary)
+        .and_then(|token| token.get("processIdentifier"))
+        .and_then(plist::Value::as_unsigned_integer)
+        .map(|pid| pid as u32);
+    match went_behind(states, opened).await {
+        Some(Some((pid, exec))) => {
+            answer["was"] = json!(bundle_of(adapter, handshake, pid, &exec).await);
+        }
+        Some(None) => answer["was"] = Value::Null, // the home screen was in front
+        None => {}                                 // the phone didn't say
+    }
+    let _ = states.stop_notifications().await;
+    Ok(answer)
+}
+
+/// How long the phone's word on its apps is waited for, once an app is opened.
+const WATCH_FOR: Duration = Duration::from_secs(3);
+
+/// The app that went behind the one just opened (`opened`, its pid when known): its pid and
+/// what the phone called it. An app heard of first going behind was in front before; one heard of first
+/// coming in front opened after (Files, for a shortcut's folder, say), and isn't it. Some(None):
+/// the phone spoke of apps, but none went behind (the home screen was in front); None: it said
+/// nothing.
+async fn went_behind<R: idevice::ReadWrite>(
+    states: &mut NotificationsClient<'_, R>,
+    opened: Option<u32>,
+) -> Option<Option<(u32, String)>> {
+    let mut deadline = Instant::now() + WATCH_FOR;
+    let mut heard: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut opened_in_front = false;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(Ok(said)) = tokio::time::timeout(left, states.get_notification()).await else {
+            break;
+        };
+        if !said.notification_type.starts_with("applicationStateNotification") || said.pid == 0 {
+            continue;
+        }
+        let in_front = said.state_description.starts_with("Foreground");
+        if Some(said.pid) == opened {
+            if in_front && !opened_in_front {
+                // In front: what it covered says so within a moment, if anything does.
+                opened_in_front = true;
+                deadline = deadline.min(Instant::now() + Duration::from_millis(1500));
+            }
+            continue;
+        }
+        if heard.insert(said.pid) && !in_front {
+            return Some(Some((said.pid, said.exec_name)));
+        }
+    }
+    (opened_in_front || !heard.is_empty()).then_some(None)
+}
+
+/// An app's bundle id from a running process: its executable's place among the apps' (CoreDevice's
+/// process and app lists); else by what the phone called it (its app's place, on iOS 27; its
+/// executable's name, "MobileSMS" of MobileSMS.app, before).
+async fn bundle_of(
+    adapter: &mut idevice::tcp::handle::AdapterHandle,
+    handshake: &mut RsdHandshake,
+    pid: u32,
+    exec: &str,
+) -> Option<String> {
+    let mut apps = AppServiceClient::connect_rsd(&mut *adapter, &mut *handshake).await.ok()?;
+    let plain = |path: &str| path.trim_start_matches("file://").trim_start_matches("/private").trim_end_matches('/').to_string();
+    let folder = match tokio::time::timeout(WATCH_FOR, apps.list_processes()).await {
+        Ok(Ok(processes)) => processes
+            .into_iter()
+            .find(|process| process.pid == pid)
+            .and_then(|process| process.executable_url)
+            .and_then(|url| plain(&url.relative).rsplit_once('/').map(|(folder, _)| folder.to_string())),
+        _ => None,
+    };
+    let listed = tokio::time::timeout(APPS_FOR, async {
+        let mut found = Vec::new();
+        let mut stream = Box::pin(apps.stream_apps(false, true, false, false, true));
+        while let Some(Ok(app)) = stream.next().await {
+            found.push(app);
+        }
+        found
+    })
+    .await
+    .ok()?;
+    let by_folder = folder.and_then(|folder| listed.iter().find(|app| plain(&app.path) == folder));
+    let by_name = || {
+        listed.iter().find(|app| plain(&app.path) == plain(exec) || app.path.trim_end_matches('/').ends_with(&format!("/{exec}.app")))
+    };
+    by_folder.or_else(by_name).map(|app| app.bundle_identifier.clone())
 }
 
 /// An app's Documents, as Handset names them: "/On My iPhone/<bundle id>/…". Files there show in
@@ -808,7 +944,11 @@ fn outside(mut found: Value, inside: &str, asked: &str) -> Value {
     if let Some(entries) = found.get_mut("entries").and_then(Value::as_array_mut) {
         for entry in entries {
             if let Some(path) = entry.get("path").and_then(Value::as_str) {
-                let rest = path.strip_prefix(inside).unwrap_or(path);
+                // From the top ("/"), a path is as it was.
+                let rest = match inside.trim_end_matches('/') {
+                    "" => path,
+                    _ => path.strip_prefix(inside).unwrap_or(path),
+                };
                 entry["path"] = json!(format!("{}{}", asked.trim_end_matches('/'), rest));
             }
         }

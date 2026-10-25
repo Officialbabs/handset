@@ -10,7 +10,8 @@ from gi.repository import GLib
 
 from handset import iphone
 from handset.gestures import Gesture
-from handset.iphone import SPAN, ClipboardLink, FilesSession, IPhone, Link, list_apps, normalized, plainly, screen_crop
+from handset.iphone import (SPAN, UNSAID, ClipboardLink, FilesSession, IPhone, Link, list_apps, normalized, plainly,
+                            screen_crop)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_HELPER = os.path.join(HERE, "fakeios.py")
@@ -275,6 +276,23 @@ class FakeHelper(unittest.TestCase):
                 self.assertEqual(where, "Photos › Albums › Handset")
                 self.assertEqual(os.listdir(waiting), [])  # in Photos: the copies gone
                 self.assertIn("IMG_beach.jpg", os.listdir(os.path.join(self.tmp.name, "media", "DCIM", "100APPLE")))
+                # The phone didn't say what it was in: the window swipes back instead.
+                self.assertEqual(session.was, UNSAID)
+                self.assertFalse(session.go_back())
+                # It said: back in that app, opened again; the home screen: nothing to open.
+                with open(os.path.join(self.tmp.name, "front"), "w") as file:
+                    file.write("org.example.chat")
+                session.deliver([photo])
+                self.assertEqual(session.was, "org.example.chat")
+                self.assertTrue(session.go_back())
+                with open(os.path.join(self.tmp.name, "front"), "w") as file:
+                    file.write("home")
+                session.deliver([photo])
+                self.assertIsNone(session.was)
+                self.assertFalse(session.go_back())
+                self.assertTrue(session.go_back("com.apple.Maps"))  # an app's own window: that app
+                with open(os.path.join(self.tmp.name, "launched")) as file:
+                    self.assertEqual(file.read().split(), ["org.example.chat", "com.apple.Maps"])
             finally:
                 session.stop()
             # Asked once a day: the next session knows without asking.
