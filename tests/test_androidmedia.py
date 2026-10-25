@@ -2,6 +2,7 @@
 Bluetooth devices are given, which session the desk shows, and the stand-in adb (fakeadb.py)
 playing a phone whose sessions change."""
 
+import base64
 import json
 import os
 import tempfile
@@ -11,7 +12,8 @@ import unittest
 from gi.repository import GLib
 
 from handset import androidmedia
-from handset.androidmedia import MediaFollower, choose, now_playing, parse_sessions, parse_song, split_description
+from handset.androidmedia import (MediaFollower, choose, helped, now_playing, parse_sessions, parse_song,
+                                  split_description)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MUSIC = "org.example.music"
@@ -93,6 +95,20 @@ class ParseTest(unittest.TestCase):
         self.assertFalse(paused.can_next)
 
 
+class HelperWordsTest(unittest.TestCase):
+    def test_what_the_helper_says(self):
+        event = {"event": "media", "package": MUSIC, "title": "A Song, Two", "artist": "A Singer",
+                 "album": "An Album", "duration": 195000, "state": 3, "position_now": 30000, "speed": 1.0,
+                 "actions": 0x337, "cover_id": "abc"}
+        now = helped(event, time.monotonic(), "/covers/abc.jpg")
+        self.assertEqual((now.title, now.artist, now.duration, now.art), ("A Song, Two", "A Singer", 195.0,
+                                                                         "/covers/abc.jpg"))
+        self.assertTrue(now.playing and now.can_seek and now.can_next)
+        self.assertAlmostEqual(now.now(), 30.0, delta=0.2)
+        self.assertFalse(helped(dict(event, actions=0x37), time.monotonic()).can_seek)  # no SEEK_TO
+        self.assertIsNone(helped({"event": "none"}, time.monotonic()))
+
+
 class FollowTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -130,6 +146,32 @@ class FollowTest(unittest.TestCase):
                 return [json.loads(line) for line in file]
         except OSError:
             return []
+
+    def test_through_the_helper_its_covers_and_seeking(self):
+        saved = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_CACHE_HOME"] = self.tmp.name
+        try:
+            cover = base64.b64encode(b"\xff\xd8a jpeg").decode()
+            self.write("media_helper.jsonl", json.dumps({
+                "event": "media", "package": MUSIC, "title": "A Song", "artist": "A Singer", "album": "An Album",
+                "duration": 195000, "state": 3, "position_now": 1000, "speed": 1.0, "actions": 0x337,
+                "cover_id": "c1", "cover": cover}) + "\n")
+            self.follower.start()
+            self.assertTrue(self.wait(lambda: self.shown and self.shown[-1] is not None))
+            now = self.shown[-1]
+            self.assertTrue(now.can_seek)
+            with open(now.art, "rb") as file:
+                self.assertEqual(file.read(), b"\xff\xd8a jpeg")
+            self.follower.control("seek", 42.5)
+            commands = os.path.join(self.tmp.name, "helper_commands.jsonl")
+            self.assertTrue(self.wait(lambda: os.path.exists(commands) and "42500" in open(commands).read()))
+            with open(commands) as file:
+                self.assertEqual(json.loads(file.read().splitlines()[-1]), {"op": "seek", "position": 42500})
+        finally:
+            if saved is None:
+                os.environ.pop("XDG_CACHE_HOME", None)
+            else:
+                os.environ["XDG_CACHE_HOME"] = saved
 
     def test_follows_and_works_the_phone(self):
         self.write("avrcp", AVRCP)

@@ -25,7 +25,10 @@
 //! {"op":"list","path"} → {"event":"list","path","entries":[{"name","folder","size","modified"}]};
 //! {"op":"fetch","path","to"} → {"event":"fetched","path"} (to: a file here);
 //! {"op":"send","from","path"} → {"event":"sent","path"} (from: a file here);
-//! {"op":"remove","path"} → {"event":"removed","path"};
+//! {"op":"remove","path"} → {"event":"removed","path"}; {"op":"mkdir","path"} → {"event":"made","path"};
+//! {"op":"names","path"} → {"event":"names","path","names"} (a folder's names only: quick);
+//! {"op":"open-url","bundle","url"} → {"event":"opened"} (the app opened with the URL, as a link
+//! is: a shortcut run by Shortcuts' URL, say);
 //! {"op":"find","path","text"} → {"event":"found","path","entries":[{"name","path","folder","size","modified"}]}
 //! (named like the text, in any case, in the folder and the folders in it);
 //! or {"event":"error","op","path","message"}.
@@ -46,7 +49,8 @@ use idevice::core_device_proxy::CoreDeviceProxy;
 use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection};
 use idevice::{IdeviceService, RsdService};
 use idevice::core_device::{
-    AppIconTarget, AppServiceClient, CallInfoBlob, DataInclusionPolicy, Domain, FileServiceClient, GENERAL_PASTEBOARD,
+    AppIconTarget, AppServiceClient, CallInfoBlob, CoreDeviceServiceClient, DataInclusionPolicy, Domain,
+    FileServiceClient, GENERAL_PASTEBOARD,
     IconServiceClient,
     PasteboardServiceClient, PasteboardSnapshot, DisplayServiceClient, HevcDepacketizer, RtpPacket, build_screen_audio_offer,
     build_start_audio_parameters, build_start_video_parameters,
@@ -540,7 +544,8 @@ async fn files(options: Options) -> Fallible<()> {
         let field = |name: &str| command.get(name).and_then(Value::as_str).unwrap_or("").to_string();
         let (op, path) = (field("op"), field("path"));
         let answer = match op.as_str() {
-            "list" | "fetch" | "send" | "remove" | "find" => {
+            "open-url" => open_url(&mut adapter, &handshake, &field("bundle"), &field("url")).await,
+            "list" | "fetch" | "send" | "remove" | "find" | "mkdir" | "names" => {
                 match place(&mut afc, &mut apps, &mut adapter, &mut handshake, &path).await {
                     Err(why) => Err(why),
                     Ok((files, inside)) => match op.as_str() {
@@ -548,6 +553,8 @@ async fn files(options: Options) -> Fallible<()> {
                         "fetch" => fetch_file(files, &inside, &field("to")).await,
                         "send" => send_file(files, &field("from"), &inside).await,
                         "remove" => files.remove(&inside).await.map(|_| json!({"event": "removed"})).map_err(Into::into),
+                        "mkdir" => files.mk_dir(&inside).await.map(|_| json!({"event": "made"})).map_err(Into::into),
+                        "names" => files.list_dir(&inside).await.map(|names| json!({"event": "names", "names": names})).map_err(Into::into),
                         _ => find_files(files, &inside, &field("text")).await.map(|found| outside(found, &inside, &path)),
                     }
                     .map(|mut answer| {
@@ -622,6 +629,41 @@ async fn find_files(afc: &mut AfcClient, path: &str, text: &str) -> Fallible<Val
         }
     }
     Ok(json!({"event": "found", "path": path, "entries": found}))
+}
+
+/// An app on the phone opened with a URL (CoreDevice's launch, as Xcode's `devicectl device
+/// process launch --payload-url`): Shortcuts running a shortcut, say. The phone must be unlocked.
+async fn open_url(
+    adapter: &mut idevice::tcp::handle::AdapterHandle,
+    handshake: &RsdHandshake,
+    bundle: &str,
+    url: &str,
+) -> Fallible<Value> {
+    let port = handshake.services.get("com.apple.coredevice.appservice").ok_or("the phone has no app service")?.port;
+    let mut apps = CoreDeviceServiceClient::new(adapter.connect(port).await?).await?;
+    let mut nothing = Vec::new();
+    plist::to_writer_xml(&mut nothing, &plist::Value::Dictionary(plist::Dictionary::new())).map_err(|e| e.to_string())?;
+    let dictionary = |pairs: Vec<(&str, plist::Value)>| {
+        plist::Value::Dictionary(pairs.into_iter().map(|(key, value)| (key.to_string(), value)).collect())
+    };
+    let launch = dictionary(vec![
+        ("applicationSpecifier", dictionary(vec![("bundleIdentifier", dictionary(vec![("_0", bundle.into())]))])),
+        ("options", dictionary(vec![
+            ("arguments", plist::Value::Array(Vec::new())),
+            ("environmentVariables", dictionary(Vec::new())),
+            ("standardIOUsesPseudoterminals", true.into()),
+            ("startStopped", false.into()),
+            ("terminateExisting", false.into()),
+            ("user", dictionary(vec![("active", true.into())])),
+            ("platformSpecificOptions", plist::Value::Data(nothing)),
+            ("payloadURL", dictionary(vec![("relative", url.into())])),
+            ("activates", true.into()),
+        ])),
+        ("standardIOIdentifiers", dictionary(Vec::new())),
+    ]);
+    let plist::Value::Dictionary(launch) = launch else { unreachable!() };
+    apps.invoke_with_plist("com.apple.coredevice.feature.launchapplication", launch).await?;
+    Ok(json!({"event": "opened", "url": url}))
 }
 
 /// An app's Documents, as Handset names them: "/On My iPhone/<bundle id>/…". Files there show in

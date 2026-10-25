@@ -550,6 +550,15 @@ class FilesSession:
     # (they show in its library), the rest into a file-transfer app's, a browser's at least.
     FOR_MEDIA = ("org.videolan.vlc-ios",)
     FOR_FILES = ("org.localsend.localsendApp", "com.google.chrome.ios")
+    # Photos and videos go into Photos, into its album Handset: put in a folder of their own (in a
+    # file-sharing app's files), then saved there by a shortcut on the iPhone, "Handset Import"
+    # (its two steps: Get Contents of Folder, that folder; Save to Photo Album, Handset), run by its
+    # URL; Photos comes forward after. Once Photos has them, the copies go.
+    PHOTOS_FOLDER = "Handset"
+    PHOTOS_SHORTCUT = "Handset Import"
+    PHOTOS_URL = ("shortcuts://x-callback-url/run-shortcut?name=Handset%20Import"
+                  "&x-success=photos-redirect%3A%2F%2F")
+    PHOTOS_WAIT_S = 60
 
     def __init__(self, link: Link):
         self.link = link
@@ -602,6 +611,77 @@ class FilesSession:
         if bundle is None:
             return self.downloads, "media Downloads (no app on it shares its files, so nothing on it shows them)"
         return f"{self.apps_root}/{bundle}", f"Files › On My iPhone › {sharing[bundle]}"
+
+    def deliver(self, paths: list[str]) -> tuple[list[str], str, str | None]:
+        """Files dropped on the iPhone, where it shows them: photos and videos in Photos (its
+        album Handset), the rest in an app's files. What went, where (in words), and why some
+        didn't; where is "set up" when the shortcut that puts them in Photos isn't there."""
+        media = [p for p in paths if (Gio.content_type_guess(p, None)[0] or "").startswith(("image/", "video/"))]
+        others = [p for p in paths if p not in media]
+        sent, places, trouble = [], [], None
+        if media:
+            folder = self.photos_folder()
+            if folder is None:
+                others = paths
+            else:
+                went, trouble = self.send_files(media, folder)
+                sent += went
+                if went:
+                    imported = self.to_photos(folder, len(went))
+                    places.append("Photos › Albums › Handset" if imported is True else imported)
+        if others:
+            folder, where = self.drop_folder(others)
+            went, why = self.send_files(others, folder)
+            sent += went
+            trouble = trouble or why
+            if went:
+                places.append(where)
+        return sent, " and ".join(places), trouble
+
+    def photos_folder(self) -> str | None:
+        """The folder photos wait in for the shortcut (made if need be), or None: no app on the
+        iPhone shares its files."""
+        sharing = self.sharing()
+        bundle = next((b for b in self.FOR_FILES + self.FOR_MEDIA if b in sharing), next(iter(sharing), None))
+        if bundle is None:
+            return None
+        folder = f"{self.apps_root}/{bundle}/{self.PHOTOS_FOLDER}"
+        self._ask({"op": "mkdir", "path": folder})  # there already: fine
+        return folder
+
+    def to_photos(self, folder: str, count: int) -> bool | str:
+        """The folder's photos into Photos, by the shortcut: True once Photos has them (and
+        they're gone from the folder); otherwise where they are, and what to do, in words."""
+        app = self.display(folder)[1] if len(self.display(folder)) > 1 else "an app"
+        waiting = f"Files › On My iPhone › {app} › {self.PHOTOS_FOLDER}"
+        before = self.photo_count()
+        names = self._ask({"op": "names", "path": folder})
+        there = [n for n in names.get("names", []) if not n.startswith(".")] if isinstance(names, dict) else []
+        opened = self._ask({"op": "open-url", "bundle": "com.apple.shortcuts", "url": self.PHOTOS_URL})
+        if isinstance(opened, str):
+            return f"{waiting} (unlock the iPhone to put them in Photos)"
+        deadline = time.monotonic() + self.PHOTOS_WAIT_S
+        while time.monotonic() < deadline:
+            time.sleep(1.5)
+            if before is not None and (self.photo_count() or 0) >= before + count:
+                for name in there:
+                    self._ask({"op": "remove", "path": f"{folder}/{name}"})
+                return True
+        return "set up"
+
+    def photo_count(self) -> int | None:
+        """How many files Photos keeps in its newest folders (DCIM/1xxAPPLE: a new one each
+        thousand or so), to see new ones come; None if it can't be read."""
+        top = self._ask({"op": "names", "path": "/DCIM"})
+        if isinstance(top, str):
+            return None
+        folders = sorted(n for n in top.get("names", []) if n[:3].isdigit())[-2:]
+        total = 0
+        for name in folders:
+            inside = self._ask({"op": "names", "path": f"/DCIM/{name}"})
+            if isinstance(inside, dict):
+                total += sum(1 for n in inside.get("names", []) if not n.startswith("."))
+        return total
 
     def _ask(self, command: dict) -> dict | str:
         """One command's answer, or why there's none, in words."""

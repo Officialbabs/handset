@@ -195,10 +195,15 @@ def choose(phones: list[Phone], wanted: str | None, taken=(), free_only: bool = 
 
 
 class Window(Adw.ApplicationWindow):
-    def __init__(self, app, wanted: str | None = None, phone_app: PhoneApp | None = None):
+    def __init__(self, app, wanted: str | None = None, phone_app: PhoneApp | None = None,
+                 task: int | None = None):
         super().__init__(application=app, title=phone_app.name if phone_app else NAME)
         self.add_css_class("handset-window")
         self.phone_app = phone_app  # the one app this window shows, if it shows one
+        # Another app's window opened this app (popout.py): its task, as it is, comes here.
+        self.task = task
+        self.parted = task is not None
+        self.display: tuple[str, int] | None = None  # (serial, id): an Android app's display on its phone
         self.gave_screen = False  # an iPhone's one screen went to another window (screen_to)
         self.border = BORDER if phone_app else 0
         # libadwaita's windows are at least 360 wide: narrower than that is a phone's own shape.
@@ -728,7 +733,9 @@ class Window(Adw.ApplicationWindow):
         if self.phone_app:
             self.device = android.AppScreen(link, self.phone_app.app, self._frame, self._turned,
                                             self._touch_changed, self._video_ended, self._awake_changed,
-                                            fps=self._monitor_rate())
+                                            fps=self._monitor_rate(), task=self.task,
+                                            on_display=self._display_made)
+            self.task = None  # opened again, it's the app's start
             self._turned()
             self.device.start()
             self._show_at()
@@ -780,9 +787,11 @@ class Window(Adw.ApplicationWindow):
         self.say(f"Sending {count} to {name}…")
 
         def send():
-            folder, where = files.drop_folder(paths)
-            sent, trouble = files.send_files(paths, folder)
+            sent, where, trouble = files.deliver(paths)
             files.stop()
+            if "set up" in where:
+                GLib.idle_add(self._photos_setup)
+                where = where.replace("set up", f"Files › On My iPhone, waiting for Photos")
             if sent and not trouble:
                 words = f"{count} is on {name}: {where}"
             elif sent:
@@ -793,6 +802,22 @@ class Window(Adw.ApplicationWindow):
 
         threading.Thread(target=send, daemon=True).start()
         return True
+
+    def _photos_setup(self):
+        """How to have dropped photos land in the iPhone's Photos: a shortcut, made once."""
+        from .iphone import FilesSession
+
+        dialog = Adw.AlertDialog(heading="Put Dropped Photos in Photos", body=(
+            "On the iPhone, once:\n"
+            "1. Photos › Albums › + › New Album, named “Handset”.\n"
+            f"2. Shortcuts › + , named “{FilesSession.PHOTOS_SHORTCUT}”.\n"
+            "3. Add “Get Contents of Folder”: On My iPhone › LocalSend › Handset.\n"
+            "4. Add “Save to Photo Album”: Handset. Done.\n\n"
+            "Then photos and videos dropped here go to that album (keep the iPhone unlocked). "
+            "These ones are in Files › On My iPhone › LocalSend › Handset for now."))
+        dialog.add_response("ok", "OK")
+        dialog.present(self)
+        return GLib.SOURCE_REMOVE
 
     def show_phone_files(self):
         """The phone's files: to look through, save here, open, or send to."""
@@ -946,7 +971,15 @@ class Window(Adw.ApplicationWindow):
                 self._show_status("phone-symbolic", f"{name}'s screen is off",
                                   "Wake it here, or press its power button.", wake=True)
 
+    def _display_made(self, display: int):
+        """This app's display is made: the apps it opens come out of it into windows of their own."""
+        serial = self._serial()
+        if serial:
+            self.get_application().app_display(self, serial, display)
+
     def _close_phone(self):
+        if self.display:
+            self.get_application().app_display_gone(self)
         if self.picture_timer:
             GLib.source_remove(self.picture_timer)
             self.picture_timer = 0

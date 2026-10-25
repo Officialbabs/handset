@@ -221,6 +221,24 @@ class FakeHelper(unittest.TestCase):
                 self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "apps", "org.videolan.vlc-ios", "clip.mp4")))
             finally:
                 session.stop()
+            # Photos and videos into Photos, through the shortcut; the rest into LocalSend.
+            photo = os.path.join(self.tmp.name, "beach.jpg")
+            with open(photo, "w") as file:
+                file.write("a photo")
+            session = FilesSession(Link("UDID-1", "/p.rppairing", "192.168.18.10", FAKE_HELPER))
+            session.PHOTOS_WAIT_S = 3
+            try:
+                sent, where, trouble = session.deliver([photo])  # no shortcut yet: it waits in Files
+                self.assertEqual((where, trouble), ("set up", None))
+                waiting = os.path.join(self.tmp.name, "apps", "org.localsend.localsendApp", "Handset")
+                self.assertEqual(os.listdir(waiting), ["beach.jpg"])
+                open(os.path.join(self.tmp.name, "shortcut"), "w").close()
+                sent, where, trouble = session.deliver([photo])
+                self.assertEqual(where, "Photos › Albums › Handset")
+                self.assertEqual(os.listdir(waiting), [])  # in Photos: the copies gone
+                self.assertIn("IMG_beach.jpg", os.listdir(os.path.join(self.tmp.name, "media", "DCIM", "100APPLE")))
+            finally:
+                session.stop()
             # Asked once a day: the next session knows without asking.
             again = FilesSession(Link("UDID-1", "/p.rppairing", "192.168.18.10", "/nonexistent"))
             self.assertEqual(sorted(again.sharing().values()), ["LocalSend", "VLC"])

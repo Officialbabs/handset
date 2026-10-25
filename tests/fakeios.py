@@ -79,6 +79,29 @@ def files():
         if path.startswith("/On My iPhone/"):
             here = os.path.join(shared, path[len("/On My iPhone/"):])
         try:
+            if op == "open-url":
+                # Shortcuts running "Handset Import", when the test made it: the Handset folder's
+                # photos copied into Photos (DCIM), as Save to Photo Album does.
+                if "Handset%20Import" in command.get("url", "") and os.path.exists(os.path.join(HERE, "shortcut")):
+                    dcim = os.path.join(root, "DCIM", "100APPLE")
+                    os.makedirs(dcim, exist_ok=True)
+                    for app in os.listdir(shared):
+                        waiting = os.path.join(shared, app, "Handset")
+                        for name in os.listdir(waiting) if os.path.isdir(waiting) else []:
+                            shutil.copyfile(os.path.join(waiting, name), os.path.join(dcim, "IMG_" + name))
+                print(json.dumps({"event": "opened", "url": command.get("url")}), flush=True)
+                continue
+            if op == "names":
+                print(json.dumps({"event": "names", "path": path, "names": os.listdir(here)}), flush=True)
+                continue
+            if op == "mkdir":
+                os.makedirs(here, exist_ok=True)
+                print(json.dumps({"event": "made", "path": path}), flush=True)
+                continue
+            if op == "remove":
+                os.remove(here)
+                print(json.dumps({"event": "removed", "path": path}), flush=True)
+                continue
             if op == "sharing":
                 print(json.dumps({"event": "sharing", "bundles": [b for b in command.get("bundles", [])
                                                                   if os.path.isdir(os.path.join(shared, b))]}),

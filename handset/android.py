@@ -955,6 +955,10 @@ def start_app_message(package: str) -> bytes:
     return struct.pack(">BB", START_APP, len(name)) + name
 
 
+# The server's word on the display it made: "New display: 1080x2400/425 (id=121)".
+DISPLAY_MADE = re.compile(r"New display: .*\(id=(\d+)\)")
+
+
 def display_size(natural: tuple[int, int]) -> tuple[int, int]:
     """An app's own screen: the phone's, upright, in whole blocks of 8 (as the video is made)."""
     width, height = sorted(natural)
@@ -973,9 +977,12 @@ class AppScreen:
     and watches it, as Android does (`awake`, `locked`)."""
 
     def __init__(self, link: Link, package: str, on_frame, on_turned, on_touch, on_ended, on_awake=None,
-                 edge: int | None = None, fps: int = FRAME_RATE):
+                 edge: int | None = None, fps: int = FRAME_RATE, task: int | None = None, on_display=None):
         self.link = link
         self.package = package
+        self.task = task  # a task of the app's already open (another app's window's), moved here
+        self.on_display = on_display  # called with the phone's id for this screen, once it's made
+        self.display: int | None = None
         self.fps = fps
         self.on_frame = on_frame
         self.on_turned = on_turned
@@ -1131,7 +1138,10 @@ class AppScreen:
                 raise ConnectionError("the phone can't send H.264 video")
             self.shown = (width, height)
             # The server knows its display only once the video starts; the app goes on it then.
-            self._send(start_app_message(self.package))
+            if self.task is None:
+                self._send(start_app_message(self.package))
+            elif not self._take_task():
+                return
             GLib.idle_add(self._touch_ready)
             while not self.stopped:
                 chunk = video.recv(65536)
@@ -1167,17 +1177,48 @@ class AppScreen:
             time.sleep(0.1)
         return None
 
+    def _take_task(self) -> bool:
+        """The app's task, open on another app's screen, moved to this one (as it is: the video
+        the link opened, say, rather than the app's start)."""
+        for _ in range(40):
+            if self.display is not None or self.stopped:
+                break
+            time.sleep(0.05)
+        if self.display is None:
+            GLib.idle_add(self._ended, "The phone didn't say which screen it made.")
+            return False
+        try:
+            said = shell(self.link.serial, f"am display move-stack {self.task} {self.display}", timeout=10)
+        except (OSError, subprocess.SubprocessError) as error:
+            said = f"Exception: {error}"
+        if "Exception" not in said:
+            return True
+        debug("the task didn't move:", said.strip()[:300])
+        GLib.idle_add(self._ended, "The app closed before it got here.")
+        return False
+
     def _read_log(self, process: subprocess.Popen):
-        """What the server says: its trouble (an app that isn't there) in words for the window."""
+        """What the server says: its trouble (an app that isn't there) in words for the window,
+        and the display it made."""
         for raw in process.stdout:
             line = raw.decode(errors="replace").rstrip()
             debug("scrcpy:", line)
+            made = DISPLAY_MADE.search(line)
+            if made:
+                self.display = int(made.group(1))
+                if self.on_display:
+                    GLib.idle_add(self._display_made)
             if "No app found" in line:
                 self.problem = "That app isn't on the phone any more."
                 GLib.idle_add(self._ended, self.problem)
             elif "ERROR" in line and not self.problem:
                 self.problem = line.split("ERROR:", 1)[-1].strip() or line
         process.stdout.close()
+
+    def _display_made(self):
+        if not self.stopped and self.display is not None:
+            self.on_display(self.display)
+        return GLib.SOURCE_REMOVE
 
     def _send(self, message: bytes):
         control = self.control
@@ -1573,6 +1614,11 @@ class AdbFiles:
     def drop_folder(self, _paths: list[str]) -> tuple[str, str]:
         """Where files dropped on the phone go, and how a person finds them there."""
         return self.downloads, "Download folder"
+
+    def deliver(self, paths: list[str]) -> tuple[list[str], str, str | None]:
+        """Files dropped on the phone, into its Download folder: what went, where, why not."""
+        sent, trouble = self.send_files(paths, self.downloads)
+        return sent, "Download folder", trouble
 
     def send_files(self, paths: list[str], folder: str) -> tuple[list[str], str | None]:
         return send_files(self.serial, paths, folder)

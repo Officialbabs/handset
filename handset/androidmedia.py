@@ -1,13 +1,21 @@
-"""What an Android phone plays, over adb: its media sessions (`dumpsys media_session`), read by a
-loop on the phone that says something only when they change (every second while one plays, now
-and then otherwise); a track's length and its words as the phone gives them to Bluetooth devices
-(`dumpsys bluetooth_manager`, while Bluetooth is on); and play, pause, next and previous sent as
-media keys (`cmd media_session dispatch`). The shell has no covers and no place to go to in a
-track.
+"""What an Android phone plays, over adb. Read on the phone by Handset's own helper
+(android/HandsetMedia.java, built into data/handset-media.jar and run by app_process as scrcpy's
+server is): the media session's own words, length, where it is, its cover, and what it takes,
+said as they change; and played, paused, skipped and moved in through it.
+
+Where the helper can't run, the shell's view instead: the sessions from `dumpsys media_session`,
+read by a loop on the phone that says something only when they change (every second while one
+plays, now and then otherwise); a track's length and its words as the phone gives them to
+Bluetooth devices (`dumpsys bluetooth_manager`, while Bluetooth is on); and play, pause, next and
+previous sent as media keys (`cmd media_session dispatch`): no covers, no place to go to in a track.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
+import os
 import re
 import subprocess
 import threading
@@ -25,10 +33,19 @@ NONE, STOPPED, PAUSED, PLAYING, FAST_FORWARDING, REWINDING, BUFFERING, ERROR = r
 # Going on (moving, or about to): shown as playing.
 GOING = {PLAYING, FAST_FORWARDING, REWINDING, BUFFERING, 8, 9, 10, 11}
 MOVING = {PLAYING, FAST_FORWARDING, REWINDING}
-SKIP_TO_PREVIOUS, SKIP_TO_NEXT = 16, 32  # its actions
+SKIP_TO_PREVIOUS, SKIP_TO_NEXT, SEEK_TO = 16, 32, 256  # its actions
 # Paused this long, it's left off the desk, as the phone itself drops it from its own controls.
 PAUSED_FOR_S = 10 * 60
 LOOK_PLAYING_S, LOOK_IDLE_S = 1, 4
+
+# The phone-side helper, and how it's run there.
+HELPER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "handset-media.jar")
+PHONE_HELPER = "/data/local/tmp/handset-media.jar"
+RUN_HELPER = f"CLASSPATH={PHONE_HELPER} app_process / io.github.officialbabs.handset.HandsetMedia"
+# A helper gone this soon, having said nothing, can't run on this phone: the shell's view instead.
+HELPER_FAILS_WITHIN_S = 5
+# Covers kept here for each phone, the latest few.
+COVERS_KEPT = 12
 
 # On the phone: the sessions' lines, said again only when they change.
 WATCH = ("o=; while :; do d=$(dumpsys media_session | grep -E "
@@ -142,6 +159,28 @@ def now_playing(session: Session, uptime_ms: int, received: float, song: dict | 
                       can_previous=bool(session.actions & SKIP_TO_PREVIOUS))
 
 
+def helped(event: dict, received: float, art: str = "") -> NowPlaying | None:
+    """What the helper said, as the desk shows it (None: nothing to play)."""
+    if event.get("event") != "media" or not event.get("title"):
+        return None
+    state, actions = int(event.get("state") or 0), int(event.get("actions") or 0)
+    speed = float(event.get("speed") or 1.0)
+    duration = max(0, int(event.get("duration") or 0)) / 1000
+    moving = state in MOVING
+    return NowPlaying(app=str(event.get("package") or ""), title=str(event["title"]),
+                      artist=str(event.get("artist") or ""), album=str(event.get("album") or ""),
+                      playing=state in GOING, duration=duration,
+                      position=max(0.0, int(event.get("position_now") or 0) / 1000), at=received,
+                      rate=speed if moving and speed else 1.0, can_next=bool(actions & SKIP_TO_NEXT),
+                      can_previous=bool(actions & SKIP_TO_PREVIOUS),
+                      can_seek=bool(actions & SEEK_TO) and duration > 0, art=art)
+
+
+def covers_folder(serial: str) -> str:
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(cache, "handset", "art", hashlib.sha1(serial.encode()).hexdigest()[:12])
+
+
 class MediaFollower:
     """One Android phone's now playing, followed while it's connected: `on_media(NowPlaying or
     None)` on GLib's main loop as it changes."""
@@ -153,20 +192,34 @@ class MediaFollower:
         self.stopped = False
         self.playing = False
         self.songs: dict[tuple[str, str], dict | None] = {}  # (package, description) → its Bluetooth song
+        self.helper: subprocess.Popen | None = None  # the phone-side helper, while it runs
+        self.helper_works: bool | None = None  # None: not tried yet
+        self.covers: dict[str, str] = {}  # cover id → its file here
 
     def start(self):
         threading.Thread(target=self._follow, daemon=True).start()
 
     def stop(self):
         self.stopped = True
-        process, self.process = self.process, None
-        if process and process.poll() is None:
-            process.kill()
-            process.wait()
+        for process in (self.process, self.helper):
+            if process and process.poll() is None:
+                process.kill()
+                process.wait()
+        self.process = self.helper = None
 
-    def control(self, command: str, _place: float = 0.0):
-        """Play, pause, toggle, next or previous, as the phone's media keys."""
+    def control(self, command: str, place: float = 0.0):
+        """Play, pause, toggle, next, previous, or seek to `place` seconds: through the helper,
+        or as the phone's media keys (no seeking then)."""
         key = {"toggle": "pause" if self.playing else "play"}.get(command, command)
+        helper = self.helper
+        if helper and helper.poll() is None and key in ("play", "pause", "next", "previous", "seek"):
+            asked = {"op": key} if key != "seek" else {"op": "seek", "position": max(0, round(place * 1000))}
+            try:
+                helper.stdin.write(json.dumps(asked) + "\n")
+                helper.stdin.flush()
+                return
+            except OSError:
+                pass
         if key not in ("play", "pause", "next", "previous"):
             return
         from .android import shell
@@ -182,9 +235,78 @@ class MediaFollower:
     # -- off the main loop
 
     def _follow(self):
+        while not self.stopped:
+            if self.helper_works is not False and os.path.exists(HELPER):
+                started, said = time.monotonic(), self._run_helper()
+                if self.stopped:
+                    return
+                if not said and time.monotonic() - started < HELPER_FAILS_WITHIN_S:
+                    debug("the media helper doesn't run on", self.serial, ": the shell's view instead")
+                    self.helper_works = False
+                    continue
+                time.sleep(3)  # the link dropped: followed again once it's back
+                continue
+            self._run_watch()
+            if not self.stopped:
+                time.sleep(3)
+
+    def _run_helper(self) -> bool:
+        """The helper on the phone until it goes: whether it said anything."""
+        from .android import adb, adb_command
+
+        try:
+            adb(self.serial, "push", HELPER, PHONE_HELPER, timeout=30)
+            process = subprocess.Popen(adb_command(self.serial, "shell", RUN_HELPER), stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+        except (OSError, subprocess.SubprocessError) as error:
+            debug("the media helper didn't start:", error)
+            return False
+        self.helper = process
+        said = False
+        with process.stdout:
+            for line in process.stdout:
+                if self.stopped:
+                    break
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if event.get("event") == "error":
+                    debug("media helper:", event.get("message"))
+                    continue
+                said = True
+                self._helped(event, time.monotonic())
+        self.helper = None
+        return said
+
+    def _helped(self, event: dict, received: float):
+        cover_id = str(event.get("cover_id") or "")
+        if cover_id and event.get("cover"):
+            self._keep_cover(cover_id, str(event["cover"]))
+        now = helped(event, received, self.covers.get(cover_id, ""))
+        self.playing = bool(now and now.playing)
+        GLib.idle_add(self._show, now)
+
+    def _keep_cover(self, cover_id: str, encoded: str):
+        folder = covers_folder(self.serial)
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"{cover_id}.jpg")
+        try:
+            with open(path, "wb") as file:
+                file.write(base64.b64decode(encoded))
+        except (OSError, ValueError):
+            return
+        self.covers[cover_id] = path
+        kept = sorted(os.listdir(folder), key=lambda name: os.path.getmtime(os.path.join(folder, name)))
+        for name in kept[:-COVERS_KEPT]:
+            os.remove(os.path.join(folder, name))
+            self.covers = {key: value for key, value in self.covers.items() if not value.endswith(name)}
+
+    def _run_watch(self):
+        """The shell's view: the sessions' dump, said by the phone each time it changes."""
         from .android import adb_command
 
-        while not self.stopped:
+        if not self.stopped:
             try:
                 process = subprocess.Popen(adb_command(self.serial, "shell", WATCH), stdout=subprocess.PIPE,
                                            stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True,
@@ -203,8 +325,6 @@ class MediaFollower:
                         block = []
                     else:
                         block.append(line.rstrip("\n"))
-            if not self.stopped:
-                time.sleep(3)  # the link dropped: followed again once it's back
 
     def _read(self, block: list[str], received: float):
         if not block:

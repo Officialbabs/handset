@@ -19,7 +19,9 @@ it's on (a switch in the desktop's Control Center, say) without asking it.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import threading
 
 import gi
 
@@ -58,6 +60,7 @@ class App(Adw.Application):
         self.connect("startup", self._started)
         self.clipboard = None  # the clipboard shared with the phones (clipboard.py), once started
         self.sound = None  # each phone's sound, here or on it (sound.py)
+        self.task_watches = {}  # adb serial → popout.TaskWatch, while its apps have windows
         self.connect("shutdown", self._shutdown)
 
     def _shutdown(self, _app):
@@ -66,6 +69,8 @@ class App(Adw.Application):
             self.clipboard.stop()
         if self.sound:
             self.sound.stop()
+        for watch in self.task_watches.values():
+            watch.stop()
 
     def _started(self, _app):
         from .appsync import start_if_needed
@@ -126,6 +131,63 @@ class App(Adw.Application):
         window.present()
         say_on(True)
         return window
+
+    # ---- Apps an app opens (popout.py) ------------------------------------------------------
+
+    def app_display(self, window, serial: str, display: int):
+        """An Android app's window has its display: another app coming on it gets a window."""
+        from .android import adb_command
+        from .popout import TaskWatch
+
+        if self.settings.get("pop_out_apps", True) is False:
+            return
+        watch = self.task_watches.get(serial)
+        if not watch:
+            watch = TaskWatch(serial, lambda shown, task: self._app_opened(serial, shown, task),
+                              lambda shown: self._app_left(serial, shown), adb_command)
+            self.task_watches[serial] = watch
+        window.display = (serial, display)
+        watch.watch(display, window.phone_app.app)
+
+    def app_display_gone(self, window):
+        serial, display = window.display
+        window.display = None
+        if serial in self.task_watches:
+            self.task_watches[serial].forget(display)
+
+    def _app_opened(self, serial: str, display: int, task):
+        """Another app came on top in an app's window: to its own window (the one it has, or a
+        new one)."""
+        from .android import shell
+        from .apps import PhoneApp, find
+        from .window import Window
+
+        opener = next((w for w in self.handset_windows() if w.display == (serial, display)), None)
+        if not opener or not opener.phone:
+            return
+        phone = opener.phone
+        has = next((w for w in self.handset_windows() if w.phone_app and w.phone and w.phone.id == phone.id
+                    and w.phone_app.app == task.package), None)
+        if has:
+            if has.display:
+                def move(to: int):
+                    try:
+                        shell(serial, f"am display move-stack {task.id} {to}", timeout=10)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                threading.Thread(target=move, args=(has.display[1],), daemon=True).start()
+            has.present()
+            return
+        phone_app = find(phone.id, task.package) or PhoneApp(phone.id, phone.name, "", task.package, task.package)
+        window = Window(self, phone_app=phone_app, task=task.id)
+        window.present()
+        say_on(True)
+
+    def _app_left(self, serial: str, display: int):
+        """An app's window that another app opened has nothing left on it: it closes, as the app did."""
+        window = next((w for w in self.handset_windows() if w.display == (serial, display)), None)
+        if window and window.parted:
+            window.close()
 
     def screen_to(self, window) -> bool:
         """An iPhone's one screen, to `window`: the other windows showing that iPhone give it up,

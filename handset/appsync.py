@@ -13,6 +13,7 @@ iPhone's icons come with its list, through Handset's helper.
 
 from __future__ import annotations
 
+import dataclasses
 import fcntl
 import json
 import os
@@ -116,6 +117,8 @@ class AppSync:
         self.notifiers: dict[str, object] = {}  # an Android phone's id → its notifications
         self.players: dict[str, PhonePlayer] = {}  # a phone's id → what it plays, on the desk
         self.media: dict[str, object] = {}  # an Android phone's id → what follows its media sessions
+        self.autopause = None  # one thing playing at a time (autopause.AutoPause)
+        self.looking: set[tuple[str, str, str]] = set()  # covers being looked up
         self.ancs = None
         self.phone_names: dict[str, str] = {}
         self.online: dict[str, Phone] = {}
@@ -130,11 +133,18 @@ class AppSync:
             follower.stop()
         if self.ancs:
             self.ancs.stop()
+        if self.autopause:
+            self.autopause.stop()
         for player in self.players.values():
             player.stop()
 
     def start(self):
         self.watch.start()
+        from . import autopause
+
+        if autopause.wanted():
+            self.autopause = autopause.AutoPause(lambda: self.players)
+            self.autopause.start()
         GLib.timeout_add_seconds(60, self._relist)
         apps.forget_old_icons()
         GLib.timeout_add_seconds(6 * 3600, lambda: (apps.forget_old_icons(), True)[1])
@@ -178,11 +188,42 @@ class AppSync:
                 return
             player = self.players[phone_id] = PhonePlayer(phone_id, self.phone_names.get(phone_id, "Phone"), control)
         player.phone_name = self.phone_names.get(phone_id, player.phone_name)
+        started = bool(now and now.playing) and not (player.now and player.now.playing)
         player.show(now)
+        if started and self.autopause:
+            self.autopause.phone_started(phone_id)
 
     def _iphone_media(self, now: NowPlaying | None):
         if self.ancs and self.ancs.media:
-            self._show_media(self.ancs.phone_id, now, self.ancs.media.control)
+            self._show_media(self.ancs.phone_id, self._with_cover(now), self.ancs.media.control)
+
+    def _with_cover(self, now: NowPlaying | None) -> NowPlaying | None:
+        """An iPhone's song with its cover (looked up once in Apple's catalog: covers.py); while
+        it's being looked up, without, and shown again with it once it's here."""
+        if now is None or now.art:
+            return now
+        from . import covers
+
+        path = covers.kept(now.title, now.artist, now.album)
+        if os.path.exists(path):
+            return dataclasses.replace(now, art=path)
+        key = (now.title, now.artist, now.album)
+        if key not in self.looking:
+            self.looking.add(key)
+
+            def look():
+                found = covers.cover(*key)
+                GLib.idle_add(self._cover_came, key, found)
+
+            threading.Thread(target=look, daemon=True).start()
+        return now
+
+    def _cover_came(self, key, found: str | None):
+        self.looking.discard(key)
+        shown = self.ancs.media.shown if self.ancs and self.ancs.media else None
+        if found and shown and (shown.title, shown.artist, shown.album) == key:
+            self._iphone_media(shown)
+        return GLib.SOURCE_REMOVE
 
     def _iphone_app(self, name: str) -> str:
         """The iPhone's app called `name` (the media service names its player only so)."""

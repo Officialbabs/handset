@@ -4,8 +4,9 @@ GStreamer's test picture as H.264 and whose uinput and input commands are writte
 keeps its state in FAKEADB_DIR: `rotation` (degrees, to turn the screen), `wakefulness` (Awake,
 Dozing… as `dumpsys power` says; the wake key wakes it), `log.jsonl` (what it
 was asked) and `uinput.jsonl` (the virtual touchscreen's commands). scrcpy's server is played too: listing apps
-(APPS), and an app's own screen (new_display=…): the test picture as its video, every control
-message written to `control.jsonl`. `others`, if there, lists more
+(APPS), and an app's own screen (new_display=…, its display 7, 8…): the test picture as its
+video, every control message written to `control.jsonl`. `tasks` is what `am stack list` says,
+and `am display move-stack` moves one there (saying so in `events`, the event log). `others`, if there, lists more
 connections adb has, one per line: "<serial> <serial number> <seconds to answer getprop>" (another
 phone, or FAKE7 over Wi-Fi); they answer nothing else. Never a real phone."""
 
@@ -93,7 +94,7 @@ def scrcpy(command):
     video.sendall(b"\0" + struct.pack(">III", 0x68323634, width, height))
     control = server.accept()[0] if options.get("control") == "true" else None
     if "new_display" in options:
-        print(f"[server] INFO: New display: {width}x{height} (id=7)", flush=True)
+        print(f"[server] INFO: New display: {width}x{height}/425 (id={new_display()})", flush=True)
     pipeline = (f"videotestsrc is-live=true pattern=ball ! video/x-raw,width={width},height={height},framerate=10/1 "
                 "! videoconvert ! openh264enc ! h264parse config-interval=-1 "
                 "! video/x-h264,stream-format=byte-stream ! fdsink fd=1")
@@ -164,6 +165,40 @@ def scrcpy(command):
         pass
     for encoder in encoders:
         encoder.kill()
+    return 0
+
+
+def new_display() -> int:
+    """The next display's id (7, 8…): `displays` keeps the count."""
+    path = os.path.join(HERE, "displays")
+    try:
+        with open(path) as file:
+            made = int(file.read())
+    except (OSError, ValueError):
+        made = 6
+    with open(path, "w") as file:
+        file.write(str(made + 1))
+    return made + 1
+
+
+def move_task(task: str, display: str):
+    """`am display move-stack`: the task in `tasks` (as `am stack list` says them) to the display,
+    said in the event log as the phone says it."""
+    path = os.path.join(HERE, "tasks")
+    try:
+        with open(path) as file:
+            text = file.read()
+    except OSError:
+        text = ""
+    moved, count = re.subn(rf"^(RootTask id={task} .*?displayId=)\d+", rf"\g<1>{display}", text, flags=re.M)
+    if not count:
+        print("Exception occurred while executing 'display':")
+        print(f"java.lang.IllegalArgumentException: moveRootTaskToTaskDisplayArea: Unknown rootTaskId={task}")
+        return 255
+    with open(path, "w") as file:
+        file.write(moved)
+    with open(os.path.join(HERE, "events"), "a") as file:
+        file.write(f"I/wm_task_moved: [{task},{task},{display},1,0]\n")
     return 0
 
 
@@ -291,6 +326,31 @@ def media_watch():
         time.sleep(0.05)
 
 
+def media_helper():
+    """Handset's media helper on the phone: `media_helper.jsonl`'s lines, said again each time
+    the file changes; what it's told, in `helper_commands.jsonl`; never-ending."""
+    path = os.path.join(HERE, "media_helper.jsonl")
+
+    def listen():
+        for line in sys.stdin:
+            with open(os.path.join(HERE, "helper_commands.jsonl"), "a") as file:
+                file.write(line)
+
+    threading.Thread(target=listen, daemon=True).start()
+    said = None
+    while True:
+        try:
+            with open(path) as file:
+                lines = file.read()
+        except OSError:
+            lines = ""
+        if lines != said:
+            sys.stdout.write(lines if lines.endswith("\n") or not lines else lines + "\n")
+            sys.stdout.flush()
+            said = lines
+        time.sleep(0.05)
+
+
 def others() -> dict[str, tuple[str, float]]:
     try:
         with open(os.path.join(HERE, "others")) as file:
@@ -322,6 +382,13 @@ def main(args):
     if args[:2] == ["shell", "-T"] and args[2:] == ["uinput", "-"]:
         uinput()
         return 0
+    if args[:1] == ["push"] and args[2] == "/data/local/tmp/handset-media.jar":
+        if os.path.exists(os.path.join(HERE, "media_helper.jsonl")):
+            return 0
+        print("adb: error: no room", file=sys.stderr)  # a phone the helper can't go to
+        return 1
+    if args[:1] == ["shell"] and "HandsetMedia" in " ".join(args[1:]):
+        return media_helper()
     if args[:1] == ["push"] and args[2].startswith("/sdcard"):
         target = storage(args[2])
         os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -363,6 +430,15 @@ def main(args):
         except OSError:
             pass
         return 0
+    if args == ["shell", "am stack list"]:
+        try:
+            with open(os.path.join(HERE, "tasks")) as file:
+                print(file.read(), end="")
+        except OSError:
+            pass
+        return 0
+    if args[:1] == ["shell"] and " ".join(args[1:]).startswith("am display move-stack "):
+        return move_task(*" ".join(args[1:]).split()[3:5])
     if args[:1] == ["shell"] and " ".join(args[1:]) == "date +%s.%N":
         print(f"{time.time():.6f}")
         return 0

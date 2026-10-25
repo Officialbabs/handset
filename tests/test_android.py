@@ -381,6 +381,35 @@ class AppScreenTest(FakeAdb):
         self.assertIn("new_display=1080x2400", started)
         self.assertIn("control=true", started)
 
+    def test_an_app_moved_in(self):
+        """Another app's window opened this one: its task, as it is, moves to this screen."""
+        with open(os.path.join(self.tmp.name, "tasks"), "w") as file:
+            file.write("RootTask id=480 bounds=[0,0][1080,2400] displayId=3 userId=0\n"
+                       " configuration={mWindowingMode=fullscreen mActivityType=standard}\n"
+                       "  taskId=480: org.example.chat/.Video bounds=[0,0][1080,2400] userId=0 visible=true\n")
+        frames, ended, displays = [], [], []
+        screen = AppScreen(Link("FAKE7", (1080, 2400), 0), "org.example.chat", frames.append, lambda: None,
+                           lambda live: None, ended.append, task=480, on_display=displays.append)
+        screen.start()
+        try:
+            spin(lambda: (frames and displays) or ended, seconds=20)
+        finally:
+            screen.stop()
+        self.assertEqual((ended, displays), ([], [7]))
+        self.assertIn(["shell", "am display move-stack 480 7"], self.logged("log.jsonl"))
+        self.assertEqual([m for m in self.logged("control.jsonl") if m["type"] == "start_app"], [])  # not started afresh
+
+    def test_an_app_that_closed_before_it_moved(self):
+        ended = []
+        screen = AppScreen(Link("FAKE7", (1080, 2400), 0), "org.example.chat", lambda t: None, lambda: None,
+                           lambda live: None, ended.append, task=999)
+        screen.start()
+        try:
+            spin(lambda: ended, seconds=20)
+        finally:
+            screen.stop()
+        self.assertEqual(ended, ["The app closed before it got here."])
+
     def test_an_app_thats_gone(self):
         ended = []
         screen = AppScreen(Link("FAKE7", (1080, 2400), 0), "org.example.gone", lambda t: None, lambda: None,

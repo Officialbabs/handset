@@ -47,6 +47,12 @@ a list, to open one or pin it. An app's window has the phone's button on the lef
   shows nothing while the phone is locked: the window wakes the phone, and says when to unlock
   it. This needs the `scrcpy` package. Apps that hide their screen from sharing (banking, some
   video apps) show black, as they do when mirrored.
+- **An app another app opens** (a link opening the video app, an attachment opening the files
+  app) comes out of the first one's window into a window of its own, as it is (the video, not the
+  app's start), or into the window it has already; that window closes when the app does. What an
+  app opens inside itself (a page in its own browser tab, the phone asking which app to use, a
+  permission question) stays in its window. Handset follows the phone's window manager for this
+  (its event log, over adb). Off: `"pop_out_apps": false` in `~/.config/handset/settings.json`.
 - **On an iPhone** the phone has one screen, so the app opens in front on it and the window shows
   the phone's screen with that app. A locked iPhone doesn't open apps: unlock it first.
 - Icons come from the phone: on Android read out of each app's package (drawn as the launcher
@@ -83,9 +89,15 @@ desk isn't possible, and clearing one here leaves it on the phone.
   "Show clipboard access" in the phone's privacy settings turns the note off.
 - **Drop files on a phone's window** to send them (never over a file that's there). An Android
   phone gets them in its Download folder, where its apps see them straight away. An iPhone gets
-  them in the Files app, under On My iPhone › an app that shares its files: videos and sound in
-  VLC (in its library too), the rest in LocalSend, or Chrome. Nothing from outside can add to an
-  iPhone's Photos library; Save Video from there does.
+  photos and videos in Photos, in an album named Handset, and the rest in the Files app, under On
+  My iPhone › an app that shares its files: sound in VLC (in its library too), the rest in
+  LocalSend, or Chrome.
+- **Photos on an iPhone** take a shortcut, made once: nothing from outside can add to its Photos
+  library, but a shortcut on the phone can. Make an album named **Handset** in Photos, and a
+  shortcut named **Handset Import** in Shortcuts with two actions: Get Contents of Folder (On My
+  iPhone › LocalSend › Handset) and Save to Photo Album (Handset). Handset puts the photos in that
+  folder, runs the shortcut (the iPhone must be unlocked), and once Photos has them takes them out
+  of the folder. Without the shortcut they wait in the folder, and Handset shows how to make it.
 - **Phone Files…** (right-click the bezel, or Ctrl+Shift+F) looks through the phone's files: a
   file can be saved in Downloads here, opened with this computer's apps, and files from here sent
   into the folder looked at. **Search** (Ctrl+F, or just type) narrows the folder at once, then
@@ -107,6 +119,23 @@ asked for again until it does.
   its sound, and its calls when there's one (heard here, answered through this computer's
   microphone). Pair it with the computer once in Settings › Bluetooth on the iPhone (as for its
   notifications).
+
+## What the phones play
+
+What a phone plays is one of the desk's media players (MPRIS), so the desk's media controls show
+it (on Ada, the activity pill): the title, artist and album, the cover, how far in, and buttons
+that work the phone. A phone starting to play pauses the other phone and the computer's own
+players (a browser's video, a music app), and one of those starting pauses the phones, as
+headphones switching between devices do. Off: `"auto_pause": false` in
+`~/.config/handset/settings.json`.
+
+- **Android** tells it through a small helper Handset runs on the phone over adb
+  (`data/handset-media.jar`, built from `android/` by `android/build.sh`; run as adb's shell
+  user, nothing installed): the app's own cover, the track's length, and seeking. Without the
+  helper, Handset reads the phone's media sessions as text (no cover, no seeking).
+- **An iPhone** tells it over Bluetooth, as it does a car (Apple Media Service), with no cover:
+  the cover is looked up in Apple's music catalog by artist and album (its public search, no
+  account), and kept in `~/.cache/handset/covers`.
 
 ## How it works
 
