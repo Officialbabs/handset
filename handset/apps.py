@@ -267,31 +267,6 @@ def remove_phone_entry(phone_id: str):
             pass
 
 
-# Apple's logo, as Lobe Icons draws it (https://github.com/lobehub/lobe-icons, "apple"; MIT License,
-# Copyright (c) LobeHub), in a 24-unit square. A trademark of Apple, naming the kind of phone.
-APPLE_LOGO = ("M11.932 6.908c.95 0 2.727-1.291 4.595-1.1.782.032 2.976.316 4.388 2.38-.113.069-2.622 1.528-2.593 "
-              "4.565.034 3.617 3.166 4.828 3.221 4.85-.029.086-.506 1.723-1.658 3.416-1.002 1.463-2.039 2.919-3.675 "
-              "2.95-1.606.03-2.125-.955-3.96-.955s-2.409.923-3.931.984c-1.581.06-2.78-1.58-3.79-3.037-2.065-2.98-3.64"
-              "-8.422-1.527-12.087 1.051-1.824 2.93-2.98 4.969-3.009 1.549-.032 3.011 1.043 3.96 1.043zM16.552 0c.153 "
-              "1.407-.411 2.817-1.251 3.833-.837 1.013-2.214 1.804-3.555 1.7-.185-1.378.495-2.814 1.27-3.712C13.883."
-              "805 15.346.05 16.553 0z")
-
-
-def apple_logo(cr, x: float, y: float, edge: float):
-    """Apple's logo, white, in the square at (x, y) `edge` wide."""
-    import gi
-
-    gi.require_version("Rsvg", "2.0")
-    from gi.repository import Rsvg
-
-    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#ffffff" '
-           f'fill-rule="evenodd" d="{APPLE_LOGO}"/></svg>')
-    handle = Rsvg.Handle.new_from_data(svg.encode())
-    area = Rsvg.Rectangle()
-    area.x, area.y, area.width, area.height = x, y, edge, edge
-    handle.render_document(cr, area)
-
-
 def android_head(cr, cx: float, cy: float, edge: float, eyes: tuple[float, float, float]):
     """The Android robot's head, white, centred at (cx, cy), `edge` wide: its dome, its two
     antennae, its eyes in the colour behind it."""
@@ -314,8 +289,8 @@ def android_head(cr, cx: float, cy: float, edge: float, eyes: tuple[float, float
 
 
 def phone_icon(name: str, platform: str, size: int = 192) -> bytes:
-    """A phone's icon: a phone, upright, its screen lit in the platform's colour, with the
-    platform's logo on it (Apple's, Android's robot)."""
+    """A phone's icon: a phone, upright, its screen lit in the platform's colour: an Android
+    phone's with Android's robot on it, an iPhone's plain (a home bar at its foot)."""
     import cairo
 
     surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
@@ -349,8 +324,11 @@ def phone_icon(name: str, platform: str, size: int = 192) -> bytes:
     cr.set_source_rgb(0.11, 0.11, 0.13)
     cr.fill()
     if platform == "ios":
-        edge = size * 0.36
-        apple_logo(cr, (size - edge) / 2, size / 2 - edge * 0.55, edge)
+        bar = size * 0.15
+        rounded(size / 2 - bar / 2, y1 - inset - size * 0.045, size / 2 + bar / 2, y1 - inset - size * 0.027,
+                size * 0.009)  # the home bar
+        cr.set_source_rgba(1, 1, 1, 0.9)
+        cr.fill()
     else:
         middle = tuple((a + b) / 2 for a, b in zip(top, bottom))
         android_head(cr, size / 2, size / 2, size * 0.36, middle)

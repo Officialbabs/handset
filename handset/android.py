@@ -46,8 +46,11 @@ def _decoder(*args, **kwargs) -> Decoder:
 # Where the phone-side tools' own complaints go: nowhere, or Handset's stderr when debugging.
 TOOL_ERRORS = None if DEBUG else subprocess.DEVNULL
 
-# The scrcpy package's server: live video with no time limit that stays steady through
-# rotations. Without it, Android's own screenrecord.
+# scrcpy's server: live video with no time limit that stays steady through rotations, the
+# phone's apps in windows of their own, its sound. Handset's own copy, of the version it's made for
+# (install.sh fetches it from the scrcpy project, checked against its published checksum); else a
+# scrcpy package's. Without either, Android's own screenrecord.
+SCRCPY_VERSION = "3.3.4"
 SCRCPY_SERVER = "/usr/share/scrcpy/scrcpy-server"
 # Where it goes on the phone: Handset's own name, so a running scrcpy's copy is never touched.
 PHONE_SERVER = "/data/local/tmp/handset-scrcpy-server.jar"
@@ -463,17 +466,49 @@ class Commands:
 
 # ---- Video ---------------------------------------------------------------------------------
 
-def scrcpy_version() -> str | None:
-    """The scrcpy package's version ("3.3.4"), which its server insists on hearing back."""
+def own_scrcpy_server() -> str:
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(data, "handset", f"scrcpy-server-v{SCRCPY_VERSION}")
+
+
+def scrcpy_server() -> tuple[str, str] | None:
+    """The scrcpy server to send the phone and its version, which it insists on hearing back:
+    Handset's own copy, else the scrcpy package's (its version as the package says)."""
+    if os.path.exists(own_scrcpy_server()):
+        return own_scrcpy_server(), SCRCPY_VERSION
     if not os.path.exists(SCRCPY_SERVER):
         return None
-    try:
-        result = subprocess.run(["dpkg-query", "-W", "-f=${Version}", "scrcpy"], capture_output=True,
-                                timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    match = re.match(r"(?:\d+:)?(\d+(?:\.\d+)+)", result.stdout.decode())
-    return match[1] if match else None
+    version = package_version("scrcpy")
+    return (SCRCPY_SERVER, version) if version else None
+
+
+def push_scrcpy_server(serial: str):
+    """scrcpy's server onto the phone; raises OSError or subprocess.SubprocessError when it can't."""
+    found = scrcpy_server()
+    if not found:
+        raise FileNotFoundError("scrcpy's server isn't on this computer")
+    adb(serial, "push", found[0], PHONE_SERVER, timeout=30)
+
+
+def scrcpy_version() -> str | None:
+    found = scrcpy_server()
+    return found[1] if found else None
+
+
+def package_version(package: str) -> str | None:
+    """An installed package's version ("3.3.4"), whichever package manager installed it."""
+    for asked in (["dpkg-query", "-W", "-f=${Version}", package], ["rpm", "-q", "--qf", "%{VERSION}", package],
+                  ["pacman", "-Q", package]):
+        if not shutil.which(asked[0]):
+            continue
+        try:
+            result = subprocess.run(asked, capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        match = re.search(r"(?:^|[\s:])(\d+(?:\.\d+)+)", result.stdout.decode()) if result.returncode == 0 else None
+        if match:
+            return match[1]
+    return None
 
 
 def read_exactly(sock: socket.socket, count: int) -> bytes:
@@ -595,7 +630,7 @@ class Video:
     def _scrcpy(self, session: int):
         scid = f"{secrets.randbits(31):08x}"
         try:
-            adb(self.serial, "push", SCRCPY_SERVER, PHONE_SERVER, timeout=30)
+            push_scrcpy_server(self.serial)
             port = int(adb(self.serial, "forward", "tcp:0", f"localabstract:scrcpy_{scid}").strip())
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             GLib.idle_add(self._fall_back, session, str(error))
@@ -914,9 +949,9 @@ def list_apps(serial: str) -> list[tuple[str, str]] | str:
     that open but have no place in the drawer (accessibility tools, say) are left out."""
     version = scrcpy_version()
     if not version:
-        return "Install the scrcpy package to open the phone's apps on the desk."
+        return "Run Handset's install.sh (it fetches scrcpy's server) to open the phone's apps on the desk."
     try:
-        adb(serial, "push", SCRCPY_SERVER, PHONE_SERVER, timeout=30)
+        push_scrcpy_server(serial)
         text = adb(serial, "shell", f"CLASSPATH={PHONE_SERVER} app_process / com.genymobile.scrcpy.Server "
                                     f"{version} log_level=info cleanup=false list_apps=true", timeout=30)
     except (OSError, subprocess.SubprocessError) as error:
@@ -1067,7 +1102,8 @@ class AppScreen:
 
     def start(self):
         if not self.version:
-            GLib.idle_add(self._ended, "Install the scrcpy package to open the phone's apps on the desk.")
+            GLib.idle_add(self._ended,
+                          "Run Handset's install.sh (it fetches scrcpy's server) to open the phone's apps on the desk.")
             return
         if not self.decoder.start():
             GLib.idle_add(self._ended, "Install gstreamer1.0-libav to show the phone's screen.")
@@ -1157,7 +1193,7 @@ class AppScreen:
         scid = f"{secrets.randbits(31):08x}"
         serial = self.link.serial
         try:
-            adb(serial, "push", SCRCPY_SERVER, PHONE_SERVER, timeout=30)
+            push_scrcpy_server(serial)
             self.forward_port = int(adb(serial, "forward", "tcp:0", f"localabstract:scrcpy_{scid}").strip())
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             GLib.idle_add(self._ended, f"The phone's video didn't start ({error}).")
@@ -1532,7 +1568,7 @@ class ClipboardLink:
             return
         scid = f"{secrets.randbits(31):08x}"
         try:
-            adb(self.serial, "push", SCRCPY_SERVER, PHONE_SERVER, timeout=30)
+            push_scrcpy_server(self.serial)
             self.port = int(adb(self.serial, "forward", "tcp:0", f"localabstract:scrcpy_{scid}").strip())
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             debug("the phone's clipboard didn't open:", error)
@@ -1856,11 +1892,11 @@ class SoundLink:
 
         version = scrcpy_version()
         if not version:
-            GLib.idle_add(self._ended, "Install the scrcpy package to play the phone's sound here.")
+            GLib.idle_add(self._ended, "Run Handset's install.sh (it fetches scrcpy's server) to play the phone's sound here.")
             return
         scid = f"{secrets.randbits(31):08x}"
         try:
-            adb(self.serial, "push", SCRCPY_SERVER, PHONE_SERVER, timeout=30)
+            push_scrcpy_server(self.serial)
             self.port = int(adb(self.serial, "forward", "tcp:0", f"localabstract:scrcpy_{scid}").strip())
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             GLib.idle_add(self._ended, f"The phone's sound didn't start ({error}).")

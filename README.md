@@ -54,7 +54,7 @@ Clicking a phone's card opens its page:
 - **Actions:** Show, the phone's apps, Play Sound Here, iPhone Bluetooth pairing, and Forget.
 
 **Each phone is also an app of its own.** It's listed under the phone's name in search and the app
-menu, with Apple's logo or Android's robot as its icon. Its window has its own dock icon, so it can be
+menu, with a plain phone or Android robot icon. Its window has its own dock icon, so it can be
 pinned and opened on its own.
 
 ### Adding a phone
@@ -357,22 +357,40 @@ A small helper written in Rust (`ios/`, built by `install.sh`) talks to the phon
 
 ## Installing
 
+One script sets up everything, on Ubuntu and Debian, Fedora, Arch (and EndeavourOS, Manjaro) and
+openSUSE:
+
 ```sh
-./install.sh             # the handset command, the menu entry and the icon
+./install.sh             # everything: it asks before installing packages or Rust
+./install.sh --check     # what's missing, changing nothing
 ./install.sh --uninstall
 ```
 
-Handset needs Python 3 with PyGObject, GTK 4, libadwaita and GStreamer (all part of the desktop),
-plus adb for Android phones and Rust (`sudo apt install cargo`) to build the iPhone helper. For
-the smoothest picture:
+Without a copy of Handset yet, the same script fetches one (with git, into
+`~/.local/share/handset/source`) and runs from there; run again, it updates it.
 
-```sh
-sudo apt install scrcpy gstreamer1.0-libav
-```
+In order, it:
 
-With the graphics card's video driver installed (on Intel: `intel-media-va-driver`), the GPU
-decodes both phones' video, and an Android phone's comes at its full size too; without it, the
-CPU decodes, and an Android phone's video is sized to what the monitor can show.
+1. **Installs the distribution's packages Handset uses**, the missing ones only, at once through
+   sudo: Python with PyGObject and pycairo, GTK 4 and libadwaita, GStreamer (with libav, and the
+   VA-API plugin and the graphics card's video driver, so the GPU decodes the phones' video),
+   adb and its USB rules, usbmuxd, Avahi, fuse3, wl-clipboard, pactl, BlueZ, git, curl, and Rust
+   with a C compiler. Bluetooth and Avahi are switched on where they're off.
+2. **Checks GTK and libadwaita** are new enough: GTK 4.16 and libadwaita 1.6, so Ubuntu 24.10 or
+   later, Debian 13, Fedora 41 or later, Arch, openSUSE Tumbleweed or Leap 16. Then that the
+   phones' video can be decoded here (H.264 for Android, HEVC for iPhones).
+3. **Fetches scrcpy's server** 3.3.4, which Handset is made for (Android video, apps in their own
+   windows, sound), from the scrcpy project, kept only if its checksum is the one the project
+   publishes; a scrcpy package's copy is used instead when it's the very same file.
+4. **Builds the iPhone helper** with Rust 1.85 or newer: the distribution's, or rustup's (in
+   `~/.cargo`, asked first) where that's older.
+5. **Installs Handset for you:** the `handset` command, the menu entry, the phones' files in the
+   desktop's search, and the sync, from sign-in.
+
+`--yes` answers yes to its questions, `--no-deps` skips the packages (for when you see to them),
+and `--deps-only` installs only them. Fedora and openSUSE leave H.264 and HEVC (the phones' video)
+out of their own packages: where nothing here decodes them, the script offers to add RPM Fusion's
+or Packman's, as each one's documentation says (asking first: it's another repository).
 
 **More than one phone:** each phone has a window of its own. Ctrl+Shift+N (or New Window on
 Handset's icon) opens one for a phone no window shows yet; `handset --phone NAME` opens that

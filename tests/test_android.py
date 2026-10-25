@@ -155,6 +155,29 @@ class CommandsTest(unittest.TestCase):
         self.assertEqual(up_events()[-3:], ["EV_SYN", "SYN_REPORT", 0])
 
 
+class ScrcpyServerTest(unittest.TestCase):
+    def test_handsets_own_first_then_a_packages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = (android.SCRCPY_SERVER, android.own_scrcpy_server, os.environ.get("PATH"))
+            try:
+                android.own_scrcpy_server = lambda: os.path.join(tmp, "scrcpy-server-v3.3.4")
+                android.SCRCPY_SERVER = os.path.join(tmp, "packaged")
+                self.assertIsNone(android.scrcpy_server())
+                # A package's, its version as pacman says (the only package manager here).
+                open(android.SCRCPY_SERVER, "w").close()
+                with open(os.path.join(tmp, "pacman"), "w") as file:
+                    file.write('#!/bin/sh\n[ "$2" = scrcpy ] && echo "scrcpy 3.3.4-1"\n')
+                os.chmod(os.path.join(tmp, "pacman"), 0o755)
+                os.environ["PATH"] = tmp
+                self.assertEqual(android.scrcpy_server(), (android.SCRCPY_SERVER, "3.3.4"))
+                self.assertIsNone(android.package_version("something-else"))
+                # Handset's own, of the version it's made for, whatever the package is.
+                open(android.own_scrcpy_server(), "w").close()
+                self.assertEqual(android.scrcpy_server(), (android.own_scrcpy_server(), android.SCRCPY_VERSION))
+            finally:
+                android.SCRCPY_SERVER, android.own_scrcpy_server, os.environ["PATH"] = saved
+
+
 class FakeAdb(unittest.TestCase):
     """The stand-in adb, for tests that talk to it."""
 
@@ -163,11 +186,12 @@ class FakeAdb(unittest.TestCase):
         self.saved = {k: os.environ.get(k) for k in ("HANDSET_ADB", "FAKEADB_DIR")}
         os.environ["HANDSET_ADB"] = FAKE_ADB
         os.environ["FAKEADB_DIR"] = self.tmp.name
-        self.scrcpy = android.SCRCPY_SERVER
+        self.scrcpy = (android.SCRCPY_SERVER, android.own_scrcpy_server)
         android.SCRCPY_SERVER = os.path.join(self.tmp.name, "no-scrcpy")
+        android.own_scrcpy_server = lambda: os.path.join(self.tmp.name, "no-own-scrcpy")
 
     def tearDown(self):
-        android.SCRCPY_SERVER = self.scrcpy
+        android.SCRCPY_SERVER, android.own_scrcpy_server = self.scrcpy
         for key, value in self.saved.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -361,11 +385,11 @@ class AppScreenTest(FakeAdb):
 
     def setUp(self):
         super().setUp()
-        self.version = android.scrcpy_version
-        android.scrcpy_version = lambda: "3.3.4"
+        self.version = android.scrcpy_server
+        android.scrcpy_server = lambda: (__file__, "3.3.4")  # any file: the stand-in adb takes it
 
     def tearDown(self):
-        android.scrcpy_version = self.version
+        android.scrcpy_server = self.version
         super().tearDown()
 
     def test_listing_the_apps(self):
@@ -448,11 +472,11 @@ class ClipboardTest(FakeAdb):
 
     def setUp(self):
         super().setUp()
-        self.version = android.scrcpy_version
-        android.scrcpy_version = lambda: "3.3.4"
+        self.version = android.scrcpy_server
+        android.scrcpy_server = lambda: (__file__, "3.3.4")  # any file: the stand-in adb takes it
 
     def tearDown(self):
-        android.scrcpy_version = self.version
+        android.scrcpy_server = self.version
         super().tearDown()
 
     def test_the_message(self):

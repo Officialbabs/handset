@@ -76,7 +76,7 @@ def checks() -> list[tuple[str, bool, str]]:
     version = android.scrcpy_version()
     found.append(("Android apps and sound", bool(version),
                   f"scrcpy {version} is here" if version else
-                  "Install scrcpy for apps in their own windows, sound here, and the smoothest picture"))
+                  "Run Handset's install.sh for apps in their own windows, sound here, and the smoothest picture"))
     usbmuxd = os.path.exists(finder.USBMUXD)
     found.append(("iPhones by cable", usbmuxd, "usbmuxd is running" if usbmuxd else
                   "Install usbmuxd (and plug an iPhone in) to reach iPhones"))
@@ -100,7 +100,7 @@ def checks() -> list[tuple[str, bool, str]]:
 
 
 def phone_picture(phone: Phone, size: int) -> Gtk.Image:
-    """The phone's own icon (as its entry has: Apple's logo, Android's robot)."""
+    """The phone's own icon (as its entry has: Android's robot, an iPhone's plain screen)."""
     from gi.repository import Gdk
 
     from .apps import phone_icon

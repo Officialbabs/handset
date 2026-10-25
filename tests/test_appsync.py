@@ -59,14 +59,14 @@ class SyncTest(unittest.TestCase):
         os.makedirs(os.path.join(os.environ["XDG_CONFIG_HOME"], "handset"))
         with open(os.path.join(os.environ["XDG_CONFIG_HOME"], "handset", "settings.json"), "w") as file:
             file.write('{"phone_notifications": false}')  # the real desk's and Bluetooth's: not here
-        self.version = android.scrcpy_version
-        android.scrcpy_version = lambda: "3.3.4"
+        self.version = android.scrcpy_server
+        android.scrcpy_server = lambda: (__file__, "3.3.4")  # any file: the stand-in adb takes it
         self.service = FakeService(os.environ["ADA_PHONES_SOCKET"],
                                    [phone(id="FAKE7", name="Pixel 7", usb=True, status="connected")])
 
     def tearDown(self):
         self.service.close()
-        android.scrcpy_version = self.version
+        android.scrcpy_server = self.version
         for key, value in self.saved.items():
             if value is None:
                 os.environ.pop(key, None)

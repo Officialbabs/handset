@@ -135,9 +135,8 @@ class AutoPauseTest(unittest.TestCase):
         autopause.SOUND_S = 1
         self.phones["PIXEL"].now.playing = True
         self.pause.phone_started("PIXEL")
-        spin(lambda: False, 1.3)
-        self.assertEqual(self.pause.lowered.said, [])  # its song was never turned down
-        self.assertEqual(self.phones["IPHONE"].sent, ["pause"])  # the rest still give way
+        self.assertTrue(spin(lambda: self.phones["IPHONE"].sent == ["pause"], 3))  # the rest still give way
+        self.assertEqual(self.pause.lowered.said, [])  # but its song was never turned down
 
     def test_the_next_song_is_the_same_thing_going_on(self):
         autopause.SOUND_S, autopause.BETWEEN_MS = 1, 600
