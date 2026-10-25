@@ -1,0 +1,6 @@
+# The iPhone helper, ready-built: install.sh fetches the one for this machine and this very source
+# (its hash, as install.sh's helper_source_hash makes it) instead of building it, checked against
+# its SHA-256 here, where the computer's C library is at least glibc LEAST. Any other machine or
+# source builds it.
+# MACHINE SOURCE SHA256 LEAST URL
+x86_64 2f127050e7f02da9d4af88c2bc4eeaadc4f0b9b5dd93aa2bfa77fde0a47d15f2 e36b7b7ea360e478b5568a781322c0bba5db27779aeb0dc0e5cb4886b02db466 2.34 https://github.com/Officialbabs/handset/releases/download/v0.1.0/handset-ios-x86_64-linux

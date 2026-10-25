@@ -151,7 +151,8 @@ button on the right, and a thin frame round it.
   - Handset follows the phone's window manager over adb to do this.
   - To turn it off, set `"pop_out_apps": false` in `~/.config/handset/settings.json`.
 - **On an iPhone**, the phone has one screen, so the app opens in front on it and the window shows
-  the phone with that app. A locked iPhone doesn't open apps; unlock it first.
+  the phone with that app. Closing the window takes the iPhone back to its home screen (unless
+  it's gone dark, which Home would light). A locked iPhone doesn't open apps; unlock it first.
 - **Icons** come from the phone. On Android they're read from each app's package and drawn the way
   the launcher draws them, with the app's first letter on a colour when an icon can't be read.
   iPhone icons come from the phone itself.
@@ -375,16 +376,19 @@ In order, it:
 1. **Installs the distribution's packages Handset uses**, the missing ones only, at once through
    sudo: Python with PyGObject and pycairo, GTK 4 and libadwaita, GStreamer (with libav, and the
    VA-API plugin and the graphics card's video driver, so the GPU decodes the phones' video),
-   adb and its USB rules, usbmuxd, Avahi, fuse3, wl-clipboard, pactl, BlueZ, git, curl, and Rust
-   with a C compiler. Bluetooth and Avahi are switched on where they're off.
+   adb and its USB rules, usbmuxd, Avahi, fuse3, wl-clipboard, pactl, BlueZ, git and curl.
+   Bluetooth and Avahi are switched on where they're off.
 2. **Checks GTK and libadwaita** are new enough: GTK 4.16 and libadwaita 1.6, so Ubuntu 24.10 or
    later, Debian 13, Fedora 41 or later, Arch, openSUSE Tumbleweed or Leap 16. Then that the
    phones' video can be decoded here (H.264 for Android, HEVC for iPhones).
 3. **Fetches scrcpy's server** 3.3.4, which Handset is made for (Android video, apps in their own
    windows, sound), from the scrcpy project, kept only if its checksum is the one the project
    publishes; a scrcpy package's copy is used instead when it's the very same file.
-4. **Builds the iPhone helper** with Rust 1.85 or newer: the distribution's, or rustup's (in
-   `~/.cargo`, asked first) where that's older.
+4. **Gets the iPhone helper.** On x86_64 it's ready-built: fetched from Handset's GitHub release
+   and kept only if its checksum is the one pinned in `ios/prebuilt`, for this very helper source
+   (and a C library at least glibc 2.34). Anywhere else, or once the helper's source has changed,
+   it's built here with Rust 1.85 or newer: the distribution's, or rustup's (in `~/.cargo`), each
+   asked first. While the repository is private, the download goes through `gh` (signed in).
 5. **Installs Handset for you:** the `handset` command, the menu entry, the phones' files in the
    desktop's search, and the sync, from sign-in.
 

@@ -25,6 +25,12 @@ STUBS = {
     "dnf": 'echo "dnf $*" >> "$LOG"',
     "zypper": 'echo "zypper $*" >> "$LOG"\n[ "$2" != repos ]',
     "sudo": 'echo "sudo $*" >> "$LOG"; "$@"',
+    # Downloads: the test's file ($ASSET) when it says they work ($CURL_OK, $GH_OK).
+    "curl": 'echo "curl $*" >> "$LOG"\n[ -n "$CURL_OK" ] || exit 22\n'
+            'while [ $# -gt 0 ]; do [ "$1" = -o ] && cp "$ASSET" "$2"; shift; done',
+    "wget": 'echo "wget $*" >> "$LOG"; exit 8',
+    "gh": 'echo "gh $*" >> "$LOG"\n[ -n "$GH_OK" ] || exit 1\n'
+          'while [ $# -gt 0 ]; do [ "$1" = --output ] && cp "$ASSET" "$2"; shift; done',
     "systemctl": 'echo "systemctl $*" >> "$LOG"\n'
                  'case "$1" in list-unit-files) echo "$2 enabled";; is-active) grep -qx "service:$3" "$INSTALLED";; esac',
 }
@@ -161,6 +167,69 @@ class InstallTest(unittest.TestCase):
         open(self.log, "w").close()
         said = self.run_install("apt", everything + ["android-udev-rules"], "--yes", "--deps-only")
         self.assertIn("everything Handset needs is installed", said)  # either will do
+
+    def helper(self, *, works: str = "curl", sha: str | None = None, least: str = "2.17", same_source: bool = True,
+               check: bool = False) -> tuple[str, int]:
+        """install.sh's ready-built helper step alone, with a pin file of the test's own."""
+        asset = os.path.join(self.tmp.name, "asset")
+        with open(asset, "wb") as file:
+            file.write(b"\x7fELF the helper")
+        lib = dict(os.environ, PATH=f"{self.stubs}:/usr/bin:/bin", LOG=self.log, HANDSET_LIB="1")
+        source = subprocess.run(["sh", "-c", '. "$0"; helper_source_hash', INSTALL], env=lib, capture_output=True,
+                                text=True).stdout.strip()
+        machine = os.uname().machine
+        pin = os.path.join(self.tmp.name, "prebuilt")
+        with open(pin, "w") as file:
+            file.write("# MACHINE SOURCE SHA256 LEAST URL\n"
+                       f"{machine} {source if same_source else '0' * 64} {sha or self.sha256(asset)} {least} "
+                       "https://github.com/Officialbabs/handset/releases/download/v0.1.0/handset-ios-x86_64-linux\n")
+        home = os.path.join(self.tmp.name, "home")
+        env = dict(lib, HOME=home, HANDSET_PREBUILT=pin, ASSET=asset, CHECK="1" if check else "",
+                   CURL_OK="1" if works == "curl" else "", GH_OK="1" if works == "gh" else "")
+        done = subprocess.run(["sh", "-c", '. "$0"; CHECK=$CHECK_WANTED; prebuilt', INSTALL],
+                              env=dict(env, CHECK_WANTED=env["CHECK"]), capture_output=True, text=True, timeout=60)
+        self.installed_helper = os.path.join(home, ".local", "lib", "handset", "handset-ios")
+        return done.stdout, done.returncode
+
+    @staticmethod
+    def sha256(path: str) -> str:
+        import hashlib
+
+        with open(path, "rb") as file:
+            return hashlib.sha256(file.read()).hexdigest()
+
+    def test_the_ready_built_helper(self):
+        said, ok = self.helper()
+        self.assertEqual(ok, 0, said)
+        self.assertIn("ready-built, its checksum as published", said)
+        self.assertTrue(os.access(self.installed_helper, os.X_OK))
+        said, ok = self.helper()  # again: it's here already
+        self.assertIn("ready-built, here", said)
+
+    def test_through_gh_while_the_repository_is_private(self):
+        said, ok = self.helper(works="gh")
+        self.assertEqual(ok, 0, said)
+        self.assertIn("gh release download v0.1.0 --repo Officialbabs/handset --pattern handset-ios-x86_64-linux "
+                      f"--output {self.installed_helper}.part --clobber", self.asked())
+
+    def test_built_instead(self):
+        for case, kwargs in (("not what was published", {"sha": "0" * 64}),
+                             ("nothing came", {"works": "nothing"}),
+                             ("another source", {"same_source": False}),
+                             ("an older C library", {"least": "99.0"})):
+            with self.subTest(case):
+                open(self.log, "w").close()
+                said, ok = self.helper(**kwargs)
+                self.assertEqual(ok, 1, said)
+                self.assertFalse(os.path.exists(self.installed_helper))
+                self.assertFalse(os.path.exists(self.installed_helper + ".part"))
+                if case in ("another source", "an older C library"):
+                    self.assertEqual(self.asked(), [])  # not even fetched
+
+    def test_check_fetches_nothing(self):
+        said, ok = self.helper(check=True)
+        self.assertIn("ready-built, to be fetched", said)
+        self.assertEqual(self.asked(), [])
 
     def test_all_there_nothing_asked(self):
         everything = self.packages("dnf") + ["service:bluetooth", "service:avahi-daemon"]

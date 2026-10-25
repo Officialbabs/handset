@@ -121,29 +121,38 @@ distro_name() { (. "$OS_RELEASE" 2>/dev/null && echo "${PRETTY_NAME:-$ID}") || e
 # GStreamer (video in, sound out: base, good, bad for VA-API, libav for decoding in software);
 # adb (with its udev rules, for phones by cable), usbmuxd (iPhones by cable), Avahi (phones
 # over Wi-Fi), fuse3 (the phones' folders), wl-clipboard and pactl (the clipboard, the sound),
-# BlueZ (an iPhone's notifications and music), psmisc (fuser), git and curl; Rust and a C
-# compiler, for the iPhone helper.
+# BlueZ (an iPhone's notifications and music), psmisc (fuser), git and curl. Rust (rust_packages)
+# only when the iPhone helper is built here.
 packages() {
     case "$1" in
         apt) echo "python3 python3-gi python3-gi-cairo python3-cairo gir1.2-gtk-4.0 gir1.2-adw-1
               gir1.2-graphene-1.0 gir1.2-gdkpixbuf-2.0 gir1.2-rsvg-2.0 gir1.2-gstreamer-1.0
               gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good
               gstreamer1.0-plugins-bad gstreamer1.0-libav adb android-udev-rules|android-sdk-platform-tools-common
-              usbmuxd avahi-daemon fuse3 wl-clipboard pulseaudio-utils bluez psmisc git curl cargo rustc gcc" ;;
+              usbmuxd avahi-daemon fuse3 wl-clipboard pulseaudio-utils bluez psmisc git curl" ;;
         dnf) echo "python3 python3-gobject python3-cairo gtk4 libadwaita graphene gdk-pixbuf2 librsvg2
               gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free
               gstreamer1-plugin-openh264 gstreamer1-plugin-libav android-tools usbmuxd avahi fuse3
-              wl-clipboard pulseaudio-utils bluez psmisc git curl cargo rust gcc" ;;
+              wl-clipboard pulseaudio-utils bluez psmisc git curl" ;;
         pacman) echo "python python-gobject python-cairo gtk4 libadwaita graphene gdk-pixbuf2 librsvg
               gstreamer gst-plugins-base-libs gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugin-va
               gst-libav android-tools android-udev usbmuxd avahi fuse3 wl-clipboard libpulse bluez
-              psmisc git curl rust gcc" ;;
+              psmisc git curl" ;;
         zypper) echo "python3 python3-gobject python3-gobject-Gdk python3-gobject-cairo python3-pycairo
               typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1 typelib-1_0-Graphene-1_0 typelib-1_0-GdkPixbuf-2_0
               typelib-1_0-Rsvg-2_0 typelib-1_0-Gst-1_0 typelib-1_0-GstVideo-1_0 typelib-1_0-GstAllocators-1_0
               gstreamer-plugins-base gstreamer-plugins-good gstreamer-plugins-bad gstreamer-plugins-libav
               android-tools android-udev-rules usbmuxd avahi fuse3 wl-clipboard
-              pipewire-pulseaudio|pulseaudio-daemon pulseaudio-utils bluez psmisc git curl cargo rust gcc" ;;
+              pipewire-pulseaudio|pulseaudio-daemon pulseaudio-utils bluez psmisc git curl" ;;
+    esac
+}
+
+# Rust and a C compiler, by family: for building the iPhone helper, when there's no ready-built one.
+rust_packages() {
+    case "$1" in
+        apt) echo "cargo rustc gcc" ;;
+        dnf|zypper) echo "cargo rust gcc" ;;
+        pacman) echo "rust gcc" ;;
     esac
 }
 
@@ -441,32 +450,118 @@ find_cargo() {
     return 1
 }
 
-# Handset's iPhone helper (ios/, in Rust), built here: with the distribution's Rust if it's new
-# enough, else with rustup's (in ~/.cargo, asked first). Android phones don't need it.
-iphone_helper() {
-    if ! find_cargo; then
-        if [ -n "$CHECK" ]; then
-            say "Rust $RUST_LEAST or newer, for the iPhone helper: missing (rustup would add it, in ~/.cargo)"
+# The iPhone helper ready-built (ios/prebuilt names it): for this machine and this very source,
+# fetched and checked against its pinned checksum instead of built, so Rust isn't needed.
+PREBUILT="${HANDSET_PREBUILT:-$HERE/ios/prebuilt}"  # another, for the tests
+
+# The helper's source, as one hash: its manifest, its locked dependencies and its code.
+helper_source_hash() {
+    (cd "$HERE/ios" && { sha256sum Cargo.toml Cargo.lock; find src -name '*.rs' | LC_ALL=C sort | xargs sha256sum; } |
+        sha256sum | cut -d' ' -f1)
+}
+
+# The ready-built helper for this machine, its C library and this source: "SHA256 URL", or nothing.
+prebuilt_helper() {
+    [ -f "$PREBUILT" ] || return 0
+    machine=$(uname -m)
+    source=$(helper_source_hash)
+    glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | cut -d' ' -f2)
+    while read -r arch hash sha least url; do
+        case "$arch" in ''|\#*) continue ;; esac
+        if [ "$arch" = "$machine" ] && [ "$hash" = "$source" ] && [ -n "$glibc" ] && at_least "$glibc" "$least"; then
+            echo "$sha $url"
             return 0
         fi
-        say "The iPhone helper needs Rust $RUST_LEAST or newer, which isn't here"
-        if command -v rustup >/dev/null 2>&1; then
-            # rustup is here (the distribution's), with no toolchain yet, or an old one.
-            if ask "Set up Rust's current version with rustup?"; then
-                rustup toolchain install stable --profile minimal && rustup default stable
-                find_cargo || true
-            fi
-        elif ask "Install Rust with rustup (in your home folder, ~/.cargo)?"; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
-            find_cargo || true
+    done < "$PREBUILT"
+}
+
+# A release's file ($1, its URL) into $2: plainly, or through GitHub's own tool (gh, signed in)
+# while the repository is private.
+fetch_asset() {
+    if curl -fsSL -o "$2" "$1" 2>/dev/null || wget -q -O "$2" "$1" 2>/dev/null; then return 0; fi
+    command -v gh >/dev/null 2>&1 || return 1
+    rest=${1#https://github.com/}
+    repo=${rest%%/releases/*}
+    tag=${rest#*/releases/download/}
+    asset=${tag#*/}
+    tag=${tag%%/*}
+    gh release download "$tag" --repo "$repo" --pattern "$asset" --output "$2" --clobber >/dev/null 2>&1
+}
+
+# The ready-built helper in place, if there's one for here: whether it is.
+prebuilt() {
+    found=$(prebuilt_helper)
+    [ -n "$found" ] || return 1
+    sha=${found%% *}
+    url=${found#* }
+    if [ "$(sha256_of "$HELPER_DIR/handset-ios")" = "$sha" ]; then
+        say "The iPhone helper: ready-built, here"
+        return 0
+    fi
+    if [ -n "$CHECK" ]; then
+        say "The iPhone helper: ready-built, to be fetched (no Rust needed)"
+        return 0
+    fi
+    say "Fetching the ready-built iPhone helper (8 MB)"
+    mkdir -p "$HELPER_DIR"
+    part="$HELPER_DIR/handset-ios.part"
+    if ! fetch_asset "$url" "$part"; then
+        rm -f "$part"
+        note "It didn't come: it's built here instead."
+        return 1
+    fi
+    if [ "$(sha256_of "$part")" != "$sha" ]; then
+        rm -f "$part"
+        note "What came isn't the published helper (its checksum differs): it's built here instead."
+        return 1
+    fi
+    chmod 755 "$part"
+    # Moved over the old one, so a running Handset keeps the copy it started.
+    mv -f "$part" "$HELPER_DIR/handset-ios"
+    say "The iPhone helper: ready-built, its checksum as published"
+}
+
+# Rust new enough to build the helper: the distribution's (asked), else rustup's (in ~/.cargo,
+# asked). Whether there is.
+get_rust() {
+    kind=$(family)
+    if [ "$kind" != unknown ]; then
+        # shellcheck disable=SC2046
+        needed=$(missing "$kind" $(rust_packages "$kind") | tr '\n' ' ')
+        if [ -n "${needed% }" ] && ask "Install Rust from $(distro_name) to build it ($needed)?"; then
+            # shellcheck disable=SC2086
+            install_packages "$kind" $needed || true
+            find_cargo && return 0
         fi
-        if [ -z "$CARGO" ]; then
+    fi
+    if command -v rustup >/dev/null 2>&1; then
+        # rustup is here (the distribution's), with no toolchain yet, or an old one.
+        if ask "Set up Rust's current version with rustup?"; then
+            rustup toolchain install stable --profile minimal && rustup default stable
+        fi
+    elif ask "Install Rust with rustup (in your home folder, ~/.cargo)?"; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+    fi
+    find_cargo
+}
+
+# Handset's iPhone helper (ios/, in Rust): ready-built where there's one for here, else built here,
+# with Rust 1.85 or newer. Android phones don't need it.
+iphone_helper() {
+    prebuilt && return 0
+    if ! find_cargo; then
+        if [ -n "$CHECK" ]; then
+            say "The iPhone helper: to be built, with Rust $RUST_LEAST or newer (not here yet)"
+            return 0
+        fi
+        say "The iPhone helper is built here, and that needs Rust $RUST_LEAST or newer, which isn't here"
+        if ! get_rust; then
             note "Without it, iPhones aren't reached; Android phones work. Run this again to add it."
             return 0
         fi
     fi
     if [ -n "$CHECK" ]; then
-        say "The iPhone helper: built with $("$CARGO" --version)"
+        say "The iPhone helper: to be built with $("$CARGO" --version)"
         return 0
     fi
     say "Building the iPhone helper (a few minutes the first time)"

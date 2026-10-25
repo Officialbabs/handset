@@ -40,6 +40,8 @@ from .service import Phone, ada_line, set_up_where, status_line, watch  # noqa: 
 
 # Typed letters wait this long for more, then go to the phone together.
 TYPE_AFTER_MS = 120
+# An iPhone app's window closing presses Home, and its screen ends this much later, once that's done.
+HOME_FIRST_MS = 400
 # Ctrl with these goes to the phone as its keyboard's shortcut (select all, copy, paste, cut, redo,
 # undo; Command on an iPhone), with Shift too for these (redo; paste as plain text).
 EDIT_KEYS = ("a", "c", "v", "x", "y", "z")
@@ -1151,6 +1153,32 @@ class Window(Adw.ApplicationWindow):
         if serial:
             self.get_application().app_display(self, serial, display)
 
+    def _iphone_home(self) -> bool:
+        """An iPhone app's window closing: the iPhone back on its home screen, as closing an app's
+        window leaves it on an Android phone. Pressed through whichever window has the iPhone's
+        screen now; not when the iPhone is dark (Home would light it). When it's this window's
+        screen, that ends a moment later, so the press is done first (the helper ends as soon as
+        its input does), and is then handed back (True)."""
+        app = self.get_application()
+        windows = [self] + [w for w in app.handset_windows()
+                            if w is not self and w.phone and w.phone.id == self.phone.id]
+        device = next((w.device for w in windows if w.device is not None and getattr(w.device, "live_touch", False)),
+                      None)
+        if device is None or not getattr(device, "awake", True):
+            return False
+        device.key("home")
+        if device is not self.device:
+            return False
+        self.device = None  # stopped here, not by _close_phone
+        GLib.timeout_add(HOME_FIRST_MS, self._stop_after_home, device, app)
+        return True
+
+    def _stop_after_home(self, device, app):
+        device.stop()
+        if not self.gave_screen:
+            app.screen_back(self)
+        return GLib.SOURCE_REMOVE
+
     def _close_phone(self):
         if self.wheel_timer:
             GLib.source_remove(self.wheel_timer)
@@ -1266,7 +1294,9 @@ class Window(Adw.ApplicationWindow):
             GLib.source_remove(self.size_timer)
         self._remember_size()
         app = self.get_application()
-        if self.phone and self.phone.platform == "ios" and not self.gave_screen:
+        # An iPhone app's window: the iPhone home first, its screen handed back once that's done.
+        later = bool(self.phone and self.phone.platform == "ios" and self.phone_app and self._iphone_home())
+        if self.phone and self.phone.platform == "ios" and not self.gave_screen and not later:
             app.screen_back(self)
         others = {w.phone.id for w in app.handset_windows() if w.phone and w is not self}
         if app.clipboard:

@@ -249,6 +249,8 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
 
 - **The app comes to the front** on the phone's single screen, and the window shows the phone with
   that app open.
+- **Closing the window** takes the iPhone back to its home screen, through whichever window has its
+  screen. A dark iPhone is left dark: Home would light it.
 - **A locked iPhone must be unlocked** before an app can be opened.
 
 ### Icons and synchronisation
@@ -565,7 +567,10 @@ Settings are stored in `~/.config/handset/settings.json`.
   - scrcpy's server, from the scrcpy project's GitHub release, kept only if its checksum matches
     the published one
   - Handset itself, with git, when run outside a Handset folder
-  - Rust, from rustup, only if accepted, and the iPhone helper's Rust libraries from crates.io
+  - the ready-built iPhone helper (x86_64), from Handset's GitHub release, kept only if its
+    checksum is the one pinned in `ios/prebuilt`
+  - otherwise Rust, from the distribution or rustup, only if accepted, and the helper's Rust
+    libraries from crates.io
 
 ---
 
@@ -582,7 +587,7 @@ Settings are stored in `~/.config/handset/settings.json`.
 | scrcpy's server 3.3.4 (fetched by `install.sh`) | Smoothest Android video, app windows, Android audio |
 | GStreamer libav plugins | Software video decoding |
 | VA-API video driver (e.g. `intel-media-va-driver`) | Hardware decoding, full-resolution Android video |
-| Rust 1.85 or newer, with a C compiler | Building the iPhone helper |
+| Rust 1.85 or newer, with a C compiler | Building the iPhone helper, where there's no ready-built one (other than x86_64, or a changed helper) |
 | usbmuxd | iPhones over USB |
 | BlueZ and PipeWire | iPhone notifications, media information and audio |
 | fusermount3 (fuse3) | Phone folders in `~/Phones` |
@@ -617,7 +622,7 @@ Handset is developed and validated on the following configuration:
 | Android | Android 17 |
 | iOS | iOS 27 |
 
-**Automated tests:** 238 tests across 24 test files run against a simulated Android device, a
+**Automated tests:** 245 tests across 25 test files run against a simulated Android device, a
 simulated iPhone helper and a simulated phone service, with no hardware required:
 
 ```sh
