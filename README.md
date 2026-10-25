@@ -1,265 +1,359 @@
 # Handset
 
-Your phone's screen in a window on the desk, live, shared with Ada. You use the phone from the
-window with the mouse and keyboard while Ada keeps working on it with her own phone tool, and the
-window shows what she's doing.
+Handset brings Android phones and iPhones onto the Linux desktop. Each phone's screen appears live
+in a native GTK 4 and libadwaita window, controlled with the mouse, touchpad and keyboard, and the
+phone joins the rest of the desktop: its apps in the launcher and dock, and its notifications,
+clipboard, files, sound and media. Nothing is installed on the phone. Handset works through adb on
+Android, Apple's device services on the iPhone, and standard Bluetooth profiles.
 
-Handset finds your phones through Ada's phone service (Settings › Phones), so there's nothing to
-pair: a phone Ada can use, Handset can show. On other desktops it finds and sets up phones itself
-(see Phones and settings).
+**[Feature reference](FEATURES.md)**: every feature in detail, with the settings, shortcuts,
+command line, requirements and known limitations.
+
+## Development and test platform
+
+Handset is developed and tested on **Ada 26.04** (Ubuntu 26.04 base, Wayland session). On Ada it
+works with the system's own phone features:
+- Phones set up in Settings › Phones are ready in Handset with no further pairing.
+- Ada's activity on a phone is shown in that phone's window.
+- Handset has a switch in Control Center.
+
+On other desktops, Handset finds and sets up phones itself (see [Adding a phone](#adding-a-phone)).
+
+| Component | Tested version |
+|---|---|
+| Desktop | Ada 26.04, Wayland |
+| GTK / libadwaita | 4.22 / 1.9 |
+| GStreamer | 1.28 |
+| scrcpy server | 3.3.4 |
+| Android | 17 |
+| iOS | 27 |
+
+The installer supports other distributions (see [Installing](#installing)), but other desktops,
+Android and iOS versions, and graphics hardware haven't been tested yet. The
+[feature reference](FEATURES.md#18-test-platform) lists the full test configuration.
 
 ## Phones and settings
 
-Opening Handset (its menu entry or its icon) opens its main window, also **Phones and Settings…**
-(right-click the bezel, Ctrl+comma, or `handset --phones`): a card for each phone it knows (how
-it's connected, its battery, a Bluetooth mark when it's connected that way, **Connected** and
-**Show** along the bottom), Handset's switches (notifications, one thing playing at a time, opened
-apps in their own windows, starting at sign-in) and what this computer has for the phones (adb,
-scrcpy, usbmuxd, the iPhone helper, the graphics card's video decoding, Bluetooth).
+Launching Handset opens **Phones and Settings**. It also opens from the bezel's menu, with Ctrl+,
+or with `handset --phones`. It shows:
 
-- **A phone's page** (click its card): Connected (off, Handset leaves it alone: no window,
-  notifications, clipboard or sound, until it's on again), Over Wi-Fi (off: its cable only), its
-  battery, its version of Android or iOS, when it was last connected, its Bluetooth link, then
-  Show, its apps, Play Sound Here, an iPhone's Bluetooth pairing, and forgetting it.
-- **Each phone is an app of its own** too ("Pixel 7", "My iPhone", under Apple's logo or
-  Android's robot): in search and the app menu, and its window under its own icon in the dock, to
-  pin and open on its own.
+- **A card for each known phone:** how it's connected, its battery, a Bluetooth mark when it's
+  connected that way, a **Connected** switch and a **Show** button.
+- **Handset's settings:** notifications, one thing playing at a time, opened apps in their own
+  windows, and starting at sign-in.
+- **What the computer provides for the phones:** adb, scrcpy, usbmuxd, the iPhone helper,
+  hardware video decoding and Bluetooth.
 
-Where the desktop has no phone service, Handset finds phones itself: Android phones through adb,
-by cable or Wi-Fi, and iPhones through usbmuxd. Phones it has seen are kept in
-`~/.config/handset/phones.json`, so they're listed while away. **+** in that window adds one:
+Clicking a phone's card opens its page:
 
-- **An Android phone** by its cable: Developer options and USB debugging on, then Allow on the
-  phone. Over Wi-Fi either way: **Use Over Wi-Fi Too** on its page while it's plugged in (adb on
-  Wi-Fi until the phone restarts; Handset connects to it there when it's back), or Wireless
-  debugging's pairing code (Android 11 and later, found on the network through Avahi; Handset
-  connects to it again whenever it's back on the Wi-Fi). A phone adb can't open ("no
-  permissions") needs the Android udev rules.
-- **An iPhone** by its cable, a step at a time, each saying what to do on the phone: trust this
-  computer, Developer Mode (the phone restarts), Apple's developer disk image (the screen's touch
-  service lives in it; Handset fetches Xcode's once, about 17 MB from a public copy on GitHub,
-  checks it, and Apple's server signs it for the phone; a restart takes it away, and Handset
-  puts it back when it connects), then Wi-Fi if you like (a pairing kept in
-  `~/.config/handset/pairings`). Without the Wi-Fi pairing the iPhone works by its cable.
+- **Connected:** when it's off, Handset leaves the phone alone (no window, notifications, clipboard
+  or sound) until it's turned back on.
+- **Over Wi-Fi:** when it's off, the phone is used by cable only.
+- **Details:** the battery, the Android or iOS version, when it was last connected, and its
+  Bluetooth link.
+- **Actions:** Show, the phone's apps, Play Sound Here, iPhone Bluetooth pairing, and Forget.
 
-## Using it
+**Each phone is also an app of its own.** It's listed under the phone's name in search and the app
+menu, with Apple's logo or Android's robot as its icon. Its window has its own dock icon, so it can be
+pinned and opened on its own.
 
-The window is just the phone's screen, edge to edge, with a slim bezel above it: no title bar,
-no buttons. Drag the bezel to move the window; double-click it to make the window fill the
-screen.
+### Adding a phone
 
-- **The mouse is a finger.** Press, drag and let go as on the glass; hold for a long press. The
-  wheel scrolls (a finger held on the phone, moved a step each notch, lifted once the wheel rests).
-- **Pinch** on the touchpad to zoom (two fingers pinching on the phone), or Ctrl and the wheel.
-- **The other buttons:** right-click goes back; a middle-click goes home, and dragging with the
-  middle button moves the window. Its edges resize it, and it keeps the phone's shape.
-- **The keyboard types on the phone.** Enter, Backspace, Tab, the arrows, Home and End do what
-  they do there, and Escape goes back. (Android types plain letters, digits and punctuation only.)
-- **Shortcuts:** Ctrl+B back, Ctrl+H home, Ctrl+R recent apps, Ctrl+N notifications, F11 full
-  screen, Ctrl+P the next phone, Ctrl+Shift+A the phone's apps, Ctrl+W close.
-- **Screenshots:** the camera on the bezel (or Ctrl+Shift+S, or Print) saves the phone's screen at
-  its own size in Pictures › Screenshots and puts it on the clipboard (from the phone itself; an
-  app's own screen as it's shown). Minimize and close are on the bezel's right.
-- **Editing keys go to the phone**, in any app: Ctrl+A select all, Ctrl+C copy (onto this
-  computer's clipboard too), Ctrl+X cut, Ctrl+V paste (this computer's clipboard, text or an
-  image, goes to the phone first), Ctrl+Z undo, Ctrl+Y or Ctrl+Shift+Z redo. On an iPhone they're
-  its keyboard's Command shortcuts.
-- **When Ada is working on the phone**, a small badge at the top says what she's doing and a ring
-  goes round the screen. She waits while you use the phone; the window's touches are meant to
-  count for that as your finger's do (not yet checked on a real phone).
-- With more than one phone, Ctrl+P switches, or pick one on the page shown while a phone isn't
-  connected. `handset --phone "Pixel 7"` opens that one.
+On Ada, phones come from the system's phone service. On other desktops, Handset finds phones
+itself: Android phones through adb (by cable or Wi-Fi) and iPhones through usbmuxd. Known phones
+are kept in `~/.config/handset/phones.json`, so they stay listed while they're away. The **+**
+button in Phones and Settings adds one:
 
-## The phone's apps on the desk
+- **An Android phone by cable:** turn on Developer options and USB debugging, then allow the
+  computer on the phone. A phone adb can't open ("no permissions") needs the Android udev rules.
+- **An Android phone over Wi-Fi**, in either of two ways:
+  - **Use Over Wi-Fi Too** on the phone's page while it's plugged in. adb stays on Wi-Fi until the
+    phone restarts, and Handset reconnects when it's back.
+  - **Wireless debugging's pairing code** (Android 11 and later). Handset finds the phone on the
+    network through Avahi, and reconnects whenever it's back on the Wi-Fi.
+- **An iPhone by cable**, one step at a time, each saying what to do on the phone:
+  1. Trust this computer.
+  2. Turn on Developer Mode. The phone restarts.
+  3. Install Apple's developer disk image, which holds the touch input service. Handset fetches
+     Xcode's image once (about 17 MB, from a public copy on GitHub), checks it, and has Apple's
+     server sign it for the phone. Restarting the phone removes it, and Handset puts it back when
+     the phone next connects.
+  4. Optionally, pair for Wi-Fi. The pairing is kept in `~/.config/handset/pairings`. Without it,
+     the iPhone works by cable.
 
-While a phone is connected, its apps are apps on the desk: each one the phone's app drawer shows
-is in search and among your apps, with its own icon and name ("WhatsApp (Pixel 7)"). Open one and
-it comes up in a window of its own, under its own icon in the dock, not Handset's; pin it there
-like any app. When the phone goes, its apps go with it, but for the ones pinned to the dock
-(opening one waits for the phone). A small background process keeps the list (`handset --sync`,
-started at sign-in and by Handset); it reads the icons once, keeps them in `~/.cache/handset/apps`,
-and reads an app's again only when the app updates.
+## Using the phone window
 
-Right-click the bezel and choose **Phone Apps…** (or press Ctrl+Shift+A) for the phone's apps in
-a list, to open one or pin it. An app's window has the phone's button on the left of its bezel
-(the whole phone) and its close button on the right, and a thin frame round it.
+The window shows the phone's screen edge to edge under a slim bezel, with no title bar or buttons.
+Drag the bezel to move the window, or double-click it to fill the screen.
 
-- **On Android** the app gets a screen of its own on the phone, as big as the phone's, and only
-  that app shows on it: the phone's own screen carries on as it was, and an app that was open
-  there moves over. Closing the window closes the app. That screen sleeps when the phone does and
-  shows nothing while the phone is locked: the window wakes the phone, and says when to unlock
-  it. This needs the `scrcpy` package. Apps that hide their screen from sharing (banking, some
-  video apps) show black, as they do when mirrored.
-- **An app another app opens** (a link opening the video app, an attachment opening the files
-  app) comes out of the first one's window into a window of its own, as it is (the video, not the
-  app's start), or into the window it has already; that window closes when the app does. What an
-  app opens inside itself (a page in its own browser tab, the phone asking which app to use, a
-  permission question) stays in its window. Handset follows the phone's window manager for this
-  (its event log, over adb). Off: `"pop_out_apps": false` in `~/.config/handset/settings.json`.
-- **On an iPhone** the phone has one screen, so the app opens in front on it and the window shows
-  the phone's screen with that app. A locked iPhone doesn't open apps: unlock it first.
-- Icons come from the phone: on Android read out of each app's package (drawn as the launcher
-  draws them, its first letter on a colour when one can't be read), on an iPhone from the phone.
-- Each app is a menu entry in `~/.local/share/applications` (`io.github.Officialbabs.Handset.App.…`);
-  a pin is a line in the dock's pins (`~/.config/os-ai/dock.ini`). `handset --phone ID --app APP`
-  is what it runs; `handset --forget-apps` takes them all away (`./install.sh --uninstall` does).
-
-## The phone's notifications on the desk
-
-A connected phone's notifications show on the desk as the desk's own, under the app's name and
-icon; clicking one opens that app in a window of its own, and one cleared on the phone goes from
-the desk too. Shown are the ones that would sound or pop up on the phone: not ongoing ones (music,
-a download), group summaries, silent ones, or ones Do Not Disturb holds back. Replying from the
-desk isn't possible, and clearing one here leaves it on the phone.
-
-- **Android** sends them over its adb link, as it posts them (its event log, and the notification
-  itself from `dumpsys notification`): nothing is installed on the phone.
-- **An iPhone** sends them over Bluetooth, as it does to a watch (Apple's Notification Center
-  Service). Pair it once: right-click the bezel, **Pair an iPhone for Notifications…** (or
-  `handset --pair-iphone`), then on the iPhone open Settings › Bluetooth, pick this computer and
-  allow its notifications. The computer is visible for a few minutes for that, and afterwards only
-  while that iPhone is away, so it can come back by itself (Handset marks it trusted in BlueZ, which
-  lets it). A call's Accept and Decline are on its notification. They come only while the iPhone is
-  connected by cable or Wi-Fi: a minute after it isn't, the computer lets go of its Bluetooth link
-  (what it plays leaves the media controls too), and takes it up again when it's back.
-- Off: `"phone_notifications": false` in `~/.config/handset/settings.json`.
-
-## The clipboard and files
-
-- **The clipboard is shared** with the phones Handset shows: copy on the computer, then click into
-  a phone's window, and it's on the phone; copy on the phone and it's on the computer, at once if
-  a Handset window is in front, else as soon as one comes forward (the desktop lets only the window
-  in front touch the clipboard). Text and images: a copied image goes onto the phone's clipboard
-  itself, never into its gallery or files, to paste in any app that takes one (on Android it's lent
-  to the app that pastes it from the Shell app's own files, by Handset's phone-side jar; on an
-  iPhone it's on its clipboard, as copied). An image copied on an iPhone comes here too; from
-  Android, text only. On Android each copy the computer reads shows the phone's "pasted from your
-  clipboard" note, and setting text opens Android's clipboard editor; "Show clipboard access" in
-  the phone's privacy settings turns the note off.
-- **Drop files on a phone's window** to send them (never over a file that's there). An Android
-  phone gets them in its Download folder, where its apps see them straight away. An iPhone gets
-  photos and videos in Photos, in an album named Handset, and the rest in the Files app, under On
-  My iPhone › an app that shares its files: sound in VLC (in its library too), the rest in
-  LocalSend, or Chrome.
-- **Photos on an iPhone** take a shortcut, made once: nothing from outside can add to its Photos
-  library, but a shortcut on the phone can. Make an album named **Handset** in Photos, and a
-  shortcut named **Handset Import** in Shortcuts with two actions: Get Contents of Folder (On My
-  iPhone › LocalSend › Handset) and Save to Photo Album (Handset). Handset puts the photos in that
-  folder, runs the shortcut (the iPhone must be unlocked), and once Photos has them takes them out
-  of the folder and takes the phone back to the app it was in (an app's window: that app; the
-  phone's window: the app Shortcuts came in front of, as the phone says through Apple's developer
-  services, or the home screen). Without the shortcut they wait in the folder, and Handset shows
-  how to make it.
-- **Each phone is a folder** while it's connected, in `~/Phones` (Phones, in your home folder):
-  any file manager, and any app's Open and Save dialogs, see its files as they'd see a USB stick's.
-  It's a file system of Handset's own (FUSE, spoken straight to the kernel; nothing to install
-  beyond fusermount3), over the phone's own link, so by cable or Wi-Fi alike: an Android phone's
-  storage, an iPhone's media folders and, under On My iPhone, the apps that share their files. A
-  file is fetched whole when it's opened (and kept a day, for a second look), and one written is
-  sent when it's closed. **Open in Files** on a phone's page; off with Phone Files in the File
-  Manager.
-- **The phones' files in the desktop's search:** type a file's name in the launcher and the
-  connected phones' files and folders named so come up, under Handset, each with its phone and
-  folder; picking one opens it in the app for its kind, from the phone's folder. Searching never
-  waits on a phone: Handset keeps an index of each phone's names, made when its folder comes and
-  again every half hour (an Android phone's storage in one `find`, under a second; an iPhone's
-  walked by the helper). Hidden files and Android's apps' own data are left out. The sync answers
-  (GNOME's search provider interface, which the launcher asks), while it runs.
-- **Phone Files…** (right-click the bezel, or Ctrl+Shift+F) looks through the phone's files: a
-  file can be saved in Downloads here, opened with this computer's apps, and files from here sent
-  into the folder looked at. **Search** (Ctrl+F, or just type) narrows the folder at once, then
-  looks through the folders in it. An Android phone's storage, over adb; an iPhone's media
-  folders (DCIM, recordings) and, under On My iPhone, the apps that share their files, through
-  Handset's helper (Apple's file services, AFC and house arrest).
-
-## The phone's sound here
-
-**Play Sound Here** (right-click a phone window's bezel) plays the phone's sound on this computer
-instead of on the phone, until it's switched off; it's remembered, so it comes back with the
-phone's window, and kept when the sound can't come for now (the phone out of reach), which is
-asked for again until it does.
-
-- **Android** sends it over its adb link (scrcpy's server, Android 11 and later): its music,
-  videos and games, while the phone itself goes quiet. Its ringtone and notification sounds stay
+- **Mouse:** the pointer works as a finger. Press, drag and release as on the glass, and hold for a
+  long press. The scroll wheel scrolls as a finger would: held on the phone, moved a step per
+  notch, and lifted once the wheel stops.
+- **Pinch:** pinch on the touchpad, or hold Ctrl and use the scroll wheel, to zoom with two fingers
   on the phone.
-- **An iPhone** sends it over Bluetooth, with this computer as its headphones and handsfree:
-  its sound, and its calls when there's one (heard here, answered through this computer's
-  microphone). Pair it with the computer once in Settings › Bluetooth on the iPhone (as for its
-  notifications).
+- **Other buttons:** right-click goes back, middle-click goes home, and dragging with the middle
+  button moves the window. Resizing from the edges keeps the phone's shape.
+- **Keyboard:** typing goes to the phone. Enter, Backspace, Tab, the arrow keys, Home and End work
+  as they do on the phone, and Escape goes back. Android accepts plain letters, digits and
+  punctuation only.
+- **Shortcuts:** Ctrl+B back, Ctrl+H home, Ctrl+R recent apps, Ctrl+N notifications, F11 full
+  screen, Ctrl+P next phone, Ctrl+Shift+A the phone's apps, Ctrl+W close.
+- **Screenshots:** the camera button on the bezel, Ctrl+Shift+S or Print saves the phone's screen
+  at its native resolution to Pictures › Screenshots and copies it to the clipboard. The capture is
+  taken on the phone itself; an app's window captures that app's screen. Minimize and Close are on
+  the right of the bezel.
+- **Editing keys go to the phone** in any app:
+  - Ctrl+A select all
+  - Ctrl+C copy, which also puts the copy on the computer's clipboard
+  - Ctrl+X cut
+  - Ctrl+V paste: the computer's clipboard (text or an image) is sent to the phone first
+  - Ctrl+Z undo, and Ctrl+Y or Ctrl+Shift+Z redo
 
-## What the phones play
+  On an iPhone these become its keyboard's Command shortcuts.
+- **Ada's activity (on Ada):** while Ada works on the phone, a small badge at the top says what
+  Ada is doing and a ring goes round the screen. Ada waits while the phone is in use. Touches from
+  the window are designed to count for this as a finger's do, but that hasn't yet been checked on
+  a real phone.
+- **More than one phone:** Ctrl+P switches between phones. Or pick a phone on the page shown while
+  one isn't connected. `handset --phone "‹phone name›"` opens a particular phone.
 
-What a phone plays is one of the desk's media players (MPRIS), so the desk's media controls show
-it (on Ada, the activity pill): the title, artist and album, the cover, how far in, and buttons
-that work the phone. A phone starting to play pauses the other phone and the computer's own
-players (a browser's video, a music app), and one of those starting pauses the phones, as
-headphones switching between devices do; once it stops, what it paused plays again. A sound of a
-moment (a message's tone) only lowers the phones' sound meanwhile, and pauses nothing. Off:
-`"auto_pause": false` in `~/.config/handset/settings.json`.
+## The phone's apps on the desktop
 
-- **Android** tells it through a small helper Handset runs on the phone over adb
-  (`data/handset-media.jar`, built from `android/` by `android/build.sh`; run as adb's shell
-  user, nothing installed): the app's own cover, the track's length, and seeking. Without the
-  helper, Handset reads the phone's media sessions as text (no cover, no seeking).
-- **An iPhone** tells it over Bluetooth, as it does a car (Apple Media Service), with no cover:
-  the cover is looked up in Apple's music catalog by artist and album (its public search, no
-  account), and kept in `~/.cache/handset/covers`.
+While a phone is connected, every app in its app drawer appears in desktop search and among the
+computer's apps, with its own icon and a name such as "WhatsApp (‹phone name›)".
+- **Each app opens in its own window**, under its own dock icon (not Handset's), and can be pinned
+  like any app.
+- **When the phone disconnects,** its apps go with it, except pinned ones. Opening a pinned app
+  then waits for the phone.
+- **A small background service keeps the list up to date** (`handset --sync`, started at sign-in
+  and by Handset). It reads each icon once, keeps it in `~/.cache/handset/apps`, and reads it again
+  only when the app updates.
+
+**Phone Apps…** in the bezel's menu (or Ctrl+Shift+A) lists the phone's apps, to open or pin one.
+An app's window has the phone button on the left of its bezel (it opens the whole phone), the close
+button on the right, and a thin frame round it.
+
+- **On Android**, each app gets a virtual screen of its own on the phone, as big as the phone's,
+  showing only that app.
+  - The phone's own screen carries on as it was, and an app that was open there moves over.
+  - Closing the window closes the app.
+  - The app's screen sleeps with the phone and stays dark while the phone is locked. The window
+    wakes the phone and says when to unlock it.
+  - This needs scrcpy.
+  - Apps that block screen sharing (banking, some video apps) show black, as they do when
+    mirrored.
+- **Apps opened by another app**, such as a link opening a video app or an attachment opening a
+  file viewer, come out into a window of their own (or into the window that app already has).
+  - The new window shows what was opened, not the app's start screen, and closes when the app
+    does.
+  - Content an app opens inside itself (a page in its own browser tab, the app chooser, a
+    permission prompt) stays in the original window.
+  - Handset follows the phone's window manager over adb to do this.
+  - To turn it off, set `"pop_out_apps": false` in `~/.config/handset/settings.json`.
+- **On an iPhone**, the phone has one screen, so the app opens in front on it and the window shows
+  the phone with that app. A locked iPhone doesn't open apps; unlock it first.
+- **Icons** come from the phone. On Android they're read from each app's package and drawn the way
+  the launcher draws them, with the app's first letter on a colour when an icon can't be read.
+  iPhone icons come from the phone itself.
+- **Launcher entries:** each app is a menu entry in `~/.local/share/applications`
+  (`io.github.Officialbabs.Handset.App.…`). On Ada, a pin is a line in the dock's pins
+  (`~/.config/os-ai/dock.ini`). Each entry runs `handset --phone ID --app APP`.
+  `handset --forget-apps` removes them all, as `./install.sh --uninstall` does.
+
+## Notifications
+
+A connected phone's notifications appear as native desktop notifications, under the app's name and
+icon.
+- **Clicking one** opens that app in a window of its own.
+- **Clearing one on the phone** removes it from the desktop too.
+- **Only notifications that would sound or pop up on the phone are shown.** That leaves out ongoing
+  ones (music, downloads), group summaries, silent ones, and ones Do Not Disturb holds back.
+- **Not yet supported:** replying from the desktop. Clearing one on the desktop leaves it on the
+  phone.
+
+How each phone sends them:
+
+- **Android** sends them over adb as they're posted, from the phone's event log and
+  `dumpsys notification`. Nothing is installed on the phone.
+- **An iPhone** sends them over Bluetooth, the way it does to a watch (Apple Notification Center
+  Service).
+  - **Pair it once:** choose **Pair an iPhone for Notifications…** in the bezel's menu (or run
+    `handset --pair-iphone`). Then, on the iPhone, open Settings › Bluetooth, pick this computer and
+    allow its notifications.
+  - **Discoverability:** the computer is discoverable for a few minutes while pairing. Afterwards
+    it's discoverable only while that iPhone is out of reach, so the iPhone can reconnect by itself
+    (Handset marks it trusted in BlueZ).
+  - **Calls:** incoming calls have Accept and Decline on their notification.
+  - **Only while connected:** notifications arrive only while the iPhone is also connected by cable
+    or Wi-Fi. A minute after that connection ends, the computer releases the Bluetooth link, and
+    the phone's media leaves the media controls. Handset takes the link up again when the phone is
+    back.
+
+To turn notifications off, use the Notifications switch in Phones and Settings, or set
+`"phone_notifications": false` in `~/.config/handset/settings.json`.
+
+## Clipboard and files
+
+- **Shared clipboard.**
+  - **Computer to phone:** copy on the computer, then click into a phone's window, and the copy is
+    on the phone.
+  - **Phone to computer:** the copy arrives at once if a Handset window is in front, otherwise as
+    soon as one comes forward. The desktop lets only the window in front use the clipboard.
+  - **Images to the phone:** an image goes onto the phone's clipboard only, never into its gallery
+    or files, ready to paste in any app that accepts one. On Android, Handset's phone-side helper
+    hands it to the pasting app from the Shell app's own files. On an iPhone it's placed on the
+    clipboard as copied.
+  - **Images from the phone:** images copied on an iPhone come to the computer too; from Android,
+    only text does.
+  - **Android's notice:** on Android, each time the computer reads the clipboard the phone shows
+    its "pasted from your clipboard" notice, and setting text opens Android's clipboard editor.
+    "Show clipboard access" in the phone's privacy settings turns the notice off.
+- **Drop files on a phone's window** to send them. Existing files are never overwritten.
+  - **Android:** files go to the phone's Download folder, where its apps see them straight away.
+  - **iPhone:** photos and videos go to Photos, in an album named Handset. Audio goes to VLC (and
+    its library), and other files go to the Files app, under On My iPhone › LocalSend (or Chrome).
+- **Photos on an iPhone need a shortcut, made once**, because only a shortcut on the phone can add
+  to its Photos library.
+  1. In Photos, make an album named **Handset**.
+  2. In Shortcuts, make a shortcut named **Handset Import** with two actions: Get Contents of
+     Folder (On My iPhone › LocalSend › Handset) and Save to Photo Album (Handset).
+
+  Handset then puts the photos in that folder and runs the shortcut (the iPhone must be unlocked).
+  Once Photos has them, Handset removes them from the folder and returns the phone to the app it
+  was in: that app, for an app's window; for the phone's window, the app Shortcuts came in front
+  of (as reported through Apple's developer services), or the home screen. Without the shortcut,
+  the photos wait in the folder and Handset shows how to make it.
+- **Each phone is a folder** in `~/Phones` while it's connected. Any file manager, and any app's
+  Open and Save dialogs, see its files as they'd see a USB stick's.
+  - It's Handset's own file system (FUSE, talking directly to the kernel; nothing to install beyond
+    fusermount3), over the phone's existing link, so it works the same by cable or Wi-Fi.
+  - It shows an Android phone's storage, or an iPhone's media folders plus, under On My iPhone, the
+    apps that share their files.
+  - A file is fetched in full when it's opened, and kept for a day. A file written there is sent to
+    the phone when it's closed.
+  - **Open in Files** on a phone's page opens it. Phone Files in the File Manager turns it off.
+- **Phone files in desktop search:** typing a file's name in the launcher shows matching files and
+  folders from connected phones, under Handset, each with its phone and folder. Choosing one opens
+  it in its default app, from the phone's folder.
+  - Searches never wait on a phone: Handset keeps an index of each phone's file names, built when
+    its folder appears and again every half hour. An Android phone's storage takes one `find`,
+    under a second; an iPhone's is walked by the helper.
+  - Hidden files and Android apps' private data are left out.
+  - The background service answers through GNOME's search provider interface while it runs.
+- **Phone Files…** (in the bezel's menu, or Ctrl+Shift+F) browses a phone's files. From there you
+  can save a file to Downloads, open one with the computer's apps, or send files into the folder
+  being viewed.
+  - **Search** (Ctrl+F, or just type) filters the folder at once, then searches its subfolders.
+  - An Android phone's storage is reached over adb. An iPhone's media folders (DCIM, recordings),
+    and under On My iPhone the apps that share their files, are reached through Handset's helper
+    (Apple's AFC and house arrest file services).
+
+## Phone audio on the computer
+
+**Play Sound Here** (in a phone window's bezel menu) plays the phone's audio on the computer
+instead of the phone, until it's switched off. The choice is remembered and comes back with the
+phone's window. If the audio can't come through at the moment (the phone is out of reach, say),
+Handset keeps trying until it can.
+
+- **Android** sends its audio over adb (scrcpy's server, Android 11 and later): music, video and
+  games, while the phone itself goes quiet. Ringtones and notification sounds stay on the phone.
+- **An iPhone** sends its audio over Bluetooth, with the computer acting as its headphones and
+  hands-free device: all its sound, and calls when there is one (heard on the computer and
+  answered through its microphone). Pair it with the computer once in Settings › Bluetooth on the
+  iPhone, as for notifications.
+
+## Media controls
+
+Whatever a phone plays is one of the desktop's media players (MPRIS), so the desktop's media
+controls show it (on Ada, the activity pill): title, artist and album, cover, position, and buttons
+that control the phone.
+
+**One thing playing at a time.** Playback is coordinated the way headphones switch between devices:
+- A phone starting to play pauses the other phones and the computer's own players (a browser
+  video, a music app).
+- One of the computer's players starting pauses the phones.
+- When it stops, whatever it paused plays again.
+- A brief sound, such as a message tone, only lowers the phones' audio for a moment and pauses
+  nothing.
+- The next track, or a moment of buffering, counts as the same playback going on.
+
+To turn it off, set `"auto_pause": false` in `~/.config/handset/settings.json`.
+
+- **Android** reports it through a small helper Handset runs on the phone over adb
+  (`data/handset-media.jar`, built from `android/` by `android/build.sh`). It runs as adb's shell
+  user, with nothing installed, and provides the app's own cover, the track's length and seeking.
+  Without the helper, Handset reads the phone's media sessions as text (no cover, no seeking).
+- **An iPhone** reports it over Bluetooth, the way it does to a car (Apple Media Service), without a
+  cover. Handset looks the cover up in Apple's music catalog by artist and album (its public
+  search, no account needed) and keeps it in `~/.cache/handset/covers`.
 
 ## With KDE Connect
 
-Handset and KDE Connect do different jobs, and run side by side. Handset is for using a phone
-from the computer: its screen, its apps, its sound and its files, over the links the phone
-already has (adb, Apple's developer services, Bluetooth), with nothing installed on it. KDE
-Connect is for the phone and the computer working together, with its app on the phone: the phone
-as the computer's touchpad, presentation remote or media and volume controls, commands run from
-the phone, texts and contacts on the computer, and ringing a lost phone.
+Handset and KDE Connect do different jobs and run side by side.
 
-A few things both do, so with both on they come twice. Keep one of each:
+- **Handset** is for using a phone from the computer: its screen, apps, sound and files. It works
+  over the links the phone already has (adb, Apple's developer services, Bluetooth), with nothing
+  installed on the phone.
+- **KDE Connect** is for the phone and the computer working together, with its app on the phone.
+  The phone can act as the computer's touchpad, presentation remote, or media and volume controls.
+  It can also run commands on the computer, bring texts and contacts to it, and ring a lost phone.
 
-- **Notifications:** Handset's Notifications switch (in Phones and Settings), or Notification
-  sync in KDE Connect's app on the phone.
-- **The clipboard:** either one shares it; KDE Connect's is its Clipboard plugin.
-- **What the phone plays** shows twice in the desktop's media controls; KDE Connect's comes from
-  its multimedia plugin.
+A few things both apps do, so with both on they happen twice. Keep one of each:
+
+- **Notifications:** Handset's Notifications switch (in Phones and Settings), or Notification sync
+  in KDE Connect's app on the phone.
+- **The clipboard:** either one shares it. KDE Connect's is its Clipboard plugin.
+- **What the phone plays** shows twice in the desktop's media controls. KDE Connect's comes from its
+  multimedia plugin.
 
 ## How it works
 
-On an Android phone, Handset uses the same adb connection Ada set up, by cable or over Wi-Fi,
-the cable when it's both:
+### Android
 
-- **The screen** comes as live H.264 video. With the `scrcpy` package installed, Handset uses its
-  small server, which is the smoothest and follows the phone as it turns. Without it, Handset uses
-  Android's own screen recorder. Frames go to GTK as they come from the decoder (YUV), and the
-  GPU turns them into colour.
-- **Touches** go through a virtual touchscreen that Handset adds to the phone (Android's own
-  `uinput` tool, nothing installed on the phone). The phone takes them as a finger's. If a phone
-  doesn't allow that, Handset falls back to sending each gesture whole.
+Handset uses adb by cable or over Wi-Fi, preferring the cable when both are available. On Ada it
+shares the adb connection the system's phone service maintains.
+
+- **Screen:** live H.264 video. With scrcpy installed, Handset uses scrcpy's server, which gives
+  the smoothest picture and follows the phone as it turns. Without it, Handset uses Android's own
+  screen recorder. Frames go to GTK as they come from the decoder (YUV), and the GPU turns them
+  into colour.
+- **Touch:** through a virtual touchscreen Handset adds to the phone with Android's own `uinput`
+  tool (nothing installed). The phone treats its touches as a finger's. Where a phone doesn't allow
+  that, Handset falls back to sending each gesture whole.
 - **Keys and text** go in as key presses.
-- **What Ada is doing** comes from her phone service, which Handset only listens to.
+- **Ada's activity** (on Ada) comes from the system's phone service, which Handset only listens to.
 
-On an iPhone (iOS 27, set up with Ada), a small helper in Rust (`ios/`, built by
-`install.sh` where Rust is installed) does the talking, with the same toolkit Ada's phone service
-uses (`idevice`):
+### iPhone
 
-- **It looks for the phone by its cable and on Wi-Fi at the same time**, and uses whichever
-  answers first (the cable, when it's plugged in). By cable it goes through usbmuxd with the
-  phone's own "Trust This Computer" pairing; over Wi-Fi, with the pairing Ada's desktop already
-  made. Either way there's nothing to tap on the phone, and unplugging it carries on over Wi-Fi.
-- **The screen** is Apple's own live screen-sharing stream (H.265, up to 60 frames a second, as
-  Xcode shows it). The stream pads its frames out to whole blocks; Handset keeps the screen's
-  own size, by the phone's model.
-- **Touches, buttons and typing** go in through Apple's developer input services, which take
-  them while the screen is being sent. An iPhone has no Back button: Back is a swipe in from the
-  left edge, Recent apps Home pressed twice (the app switcher), the notifications a swipe down
-  from the top. Typing is a US keyboard's letters, digits and punctuation.
-- **Ending cleanly:** the iPhone shares its screen like a call (the purple pill in its status bar),
-  and keeps a stream nobody ended for up to an hour, holding its camera and microphone. So Handset
-  ends its streams when its window closes. The phone stops all its streams at once, so that's done
-  when they're all Handset's, never while Ada shares the screen (she ends hers when she's done).
-  Starting with no one else sharing the screen, Handset first ends streams left from before. A dark
-  screen sends nothing, and its stream lights up with it: no second one is started meanwhile.
-- **Sharing the phone with Ada:** if Ada's desktop stops the screen stream (it stops them all),
-  Handset starts its own again.
+A small helper written in Rust (`ios/`, built by `install.sh`) talks to the phone through
+`idevice`, the same toolkit Ada's phone service uses.
+
+- **Connection:** the helper looks for the phone by cable and on Wi-Fi at the same time, and uses
+  whichever answers first (the cable, when it's plugged in).
+  - By cable, it goes through usbmuxd with the phone's own "Trust This Computer" pairing.
+  - Over Wi-Fi, it uses Handset's Wi-Fi pairing, or on Ada the pairing the system already made.
+  - Either way there's nothing to tap on the phone, and unplugging it carries on over Wi-Fi.
+- **Screen:** Apple's own live screen-sharing stream (H.265, up to 60 frames a second, as Xcode
+  shows it). The stream pads its frames out to whole blocks; Handset crops them to the screen's
+  real size for each model.
+- **Touches, buttons and typing** go in through Apple's developer input services, which take them
+  while the screen is being streamed. An iPhone has no navigation buttons, so:
+  - Back is a swipe in from the left edge.
+  - Recent apps is Home pressed twice (the app switcher).
+  - Notifications are a swipe down from the top.
+
+  Typing follows a US keyboard's letters, digits and punctuation.
+- **Ending cleanly:** the iPhone shares its screen like a call (the purple pill in its status bar).
+  It keeps a stream nobody ended for up to an hour, holding its camera and microphone.
+  - Handset ends its streams when its window closes.
+  - The phone stops all its streams at once, so Handset does this only when they're all its own,
+    never while Ada is sharing the screen.
+  - Starting with no one else sharing the screen, Handset first ends streams left over from
+    before.
+  - A dark screen sends nothing, and its stream lights up with it, with no second stream started
+    meanwhile.
+- **Sharing the screen with Ada:** if Ada stops the screen stream (which stops them all), Handset
+  starts its own again.
 
 ## Installing
 
