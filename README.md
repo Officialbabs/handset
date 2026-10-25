@@ -41,8 +41,8 @@ or with `handset --phones`. It shows:
   connected that way, a **Connected** switch and a **Show** button.
 - **Handset's settings:** notifications, one thing playing at a time, opened apps in their own
   windows, and starting at sign-in.
-- **What the computer provides for the phones:** adb, scrcpy, usbmuxd, the iPhone helper,
-  hardware video decoding and Bluetooth.
+- **What the computer provides for the phones:** adb, scrcpy's server, usbmuxd, the iPhone
+  helper, hardware video decoding and Bluetooth.
 
 Clicking a phone's card opens its page:
 
@@ -139,7 +139,7 @@ button on the right, and a thin frame round it.
   - Closing the window closes the app.
   - The app's screen sleeps with the phone and stays dark while the phone is locked. The window
     wakes the phone and says when to unlock it.
-  - This needs scrcpy.
+  - This needs scrcpy's server, which `install.sh` fetches.
   - Apps that block screen sharing (banking, some video apps) show black, as they do when
     mirrored.
 - **Apps opened by another app**, such as a link opening a video app or an attachment opening a
@@ -273,8 +273,8 @@ that control the phone.
   video, a music app).
 - One of the computer's players starting pauses the phones.
 - When it stops, whatever it paused plays again.
-- A brief sound, such as a message tone, only lowers the phones' audio for a moment and pauses
-  nothing.
+- A brief sound on the computer, such as a message tone, only lowers the phones' audio for a
+  moment and pauses nothing. A phone starting to play never lowers its own sound.
 - The next track, or a moment of buffering, counts as the same playback going on.
 
 To turn it off, set `"auto_pause": false` in `~/.config/handset/settings.json`.
@@ -313,9 +313,10 @@ A few things both apps do, so with both on they happen twice. Keep one of each:
 Handset uses adb by cable or over Wi-Fi, preferring the cable when both are available. On Ada it
 shares the adb connection the system's phone service maintains.
 
-- **Screen:** live H.264 video. With scrcpy installed, Handset uses scrcpy's server, which gives
-  the smoothest picture and follows the phone as it turns. Without it, Handset uses Android's own
-  screen recorder. Frames go to GTK as they come from the decoder (YUV), and the GPU turns them
+- **Screen:** live H.264 video through scrcpy's server, which gives the smoothest picture and
+  follows the phone as it turns. Handset sends the phone its own copy, the version it's made for
+  (3.3.4, fetched by `install.sh` and checked against the scrcpy project's published checksum).
+  Without it, Handset uses Android's own screen recorder. Frames go to GTK as they come from the decoder (YUV), and the GPU turns them
   into colour.
 - **Touch:** through a virtual touchscreen Handset adds to the phone with Android's own `uinput`
   tool (nothing installed). The phone treats its touches as a finger's. Where a phone doesn't allow

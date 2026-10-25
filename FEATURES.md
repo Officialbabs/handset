@@ -110,8 +110,8 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
   - its Bluetooth link
   - Show, Apps, Play Sound Here and iPhone Bluetooth pairing
   - Forget
-- **System readiness panel:** shows whether each component is available: adb, scrcpy, usbmuxd, the
-  iPhone helper, hardware video decoding and Bluetooth.
+- **System readiness panel:** shows whether each component is available: adb, scrcpy's server,
+  usbmuxd, the iPhone helper, hardware video decoding and Bluetooth.
 - **Each phone as its own app:** every phone has an entry under its own name in search and the app
   menu, with its own dock icon that can be pinned.
 
@@ -133,7 +133,9 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
 ### Video pipeline
 
 - **Android:** H.264 through the scrcpy server, which gives the smoothest picture and follows
-  rotation. Where scrcpy isn't installed, Android's built-in screen recorder is used instead.
+  rotation. Handset sends the phone its own copy of the server, version 3.3.4, which `install.sh`
+  fetches from the scrcpy project and checks against its published checksum. Without it, Android's
+  built-in screen recorder is used instead.
 - **iPhone:** H.265 from Apple's screen-sharing service, at up to 60 frames per second. The stream's
   block padding is cropped to the display's true size for each model.
 - **Hardware decoding:** through VA-API, with zero-copy DMA-BUF frames passed straight to GTK and
@@ -417,8 +419,9 @@ devices:
   music app).
 - A player on the computer starting pauses the phones.
 - Whatever was paused resumes when the interruption ends.
-- **Short sounds** (a message tone, a notification chime) only lower the phones' audio routed to
-  the computer for a moment. They pause nothing.
+- **Short sounds** on the computer (a message tone, a notification chime) only lower the phones'
+  audio routed to the computer for a moment. They pause nothing. A phone starting to play never
+  lowers its own sound.
 - **The next track,** or a moment of buffering, counts as the same playback continuing. Nothing is
   lowered and nothing resumes in between.
 - **Players that stand for a phone are left alone,** so a phone never pauses itself. These include
@@ -530,7 +533,15 @@ Settings are stored in `~/.config/handset/settings.json`.
 | `~/.config/handset/notifications.json` | iPhones paired over Bluetooth |
 | `~/.cache/handset/apps` | Phone app icons |
 | `~/.cache/handset/covers` | Album covers for iPhone media |
+| `~/.cache/handset/files` | Phone files opened from `~/Phones`, kept a day |
+| `~/.cache/handset/search` | The index of phone file names for desktop search |
+| `~/.cache/handset/ddi` | Apple's developer disk image |
+| `~/.local/share/handset/scrcpy-server-v3.3.4` | scrcpy's server, sent to Android phones |
+| `~/.local/share/handset/source` | Handset itself, when `install.sh` fetched it |
+| `~/.local/lib/handset/handset-ios` | The iPhone helper |
 | `~/.local/share/applications/io.github.Officialbabs.Handset.App.*` | Launcher entries for phone apps |
+| `~/.local/share/gnome-shell/search-providers/io.github.Officialbabs.Handset.search-provider.ini` | Desktop search registration |
+| `~/.config/autostart/io.github.Officialbabs.Handset.Sync.desktop` | The background sync, from sign-in |
 | `~/Phones` | Phone folders (while connected) |
 
 ---
@@ -548,6 +559,13 @@ Settings are stored in `~/.config/handset/settings.json`.
   - **Album covers (iPhone):** artist and album names are sent to Apple's public music catalogue
     search, with no account.
 - **Names only in search.** Desktop search indexes file and folder names, never file contents.
+- **The installer's downloads,** each only when needed:
+  - the distribution's packages, from its own repositories (and RPM Fusion's or Packman's video
+    codecs on Fedora or openSUSE, only if accepted)
+  - scrcpy's server, from the scrcpy project's GitHub release, kept only if its checksum matches
+    the published one
+  - Handset itself, with git, when run outside a Handset folder
+  - Rust, from rustup, only if accepted, and the iPhone helper's Rust libraries from crates.io
 
 ---
 
@@ -555,18 +573,21 @@ Settings are stored in `~/.config/handset/settings.json`.
 
 ### Computer
 
+`install.sh` installs all of these (see the README's Installing section).
+
 | Component | Needed for |
 |---|---|
-| Python 3, PyGObject, GTK 4, libadwaita, GStreamer | Handset itself |
-| adb | Android phones |
-| scrcpy (recommended) | Smoothest Android video, app windows, Android audio |
+| Python 3, PyGObject, pycairo, GTK 4.16+, libadwaita 1.6+, GStreamer | Handset itself |
+| adb, with its USB rules | Android phones |
+| scrcpy's server 3.3.4 (fetched by `install.sh`) | Smoothest Android video, app windows, Android audio |
 | GStreamer libav plugins | Software video decoding |
 | VA-API video driver (e.g. `intel-media-va-driver`) | Hardware decoding, full-resolution Android video |
-| Rust toolchain (cargo) | Building the iPhone helper |
+| Rust 1.85 or newer, with a C compiler | Building the iPhone helper |
 | usbmuxd | iPhones over USB |
 | BlueZ and PipeWire | iPhone notifications, media information and audio |
-| fusermount3 | Phone folders in `~/Phones` |
+| fusermount3 (fuse3) | Phone folders in `~/Phones` |
 | Avahi | Finding Android phones for Wi-Fi pairing |
+| wl-clipboard, pactl | The clipboard, and lowering the phones' sound |
 
 ### Phone
 
@@ -591,12 +612,12 @@ Handset is developed and validated on the following configuration:
 | Python | 3.14.4 |
 | Graphics | Intel integrated graphics, iHD VA-API driver 26.1.2 |
 | adb | 1.0.41 |
-| scrcpy | 3.3.4 |
+| scrcpy server | 3.3.4 |
 | iPhone helper | Rust 1.93, idevice 0.1.68 |
 | Android | Android 17 |
 | iOS | iOS 27 |
 
-**Automated tests:** 232 tests across 24 test files run against a simulated Android device, a
+**Automated tests:** 238 tests across 24 test files run against a simulated Android device, a
 simulated iPhone helper and a simulated phone service, with no hardware required:
 
 ```sh
