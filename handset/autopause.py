@@ -4,11 +4,12 @@ other phones and the computer's own players (MPRIS: a browser's video, a music a
 computer starting, on the phones. The players standing for a phone over Bluetooth (BlueZ's
 mpris-proxy) or through KDE Connect are left alone: they're that phone.
 
-A sound first only lowers what's playing (the phones' sound playing here, through the sound
+A sound on the computer first only lowers the phones' sound playing here (through the sound
 server): a notification's chime, a message's tone, is over in a moment, and what was playing goes
-on as it was. Still playing a few seconds on, it's something to listen to: the others pause, and
-play again once it stops (if nothing else was started meanwhile). Off with `"auto_pause": false` in
-Handset's settings.
+on as it was. A phone's never lowers the phones' sound: that's its own. Still playing a few seconds
+on, it's something to listen to: the others pause, and play again once it stops (if nothing else
+was started meanwhile). The next song, or a moment's buffering, is the same thing going on, not
+something starting. Off with `"auto_pause": false` in Handset's settings.
 """
 
 from __future__ import annotations
@@ -36,9 +37,10 @@ PHONE_PROGRAMS = ("mpris-proxy", "handset", "kdeconnectd")
 # Shorter than this, a sound is a notification's: the others are only lowered meanwhile.
 SOUND_S = 3
 LOWERED = "30%"  # how loud the phones' sound is while another plays a moment
-# What paused for something comes back once it stops, a moment after (in case it's only between
-# tracks), if it's within this long.
-RESUME_AFTER_MS = 1200
+# Playing again within this long of stopping, it's the same thing going on (the next song, a
+# moment's buffering): nothing's lowered, and what paused for it stays paused. What paused for
+# something comes back once it's been stopped this long, if it's within HELD_FOR_S.
+BETWEEN_MS = 3000
 HELD_FOR_S = 30 * 60
 # The phones' sound as the sound server knows it: Handset's own stream (Play Sound Here on Android),
 # or a phone's Bluetooth stream (an iPhone's).
@@ -123,6 +125,9 @@ class AutoPause:
         self.desk_status: dict[str, str] = {}  # the computer's players, as they last said
         # What paused for what: its key → {("phone", id) or ("desk", name)}, and when.
         self.held: dict[str, tuple[set[tuple[str, str]], float]] = {}
+        self.stopped_at: dict[str, float] = {}  # what was playing and stopped: its key → when
+        self.resuming: dict[str, int] = {}  # what stopped: its key → the timer that plays the rest again
+        self.lowering: set[str] = set()  # what has the phones' sound lowered, while it's a moment's
 
     def start(self):
         try:
@@ -141,16 +146,17 @@ class AutoPause:
             for watch in self.watches:
                 self.bus.signal_unsubscribe(watch)
         self.watches = []
-        for timer in self.waiting.values():
+        for timer in list(self.waiting.values()) + list(self.resuming.values()):
             GLib.source_remove(timer)
-        self.waiting = {}
+        self.waiting, self.resuming, self.lowering = {}, {}, set()
         self.lowered.restore()
 
     # -- something started
 
     def phone_started(self, phone_id: str):
         """A phone started playing: the others give way (a moment on, if it's still playing)."""
-        self._started(f"phone:{phone_id}", lambda: self._phone_playing(phone_id), lambda: self._phone_gives_way(phone_id))
+        self._started(f"phone:{phone_id}", lambda: self._phone_playing(phone_id), lambda: self._phone_gives_way(phone_id),
+                      lower=False)
 
     def _changed(self, bus, sender, _path, _interface, _signal, parameters):
         _interface, changed, _gone = parameters.unpack()
@@ -169,17 +175,27 @@ class AutoPause:
         if name.startswith(":") and not new:
             self.desk_status.pop(name, None)
             self._ended(f"desk:{name}")
+            self.stopped_at.pop(f"desk:{name}", None)  # gone: it won't be back
 
-    def _started(self, key: str, still: Callable[[], bool], give_way: Callable[[], None]):
-        """Something started: the phones' sound lowered at once; still playing SOUND_S on, the
-        others pause (`give_way`); stopped before, the sound is as it was."""
+    def _started(self, key: str, still: Callable[[], bool], give_way: Callable[[], None], lower: bool = True):
+        """Something started: the phones' sound lowered at once (`lower`: not when it's a phone's
+        own); still playing SOUND_S on, the others pause (`give_way`); stopped before, the sound
+        is as it was. Playing again just after it stopped, it's going on: as it was."""
         if key in self.waiting:
             return
-        self.lowered.lower()
+        stopped = self.stopped_at.pop(key, None)
+        if stopped is not None and time.monotonic() - stopped < BETWEEN_MS / 1000:
+            timer = self.resuming.pop(key, None)
+            if timer:
+                GLib.source_remove(timer)  # what paused for it stays paused
+            return
+        if lower:
+            self.lowering.add(key)
+            self.lowered.lower()
 
         def later():
             self.waiting.pop(key, None)
-            self.lowered.restore()
+            self._unlower(key)
             if still():
                 give_way()
             return GLib.SOURCE_REMOVE
@@ -187,15 +203,31 @@ class AutoPause:
         self.waiting[key] = GLib.timeout_add_seconds(SOUND_S, later)
 
     def _ended(self, key: str):
-        """It stopped: if it was a moment's sound, the sound is back as it was; if things paused
-        for it, they play again, a moment on."""
+        """It stopped: if it was a moment's sound, the sound is back as it was; if it had been
+        playing, things paused for it play again once it's been stopped a moment (unless it's
+        only between songs)."""
         timer = self.waiting.pop(key, None)
         if timer:
             GLib.source_remove(timer)
-            self.lowered.restore()
+            self._unlower(key)
+            return
+        self.stopped_at[key] = time.monotonic()
+        if key in self.held and key not in self.resuming:
+            self.resuming[key] = GLib.timeout_add(BETWEEN_MS, self._held_over, key)
+
+    def _unlower(self, key: str):
+        """The phones' sound as it was, once nothing else has it lowered."""
+        if key in self.lowering:
+            self.lowering.discard(key)
+            if not self.lowering:
+                self.lowered.restore()
+
+    def _held_over(self, key: str):
+        self.resuming.pop(key, None)
         held = self.held.pop(key, None)
         if held and time.monotonic() - held[1] < HELD_FOR_S:
-            GLib.timeout_add(RESUME_AFTER_MS, self._resume, held[0])
+            self._resume(held[0])
+        return GLib.SOURCE_REMOVE
 
     def phone_stopped(self, phone_id: str):
         self._ended(f"phone:{phone_id}")

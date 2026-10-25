@@ -62,10 +62,10 @@ class FakeLowered:
 
 class AutoPauseTest(unittest.TestCase):
     def setUp(self):
-        self.saved = (autopause.SOUND_S, autopause.RESUME_AFTER_MS)
-        autopause.SOUND_S, autopause.RESUME_AFTER_MS = 0, 10
+        self.saved = (autopause.SOUND_S, autopause.BETWEEN_MS)
+        autopause.SOUND_S, autopause.BETWEEN_MS = 0, 10
         self.addCleanup(lambda: setattr(autopause, "SOUND_S", self.saved[0]))
-        self.addCleanup(lambda: setattr(autopause, "RESUME_AFTER_MS", self.saved[1]))
+        self.addCleanup(lambda: setattr(autopause, "BETWEEN_MS", self.saved[1]))
         self.tmp = tempfile.TemporaryDirectory()
         config = os.path.join(self.tmp.name, "bus.conf")
         with open(config, "w") as file:
@@ -130,6 +130,42 @@ class AutoPauseTest(unittest.TestCase):
         spin(lambda: False, 1.5)
         self.assertEqual(self.phones["IPHONE"].sent, [])  # never paused
         self.assertEqual(self.pause.lowered.said, ["lower", "restore"])
+
+    def test_a_phone_never_lowers_its_own_sound(self):
+        autopause.SOUND_S = 1
+        self.phones["PIXEL"].now.playing = True
+        self.pause.phone_started("PIXEL")
+        spin(lambda: False, 1.3)
+        self.assertEqual(self.pause.lowered.said, [])  # its song was never turned down
+        self.assertEqual(self.phones["IPHONE"].sent, ["pause"])  # the rest still give way
+
+    def test_the_next_song_is_the_same_thing_going_on(self):
+        autopause.SOUND_S, autopause.BETWEEN_MS = 1, 600
+        self.status("Playing")
+        self.assertTrue(spin(lambda: self.phones["IPHONE"].sent == ["pause"], 2))
+        self.phones["IPHONE"].now.playing = False
+        lowered = list(self.pause.lowered.said)
+        self.status("Stopped")  # between songs
+        spin(lambda: False, 0.2)
+        self.status("Playing")
+        spin(lambda: False, 1.2)
+        self.assertEqual(self.pause.lowered.said, lowered)  # not turned down again
+        self.assertEqual(self.phones["IPHONE"].sent, ["pause"])  # and the phone stays paused
+        self.status("Paused")  # over: the phone plays again
+        self.assertTrue(spin(lambda: self.phones["IPHONE"].sent == ["pause", "play"], 2))
+
+    def test_a_phones_next_song(self):
+        autopause.SOUND_S, autopause.BETWEEN_MS = 0, 600
+        self.phones["PIXEL"].now.playing = True
+        self.pause.phone_started("PIXEL")
+        self.assertTrue(spin(lambda: self.desk_paused == ["Pause"]))
+        self.phones["PIXEL"].now.playing = False
+        self.pause.phone_stopped("PIXEL")  # the next song, loading
+        spin(lambda: False, 0.2)
+        self.phones["PIXEL"].now.playing = True
+        self.pause.phone_started("PIXEL")
+        spin(lambda: False, 1.0)
+        self.assertEqual(self.desk_paused, ["Pause"])  # the computer's player not played in between
 
     def test_what_paused_plays_again_once_its_over(self):
         self.status("Playing")
