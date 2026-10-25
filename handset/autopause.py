@@ -2,7 +2,7 @@
 between devices do, and come back when it's over. A phone starting to play gives way to it on the
 other phones and the computer's own players (MPRIS: a browser's video, a music app); a player on the
 computer starting, on the phones. The players standing for a phone over Bluetooth (BlueZ's
-mpris-proxy) are left alone: they're that phone.
+mpris-proxy) or through KDE Connect are left alone: they're that phone.
 
 A sound first only lowers what's playing (the phones' sound playing here, through the sound
 server): a notification's chime, a message's tone, is over in a moment, and what was playing goes
@@ -29,6 +29,10 @@ MPRIS = "org.mpris.MediaPlayer2."
 PLAYER = "org.mpris.MediaPlayer2.Player"
 PATH = "/org/mpris/MediaPlayer2"
 OURS = MPRIS + "Handset."  # the phones' own players (media.PhonePlayer)
+# Programs whose players stand for a phone, not for anything on this computer: Handset's own,
+# BlueZ's for a phone over Bluetooth, and KDE Connect's for what a phone plays (its multimedia
+# plugin). Pausing one of those would pause the phone itself.
+PHONE_PROGRAMS = ("mpris-proxy", "handset", "kdeconnectd")
 # Shorter than this, a sound is a notification's: the others are only lowered meanwhile.
 SOUND_S = 3
 LOWERED = "30%"  # how loud the phones' sound is while another plays a moment
@@ -279,8 +283,8 @@ class AutoPause:
         self.bus.call(name, PATH, PLAYER, method, None, None, Gio.DBusCallFlags.NONE, 2000, None, None)
 
     def _a_phone(self, name: str) -> bool:
-        """Whether a player stands for a phone: Handset's own, or BlueZ's for a phone over
-        Bluetooth (mpris-proxy)."""
+        """Whether a player stands for a phone: Handset's own, BlueZ's for a phone over
+        Bluetooth (mpris-proxy), or KDE Connect's (PHONE_PROGRAMS)."""
         if name.startswith(OURS):
             return True
         try:
@@ -291,4 +295,4 @@ class AutoPause:
                 program = file.read().strip()
         except (GLib.Error, OSError):
             return False
-        return program in ("mpris-proxy", "handset")
+        return program in PHONE_PROGRAMS

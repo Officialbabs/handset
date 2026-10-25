@@ -138,6 +138,23 @@ class AutoPauseTest(unittest.TestCase):
         self.status("Paused")
         self.assertTrue(spin(lambda: self.phones["IPHONE"].sent == ["pause", "play"]))
 
+    def test_kde_connects_players_are_the_phones_own(self):
+        """KDE Connect's player for a phone is that phone: its playing pauses no phone, and a phone
+        starting doesn't pause it (which would pause the phone itself)."""
+        with open("/proc/self/comm") as file:
+            me = file.read().strip()
+        saved = autopause.PHONE_PROGRAMS
+        autopause.PHONE_PROGRAMS = (*saved, me)  # the desk's player stands in for KDE Connect's
+        self.addCleanup(lambda: setattr(autopause, "PHONE_PROGRAMS", saved))
+        self.status("Playing")
+        spin(lambda: False, 0.3)
+        self.assertEqual(self.phones["IPHONE"].sent, [])
+        self.phones["PIXEL"].now.playing = True
+        self.pause.phone_started("PIXEL")
+        self.assertTrue(spin(lambda: self.phones["IPHONE"].sent == ["pause"]))
+        spin(lambda: False, 0.3)
+        self.assertEqual(self.desk_paused, [])
+
     def test_the_phones_sound_among_the_servers(self):
         listed = [{"index": 7, "properties": {"application.name": autopause.HANDSET_SOUND},
                    "volume": {"front-left": {"value_percent": "80%"}}},
