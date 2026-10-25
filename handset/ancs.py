@@ -18,6 +18,7 @@ from collections.abc import Callable
 from gi.repository import Gio, GLib
 
 from .ams import AMS, ENTITY_UPDATE, REMOTE_COMMAND, Ams, Writes
+from .bluetooth import trust
 from .log import debug
 from .media import NowPlaying
 from .notifications import Note
@@ -250,6 +251,7 @@ class Ancs:
             objects = self._objects()
         except GLib.Error:
             return GLib.SOURCE_REMOVE
+        self._trust_known(objects)
         if self.device and not objects.get(self.device, {}).get("org.bluez.Device1", {}).get("Connected"):
             debug("the iPhone went")
             self.device, self.chars = None, {}
@@ -285,6 +287,16 @@ class Ancs:
             self._look_media(objects)
             break
         return GLib.SOURCE_REMOVE
+
+    def _trust_known(self, objects: dict):
+        """The iPhones paired for this, trusted: BlueZ then lets them reconnect by themselves
+        (to the advertising this does while none is connected), without asking anyone."""
+        known = self.known()
+        for path, interfaces in objects.items():
+            device = interfaces.get("org.bluez.Device1")
+            if device and device.get("Paired") and not device.get("Trusted") and device.get("Address") in known:
+                debug("trusting", device.get("Alias") or device.get("Address"), "to come back by itself")
+                trust(self.bus, path)
 
     @staticmethod
     def _chars(objects: dict, service: str) -> dict[str, str]:

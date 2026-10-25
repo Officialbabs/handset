@@ -89,13 +89,30 @@ class SwitchTest(unittest.TestCase):
         self.assertTrue(self.links[0].stopped)
         self.assertEqual(self.app.settings["sound_here"], ["FAKE7"])  # still wanted next time
 
-    def test_a_link_that_cant_play_turns_the_switch_off(self):
+    def test_the_choice_stays_when_the_sound_cant_come(self):
         self.switch.switch(self.window, True)
-        self.links[0].on_ended("The phone didn't let its sound be shared.")
-        self.assertEqual(self.window.said, ["The phone didn't let its sound be shared."])
-        self.assertEqual(self.window.switched, [False])
-        self.assertFalse(self.switch.is_on("FAKE7"))
-        self.assertTrue(self.links[0].stopped)
+        self.links[0].on_ended("The phone isn't near.")
+        self.links[0].on_ended("The phone isn't near.")
+        self.assertEqual(self.window.said, ["The phone isn't near."])  # said once
+        self.assertEqual(self.window.switched, [])  # the switch stays on
+        self.assertTrue(self.switch.is_on("FAKE7"))
+        self.assertEqual(window.load_settings()["sound_here"], ["FAKE7"])
+        self.assertTrue(self.links[0].stopped)  # this one doesn't keep trying: asked again later
+        self.switch._again(self.window, "FAKE7")
+        self.assertEqual(len(self.links), 2)
+        self.assertTrue(self.links[1].started)
+
+    def test_a_link_that_keeps_trying_is_left_to(self):
+        self.switch._link = lambda w: self.links.append(KeepsTrying(lambda why: self.switch._ended(w, w.phone.id, why))) \
+            or self.links[-1]
+        self.switch.switch(self.window, True)
+        self.links[0].on_ended("Out of reach.")
+        self.assertFalse(self.links[0].stopped)
+        self.assertIn("FAKE7", self.switch.links)
+
+
+class KeepsTrying(FakeLink):
+    keeps_trying = True
 
 
 if __name__ == "__main__":

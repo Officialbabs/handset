@@ -70,12 +70,20 @@ def files():
     import shutil
 
     root = os.path.join(HERE, "media")
+    shared = os.path.join(HERE, "apps")  # an app per folder: the ones that share their Documents
     say(event="files", ready=True)
     for line in sys.stdin:
         command = json.loads(line)
         op, path = command.get("op"), command.get("path", "")
         here = os.path.join(root, path.strip("/"))
+        if path.startswith("/On My iPhone/"):
+            here = os.path.join(shared, path[len("/On My iPhone/"):])
         try:
+            if op == "sharing":
+                print(json.dumps({"event": "sharing", "bundles": [b for b in command.get("bundles", [])
+                                                                  if os.path.isdir(os.path.join(shared, b))]}),
+                      flush=True)
+                continue
             if op == "list":
                 entries = [{"name": n, "folder": os.path.isdir(os.path.join(here, n)),
                             "size": os.path.getsize(os.path.join(here, n)),
@@ -85,8 +93,20 @@ def files():
                 shutil.copyfile(here, command["to"])
                 answer = {"event": "fetched", "path": path}
             elif op == "send":
+                # As idevice's AFC says when a write fails: a line that's no answer, before the answer.
+                print("error: AFC file descriptor dropped without calling .close().await", flush=True)
                 shutil.copyfile(command["from"], here)
                 answer = {"event": "sent", "path": path}
+            elif op == "find":
+                wanted, entries = command.get("text", "").lower(), []
+                for folder, names, files_in in os.walk(here):
+                    for name in names + files_in:
+                        if wanted in name.lower():
+                            full = os.path.join(folder, name)
+                            entries.append({"name": name, "path": "/" + os.path.relpath(full, root),
+                                            "folder": os.path.isdir(full), "size": os.path.getsize(full),
+                                            "modified": int(os.path.getmtime(full))})
+                answer = {"event": "found", "path": path, "entries": entries}
             else:
                 continue
         except OSError as error:

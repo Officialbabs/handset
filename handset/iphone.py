@@ -33,7 +33,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 from dataclasses import dataclass
 
-from gi.repository import GLib
+from gi.repository import Gio, GLib
 
 from .gestures import Gesture
 from .log import DEBUG, debug
@@ -536,17 +536,72 @@ class ClipboardLink:
 
 
 class FilesSession:
-    """An iPhone's media files (its photos, Downloads, recordings), through the helper's `files`
-    session: one helper while it's open, a command at a time. Slow calls: off the main loop. The
-    same calls as android.AdbFiles."""
+    """An iPhone's files, through the helper's `files` session: its media folders (photos,
+    recordings…), and under "On My iPhone" the apps that share their Documents (VLC, LocalSend…),
+    which the iPhone's Files app shows under On My iPhone too. One helper while it's open, a
+    command at a time. Slow calls: off the main loop. The same calls as android.AdbFiles."""
 
     top = "/"
-    downloads = "/Downloads"
+    downloads = "/Downloads"  # iTunes' own, which nothing on the iPhone shows: for nothing new
+    apps_root = "/On My iPhone"
+    # Which apps share their files is asked once a day (asking each app takes a while).
+    SHARING_FOR_S = 24 * 3600
+    # Where dropped files go, the first of these that shares its files: videos and sound into VLC
+    # (they show in its library), the rest into a file-transfer app's, a browser's at least.
+    FOR_MEDIA = ("org.videolan.vlc-ios",)
+    FOR_FILES = ("org.localsend.localsendApp", "com.google.chrome.ios")
 
     def __init__(self, link: Link):
         self.link = link
         self.process: subprocess.Popen | None = None
         self.lock = threading.Lock()
+        self._sharing: dict[str, str] | None = None
+
+    def sharing(self) -> dict[str, str]:
+        """The iPhone's apps that share their Documents: bundle id → name. Kept for a day."""
+        if self._sharing is not None:
+            return self._sharing
+        from . import apps
+
+        names = {app.app: app.name for app in apps.entries(self.link.udid)}
+        kept = os.path.join(apps.cache_dir(self.link.udid), "sharing.json")
+        try:
+            with open(kept) as file:
+                saved = json.load(file)
+            if time.time() - saved.get("time", 0) < self.SHARING_FOR_S:
+                self._sharing = {b: names.get(b, b) for b in saved.get("bundles", [])}
+                return self._sharing
+        except (OSError, ValueError, AttributeError):
+            pass
+        answer = self._ask({"op": "sharing", "bundles": sorted(names)}) if names else {"bundles": []}
+        if isinstance(answer, str):
+            return {}
+        bundles = [b for b in answer.get("bundles", []) if isinstance(b, str)]
+        os.makedirs(os.path.dirname(kept), exist_ok=True)
+        with open(kept, "w") as file:
+            json.dump({"time": time.time(), "bundles": bundles}, file)
+        self._sharing = {b: names.get(b, b) for b in bundles}
+        return self._sharing
+
+    def display(self, path: str) -> list[str]:
+        """A path's folders as a person reads them: an app's by its name."""
+        parts = [part for part in path.split("/") if part]
+        if parts[:1] == [self.apps_root.strip("/")] and len(parts) >= 2:
+            parts[1] = self.sharing().get(parts[1], parts[1])
+        return parts
+
+    def drop_folder(self, paths: list[str]) -> tuple[str, str]:
+        """Where files dropped on the iPhone go, and how a person finds them there: an app's
+        files the Files app shows (VLC for videos and sound), else its media Downloads (seen
+        nowhere on the iPhone: said so)."""
+        sharing = self.sharing()
+        kinds = [Gio.content_type_guess(path, None)[0] or "" for path in paths]
+        media = bool(kinds) and all(k.startswith(("video/", "audio/")) for k in kinds)
+        wanted = (self.FOR_MEDIA if media else ()) + self.FOR_FILES + self.FOR_MEDIA
+        bundle = next((b for b in wanted if b in sharing), next(iter(sharing), None))
+        if bundle is None:
+            return self.downloads, "media Downloads (no app on it shares its files, so nothing on it shows them)"
+        return f"{self.apps_root}/{bundle}", f"Files › On My iPhone › {sharing[bundle]}"
 
     def _ask(self, command: dict) -> dict | str:
         """One command's answer, or why there's none, in words."""
@@ -563,19 +618,24 @@ class FilesSession:
             try:
                 self.process.stdin.write((json.dumps(command) + "\n").encode())
                 self.process.stdin.flush()
-                line = self.process.stdout.readline()
+                answer = None
+                while answer is None:
+                    line = self.process.stdout.readline()
+                    if not line:
+                        break
+                    try:
+                        answer = json.loads(line)
+                    except ValueError:
+                        # Not an answer: a word from the crate under the helper (on the same output).
+                        debug("iphone files helper:", line.decode(errors="replace").strip())
             except OSError as error:
                 return str(error)
-            if not line:
+            if answer is None:
                 why = self.process.stderr.read().decode(errors="replace") if self.process.poll() is not None else ""
                 message = next((json.loads(l).get("message") for l in why.splitlines()
                                 if l.startswith("{") and '"error"' in l), None)
                 self.process = None
                 return plainly(message or "The iPhone didn't answer.")
-            try:
-                answer = json.loads(line)
-            except ValueError:
-                return "The iPhone helper said something odd."
             if answer.get("event") == "error":
                 return str(answer.get("message") or "It didn't work.")
             return answer
@@ -583,12 +643,30 @@ class FilesSession:
     def list_folder(self, folder: str) -> list | str:
         from .android import PhoneFile
 
+        if folder.rstrip("/") == self.apps_root:
+            return sorted((PhoneFile(name, f"{self.apps_root}/{bundle}", True, 0, time.time())
+                           for bundle, name in self.sharing().items()), key=lambda f: f.name.casefold())
         answer = self._ask({"op": "list", "path": folder})
         if isinstance(answer, str):
             return answer
         found = [PhoneFile(e["name"], f"{folder.rstrip('/')}/{e['name']}", bool(e.get("folder")),
                            int(e.get("size") or 0), float(e.get("modified") or 0))
                  for e in answer.get("entries", []) if e.get("name") and not e["name"].startswith(".")]
+        found = sorted(found, key=lambda f: (not f.folder, f.name.casefold()))
+        if folder.rstrip("/") == "" and self.sharing():
+            found.insert(0, PhoneFile("On My iPhone", self.apps_root, True, 0, time.time()))
+        return found
+
+    def find_files(self, folder: str, text: str) -> list | str:
+        """What's named like `text` (any case) in the folder and the folders in it."""
+        from .android import PhoneFile
+
+        answer = self._ask({"op": "find", "path": folder, "text": text})
+        if isinstance(answer, str):
+            return answer
+        found = [PhoneFile(e["name"], e["path"], bool(e.get("folder")), int(e.get("size") or 0),
+                           float(e.get("modified") or 0))
+                 for e in answer.get("entries", []) if e.get("name") and e.get("path")]
         return sorted(found, key=lambda f: (not f.folder, f.name.casefold()))
 
     def fetch_file(self, path: str, folder: str) -> str | None:

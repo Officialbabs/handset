@@ -98,6 +98,15 @@ class TurningTest(unittest.TestCase):
         self.assertEqual(even_size((1081, 1201), 0), (1080, 1200))
 
 
+class FoundTest(unittest.TestCase):
+    def test_what_a_search_found(self):
+        data = (b"drwxrwx--x\t4096\t1.5\t/sdcard/DCIM\0-rw-rw----\t10\t2.5\t/sdcard/DCIM/a photo.jpg\0"
+                b"-rw-rw----\t1\t1\t/sdcard/.thumbnails/a photo.jpg\0")
+        found = android.parse_found(data)
+        self.assertEqual([(f.name, f.path, f.folder) for f in found],
+                         [("DCIM", "/sdcard/DCIM", True), ("a photo.jpg", "/sdcard/DCIM/a photo.jpg", False)])
+
+
 class BitRateTest(unittest.TestCase):
     def test_more_over_a_cable(self):
         self.assertEqual(android.bit_rate("0A1B2C3D4E5F6G"), android.CABLE_BIT_RATE)

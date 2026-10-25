@@ -13,6 +13,11 @@ StartupWMClass=io.github.Officialbabs.Handset
 StartupNotify=true
 SingleMainWindow=true
 Actions=new-window;off;
+# A switch in Ada's Control Center: on while Handset is (it keeps handset.on in the runtime
+# folder); switching it on starts Handset, off runs the Turn Off action.
+X-Ada-ControlCenter=toggle
+X-Ada-ControlCenter-State=handset.on
+X-Ada-ControlCenter-Name=Handset
 
 [Desktop Action new-window]
 Name=New Window

@@ -1443,6 +1443,45 @@ def parse_listing(data: bytes, folder: str) -> list[PhoneFile]:
     return sorted(found, key=lambda f: (not f.folder, f.name.casefold()))
 
 
+# A search gives at most this many of what it finds.
+MOST_FOUND = 300
+
+
+def parse_found(data: bytes) -> list[PhoneFile]:
+    """`find -printf '%M\\t%s\\t%T@\\t%p\\0'` output (whole paths): hidden ones and what's in
+    hidden folders left out, at most MOST_FOUND, folders first, then by name."""
+    found = []
+    for entry in data.split(b"\0"):
+        parts = entry.decode(errors="surrogateescape").split("\t", 3)
+        if len(parts) != 4 or not parts[3]:
+            continue
+        mode, size, when, path = parts
+        if any(part.startswith(".") for part in path.split("/") if part):
+            continue
+        try:
+            found.append(PhoneFile(path.rsplit("/", 1)[-1], path, mode.startswith("d"), int(size), float(when)))
+        except ValueError:
+            continue
+        if len(found) >= MOST_FOUND:
+            break
+    return sorted(found, key=lambda f: (not f.folder, f.name.casefold()))
+
+
+def find_files(serial: str, folder: str, text: str) -> list[PhoneFile] | str:
+    """What's named like `text` (any case) in a folder on the phone and the folders in it."""
+    pattern = "*" + "".join("\\" + c if c in "*?[]\\" else c for c in text) + "*"
+    # Hidden folders and apps' own data (Android/data, Android/obb) aren't looked through: slow, and
+    # nothing a person keeps there.
+    command = (f"find {shlex.quote(folder.rstrip('/') + '/')} -mindepth 1 "
+               "\\( -name '.*' -o -path '*/Android/data' -o -path '*/Android/obb' \\) -prune -o "
+               f"-iname {shlex.quote(pattern)} -printf '%M\\t%s\\t%T@\\t%p\\0' 2>/dev/null")
+    try:
+        result = subprocess.run(adb_command(serial, "exec-out", command), capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"The phone didn't answer ({error})."
+    return parse_found(result.stdout)
+
+
 def list_folder(serial: str, folder: str) -> list[PhoneFile] | str:
     """What's in a folder on the phone, or why not, in words."""
     quoted = shlex.quote(folder.rstrip("/") + "/")
@@ -1527,6 +1566,13 @@ class AdbFiles:
 
     def fetch_file(self, path: str, folder: str) -> str | None:
         return fetch_file(self.serial, path, folder)
+
+    def find_files(self, folder: str, text: str) -> list[PhoneFile] | str:
+        return find_files(self.serial, folder, text)
+
+    def drop_folder(self, _paths: list[str]) -> tuple[str, str]:
+        """Where files dropped on the phone go, and how a person finds them there."""
+        return self.downloads, "Download folder"
 
     def send_files(self, paths: list[str], folder: str) -> tuple[list[str], str | None]:
         return send_files(self.serial, paths, folder)

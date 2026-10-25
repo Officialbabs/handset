@@ -70,6 +70,9 @@ class App(Adw.Application):
     def _started(self, _app):
         from .appsync import start_if_needed
         from .clipboard import ClipboardSync
+        from .scope import move_to_own_scope
+
+        move_to_own_scope()  # counted as Handset, whichever phone app's entry started it
 
         self.clipboard = ClipboardSync(self)
         from .sound import SoundSwitch

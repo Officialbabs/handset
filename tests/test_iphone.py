@@ -180,8 +180,56 @@ class FakeHelper(unittest.TestCase):
             with open(got) as file:
                 self.assertEqual(file.read(), "from the iPhone")
             self.assertIsInstance(session.list_folder("/Nowhere"), str)
+            with open(os.path.join(media, "DCIM", "100APPLE", "IMG_0042.HEIC"), "w") as file:
+                file.write("a photo")
+            found = session.find_files("/", "img_00")
+            self.assertEqual([(f.name, f.path) for f in found], [("IMG_0042.HEIC", "/DCIM/100APPLE/IMG_0042.HEIC")])
         finally:
             session.stop()
+
+    def test_apps_that_share_their_files(self):
+        from handset import apps
+        from handset.apps import PhoneApp
+
+        saved = {k: os.environ.get(k) for k in ("XDG_DATA_HOME", "XDG_CACHE_HOME")}
+        os.environ["XDG_DATA_HOME"] = os.path.join(self.tmp.name, "data")
+        os.environ["XDG_CACHE_HOME"] = os.path.join(self.tmp.name, "cache")
+        try:
+            for bundle, name in (("org.videolan.vlc-ios", "VLC"), ("org.localsend.localsendApp", "LocalSend"),
+                                 ("com.apple.calculator", "Calculator")):
+                apps.write_entry(PhoneApp("UDID-1", "Test iPhone", "ios", bundle, name))
+            os.makedirs(os.path.join(self.tmp.name, "apps", "org.videolan.vlc-ios"))
+            os.makedirs(os.path.join(self.tmp.name, "apps", "org.localsend.localsendApp"))
+            os.makedirs(os.path.join(self.tmp.name, "media", "DCIM"))
+            session = FilesSession(Link("UDID-1", "/p.rppairing", "192.168.18.10", FAKE_HELPER))
+            try:
+                self.assertEqual([f.name for f in session.list_folder("/")], ["On My iPhone", "DCIM"])
+                self.assertEqual([(f.name, f.path) for f in session.list_folder("/On My iPhone")],
+                                 [("LocalSend", "/On My iPhone/org.localsend.localsendApp"),
+                                  ("VLC", "/On My iPhone/org.videolan.vlc-ios")])
+                self.assertEqual(session.display("/On My iPhone/org.videolan.vlc-ios/Films"),
+                                 ["On My iPhone", "VLC", "Films"])
+                # Videos into VLC, the rest into LocalSend: where the Files app shows them.
+                self.assertEqual(session.drop_folder(["/x/clip.mp4"]),
+                                 ("/On My iPhone/org.videolan.vlc-ios", "Files › On My iPhone › VLC"))
+                self.assertEqual(session.drop_folder(["/x/notes.pdf"])[0], "/On My iPhone/org.localsend.localsendApp")
+                here = os.path.join(self.tmp.name, "clip.mp4")
+                with open(here, "w") as file:
+                    file.write("a video")
+                sent, trouble = session.send_files([here], "/On My iPhone/org.videolan.vlc-ios")
+                self.assertEqual((sent, trouble), (["/On My iPhone/org.videolan.vlc-ios/clip.mp4"], None))
+                self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "apps", "org.videolan.vlc-ios", "clip.mp4")))
+            finally:
+                session.stop()
+            # Asked once a day: the next session knows without asking.
+            again = FilesSession(Link("UDID-1", "/p.rppairing", "192.168.18.10", "/nonexistent"))
+            self.assertEqual(sorted(again.sharing().values()), ["LocalSend", "VLC"])
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def test_its_apps_and_their_icons(self):
         icons = os.path.join(self.tmp.name, "icons")

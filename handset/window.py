@@ -780,12 +780,13 @@ class Window(Adw.ApplicationWindow):
         self.say(f"Sending {count} to {name}…")
 
         def send():
-            sent, trouble = files.send_files(paths, files.downloads)
+            folder, where = files.drop_folder(paths)
+            sent, trouble = files.send_files(paths, folder)
             files.stop()
             if sent and not trouble:
-                words = f"In {name}'s Downloads: {count}"
+                words = f"{count} is on {name}: {where}"
             elif sent:
-                words = f"Some went to {name}'s Downloads; the rest didn't ({trouble})"
+                words = f"Some went to {name} ({where}); the rest didn't ({trouble})"
             else:
                 words = f"{count} didn't go to {name} ({trouble})"
             GLib.idle_add(self.say, words)

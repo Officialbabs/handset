@@ -1,5 +1,7 @@
 """The phone's files, in a dialog: its folders to look through, a file to save in Downloads here
 or to open with this computer's apps, and files from here to send into the folder looked at.
+Search (Ctrl+F, or just typing) narrows the folder shown at once, and a moment later looks
+through the folders in it too, each found thing with the folder it's in.
 Android's storage over adb (android.AdbFiles), an iPhone's media files (photos, Downloads,
 recordings) through Handset's helper (iphone.FilesSession).
 """
@@ -14,9 +16,12 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gio, GLib, GObject, Gtk  # noqa: E402
 
 from .service import Phone  # noqa: E402
+
+# Typing pauses this long before the folders below are searched too.
+SEARCH_AFTER_MS = 350
 
 def downloads_dir() -> str:
     return GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) or os.path.expanduser("~/Downloads")
@@ -46,14 +51,31 @@ class FilesDialog(Adw.Dialog):
         self.folder = self.top
         self.connect("closed", lambda _d: self.files and threading.Thread(target=self.files.stop, daemon=True).start())
         self.listing = 0  # each listing asked for; an older one coming late is let go
+        self.searched = 0  # each search below, the same
+        self.items = []  # the folder's own, as listed
+        self.search_timer = 0
 
         self.back = Gtk.Button(icon_name="go-up-symbolic", tooltip_text="Up a folder", sensitive=False)
         self.back.connect("clicked", lambda _b: self.open_folder(os.path.dirname(self.folder)))
         send = Gtk.Button(icon_name="document-send-symbolic", tooltip_text="Send files here from this computer")
         send.connect("clicked", self._choose_to_send)
+        searching = Gtk.ToggleButton(icon_name="system-search-symbolic", tooltip_text="Search (Ctrl+F)")
         header = Adw.HeaderBar()
         header.pack_start(self.back)
         header.pack_end(send)
+        header.pack_end(searching)
+        self.search = Gtk.SearchEntry(placeholder_text="Search in this folder and below", hexpand=True)
+        self.search.connect("search-changed", self._search_changed)
+        self.search_bar = Gtk.SearchBar(child=Adw.Clamp(child=self.search, maximum_size=420))
+        self.search_bar.connect_entry(self.search)
+        self.search_bar.set_key_capture_widget(self)
+        searching.bind_property("active", self.search_bar, "search-mode-enabled",
+                                GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE)
+        keys = Gtk.ShortcutController()
+        keys.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string("<Control>f"),
+                                           Gtk.CallbackAction.new(lambda *_a: (searching.set_active(True),
+                                                                               self.search.grab_focus(), True)[2])))
+        self.add_controller(keys)
         self.place = Gtk.Label(xalign=0, ellipsize=3, margin_start=12, margin_end=12, margin_top=4, margin_bottom=4)
         self.place.add_css_class("dim-label")
         self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, valign=Gtk.Align.START)
@@ -69,6 +91,7 @@ class FilesDialog(Adw.Dialog):
         self.toasts = Adw.ToastOverlay(child=self.stack)
         view = Adw.ToolbarView(content=self.toasts)
         view.add_top_bar(header)
+        view.add_top_bar(self.search_bar)
         view.add_top_bar(self.place)
         self.set_child(view)
         if files:
@@ -85,12 +108,15 @@ class FilesDialog(Adw.Dialog):
     # ---- A folder ---------------------------------------------------------------------------
 
     def open_folder(self, folder: str):
+        if self.search.get_text():
+            self.search.set_text("")  # a folder opened from what was found: shown whole
+        self.search_bar.set_search_mode(False)
         self.folder = folder
         self.listing += 1
+        self.searched += 1
         number = self.listing
         self.back.set_sensitive(folder.rstrip("/") != self.top.rstrip("/"))
-        inside = folder[len(self.top.rstrip("/")):]
-        self.place.set_label(" › ".join([self.phone.name] + [part for part in inside.split("/") if part]))
+        self.place.set_label(" › ".join([self.phone.name] + self._parts(folder)))
         self.stack.set_visible_child_name("loading")
 
         def work():
@@ -102,16 +128,78 @@ class FilesDialog(Adw.Dialog):
     def _listed(self, number: int, found):
         if number != self.listing:
             return GLib.SOURCE_REMOVE
+        self.items = found if isinstance(found, list) else []
+        if isinstance(found, str):
+            self._show(found, "Can't open it")
+        else:
+            self._show(self._narrowed(self.search.get_text().strip()))
+        return GLib.SOURCE_REMOVE
+
+    # ---- Search -----------------------------------------------------------------------------
+
+    def _narrowed(self, text: str) -> list:
+        """The folder's own things named like `text` (all of them, with none)."""
+        wanted = text.casefold()
+        return [item for item in self.items if wanted in item.name.casefold()]
+
+    def _search_changed(self, entry):
+        text = entry.get_text().strip()
+        if self.search_timer:
+            GLib.source_remove(self.search_timer)
+            self.search_timer = 0
+        self.searched += 1  # a search still going is let go
+        if self.stack.get_visible_child_name() != "loading":
+            self._show(self._narrowed(text))
+        self._say_where(text)
+        if text and self.files:
+            self.search_timer = GLib.timeout_add(SEARCH_AFTER_MS, self._search_below, text, self.searched)
+
+    def _parts(self, path: str) -> list[str]:
+        """A path's folders below the top, as a person reads them (an iPhone app's by its name)."""
+        inside = path[len(self.top.rstrip("/")):]
+        display = getattr(self.files, "display", None)
+        return display(inside) if display else [part for part in inside.split("/") if part]
+
+    def _say_where(self, text: str):
+        where = " › ".join([self.phone.name] + self._parts(self.folder))
+        self.place.set_label(f"“{text}” in {where} and below" if text else where)
+
+    def _search_below(self, text: str, number: int):
+        self.search_timer = 0
+        folder = self.folder
+
+        def work():
+            found = self.files.find_files(folder, text)
+            GLib.idle_add(self._found, number, found)
+
+        threading.Thread(target=work, daemon=True).start()
+        return GLib.SOURCE_REMOVE
+
+    def _found(self, number: int, found):
+        if number == self.searched:
+            if isinstance(found, str):
+                self.say(found)
+            else:
+                self._show(found, where=True)
+        return GLib.SOURCE_REMOVE
+
+    def _show(self, found, problem: str = "Nothing here", where: bool = False):
+        """Things listed (with the folder each is in, for what a search found), or why not."""
         self.list.remove_all()
         if isinstance(found, str) or not found:
-            self.problem.set_title("Nothing here" if not isinstance(found, str) else "Can't open it")
+            searched = bool(self.search.get_text().strip())
+            self.problem.set_title(problem if isinstance(found, str) else ("Nothing found" if searched else problem))
             self.problem.set_description(found if isinstance(found, str) else "")
             self.stack.set_visible_child_name("problem")
-            return GLib.SOURCE_REMOVE
+            return
         for item in found:
             row = Adw.ActionRow(title=GLib.markup_escape_text(item.name), activatable=True)
             when = time.strftime("%-d %b %Y, %H:%M", time.localtime(item.modified))
-            row.set_subtitle(when if item.folder else f"{size_words(item.size)} · {when}")
+            details = when if item.folder else f"{size_words(item.size)} · {when}"
+            if where:
+                parent = self._parts(os.path.dirname(item.path))
+                details = f"{' › '.join(parent) if parent else self.phone.name} · {details}"
+            row.set_subtitle(GLib.markup_escape_text(details))
             content_type, _uncertain = Gio.content_type_guess(item.name, None)
             icon = "folder-symbolic" if item.folder else None
             image = Gtk.Image.new_from_icon_name(icon) if icon else Gtk.Image.new_from_gicon(
@@ -130,7 +218,6 @@ class FilesDialog(Adw.Dialog):
                 row.connect("activated", lambda _r, path=item.path: self._fetch(path, opened_dir(self.phone.id), True))
             self.list.append(row)
         self.stack.set_visible_child_name("list")
-        return GLib.SOURCE_REMOVE
 
     # ---- Files both ways ----------------------------------------------------------------------
 
@@ -166,6 +253,9 @@ class FilesDialog(Adw.Dialog):
         if not paths:
             return
         folder = self.folder
+        apps_root = getattr(self.files, "apps_root", None)
+        if apps_root and folder.rstrip("/") in ("", apps_root):
+            folder = self.files.drop_folder(paths)[0]  # the list of apps, or the top: into an app's
         self.say(f"Sending {len(paths)} file{'s' if len(paths) > 1 else ''}…")
 
         def work():

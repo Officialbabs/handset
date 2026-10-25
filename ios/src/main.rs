@@ -25,6 +25,9 @@
 //! {"op":"list","path"} → {"event":"list","path","entries":[{"name","folder","size","modified"}]};
 //! {"op":"fetch","path","to"} → {"event":"fetched","path"} (to: a file here);
 //! {"op":"send","from","path"} → {"event":"sent","path"} (from: a file here);
+//! {"op":"remove","path"} → {"event":"removed","path"};
+//! {"op":"find","path","text"} → {"event":"found","path","entries":[{"name","path","folder","size","modified"}]}
+//! (named like the text, in any case, in the folder and the folders in it);
 //! or {"event":"error","op","path","message"}.
 //!
 //!     handset-ios stream --pairing FILE --udid UDID [--address IP] [--port PORT] [--verbose]
@@ -43,7 +46,8 @@ use idevice::core_device_proxy::CoreDeviceProxy;
 use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection};
 use idevice::{IdeviceService, RsdService};
 use idevice::core_device::{
-    AppIconTarget, AppServiceClient, CallInfoBlob, DataInclusionPolicy, GENERAL_PASTEBOARD, IconServiceClient,
+    AppIconTarget, AppServiceClient, CallInfoBlob, DataInclusionPolicy, Domain, FileServiceClient, GENERAL_PASTEBOARD,
+    IconServiceClient,
     PasteboardServiceClient, PasteboardSnapshot, DisplayServiceClient, HevcDepacketizer, RtpPacket, build_screen_audio_offer,
     build_start_audio_parameters, build_start_video_parameters,
 };
@@ -77,6 +81,8 @@ const REACH_FOR: Duration = Duration::from_secs(20);
 /// Where iPhones' remote pairing listens, when looking it up finds nothing (as Ada's desktop
 /// has always found it).
 const PAIRING_PORT: u16 = 49152;
+/// Bytes in each TCP segment through the cable's tunnel (by_cable).
+const CABLE_SEGMENT: usize = 8000;
 /// The phone's stream going this quiet means someone stopped it: the phone has one screen
 /// stream for everyone, and stopping it stops them all (Ada's desktop does when it gets the phone
 /// ready for her). It's started again.
@@ -526,6 +532,7 @@ async fn clipboard(options: Options) -> Fallible<()> {
 async fn files(options: Options) -> Fallible<()> {
     let (_way, (mut adapter, mut handshake)) = reach(&options).await?;
     let mut afc = AfcClient::connect_rsd(&mut adapter, &mut handshake).await?;
+    let mut apps: std::collections::HashMap<String, AfcClient> = std::collections::HashMap::new();
     say(json!({"event": "files", "ready": true}));
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -533,15 +540,168 @@ async fn files(options: Options) -> Fallible<()> {
         let field = |name: &str| command.get(name).and_then(Value::as_str).unwrap_or("").to_string();
         let (op, path) = (field("op"), field("path"));
         let answer = match op.as_str() {
-            "list" => list_folder(&mut afc, &path).await,
-            "fetch" => fetch_file(&mut afc, &path, &field("to")).await,
-            "send" => send_file(&mut afc, &field("from"), &path).await,
+            "list" | "fetch" | "send" | "remove" | "find" => {
+                match place(&mut afc, &mut apps, &mut adapter, &mut handshake, &path).await {
+                    Err(why) => Err(why),
+                    Ok((files, inside)) => match op.as_str() {
+                        "list" => list_folder(files, &inside).await,
+                        "fetch" => fetch_file(files, &inside, &field("to")).await,
+                        "send" => send_file(files, &field("from"), &inside).await,
+                        "remove" => files.remove(&inside).await.map(|_| json!({"event": "removed"})).map_err(Into::into),
+                        _ => find_files(files, &inside, &field("text")).await.map(|found| outside(found, &inside, &path)),
+                    }
+                    .map(|mut answer| {
+                        answer["path"] = json!(path);
+                        answer
+                    }),
+                }
+            }
+            "container-list" => container_list(&mut adapter, &mut handshake, &field("domain"), &field("identifier"), &path).await,
+            "sharing" => sharing_apps(&mut adapter, &mut handshake, &command).await,
             _ => continue,
         };
         let answer = answer.unwrap_or_else(|why| json!({"event": "error", "op": op, "path": path, "message": why.to_string()}));
         println!("{answer}");
     }
     Ok(())
+}
+
+/// A search gives at most this many of what it finds, and looks through at most this many folders.
+const MOST_FOUND: usize = 300;
+const MOST_FOLDERS: usize = 2000;
+/// The media folders iOS keeps for itself (Photos' own database and thumbnails, iTunes' copies
+/// under made-up names…): nothing a person looks for by name, and PhotoData alone takes a search
+/// many seconds.
+const INTERNAL: [&str; 6] = ["PhotoData", "MediaAnalysis", "Deferred", "Espresso", "EnhancedAudioSharedKeys", "iTunes_Control"];
+
+/// Whether a name is a file's by its look ("IMG_0042.HEIC"): such a name not wanted isn't asked
+/// about, which keeps a search through thousands of photos to a request a folder.
+fn looks_like_a_file(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty() && (1..=5).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric())
+    })
+}
+
+/// What's named like `text` (any case) in `path` and the folders in it, nearest first; hidden
+/// ones left out.
+async fn find_files(afc: &mut AfcClient, path: &str, text: &str) -> Fallible<Value> {
+    let wanted = text.to_lowercase();
+    let mut folders = std::collections::VecDeque::from([path.trim_end_matches('/').to_string()]);
+    let (mut found, mut looked) = (Vec::new(), 0);
+    while let Some(folder) = folders.pop_front() {
+        looked += 1;
+        if looked > MOST_FOLDERS || found.len() >= MOST_FOUND {
+            break;
+        }
+        let Ok(names) = afc.list_dir(if folder.is_empty() { "/" } else { folder.as_str() }).await else {
+            continue;
+        };
+        for name in names {
+            if name.starts_with('.') || (folder.is_empty() && INTERNAL.contains(&name.as_str())) {
+                continue;
+            }
+            let matches = name.to_lowercase().contains(&wanted);
+            if !matches && looks_like_a_file(&name) {
+                continue;
+            }
+            let full = format!("{folder}/{name}");
+            let Ok(info) = afc.get_file_info(&full).await else { continue };
+            let is_folder = info.st_ifmt == "S_IFDIR";
+            if matches && found.len() < MOST_FOUND {
+                found.push(json!({
+                    "name": name,
+                    "path": full,
+                    "folder": is_folder,
+                    "size": info.size,
+                    "modified": info.modified.and_utc().timestamp(),
+                }));
+            }
+            if is_folder {
+                folders.push_back(full);
+            }
+        }
+    }
+    Ok(json!({"event": "found", "path": path, "entries": found}))
+}
+
+/// An app's Documents, as Handset names them: "/On My iPhone/<bundle id>/…". Files there show in
+/// the iPhone's Files app, under On My iPhone › the app (for apps that share their Documents).
+const APPS_ROOT: &str = "/On My iPhone";
+
+/// The bundle id and the path inside its container, for a path in an app's Documents.
+fn in_app(path: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix(APPS_ROOT)?.strip_prefix('/')?;
+    let (bundle, inner) = rest.split_once('/').unwrap_or((rest, ""));
+    (!bundle.is_empty()).then(|| (bundle.to_string(), format!("/Documents/{inner}").trim_end_matches('/').to_string()))
+}
+
+/// The files a path is among (the media folders', or an app's, opened once through house
+/// arrest), and the path there.
+async fn place<'a>(
+    media: &'a mut AfcClient,
+    apps: &'a mut std::collections::HashMap<String, AfcClient>,
+    adapter: &mut idevice::tcp::handle::AdapterHandle,
+    handshake: &mut RsdHandshake,
+    path: &str,
+) -> Fallible<(&'a mut AfcClient, String)> {
+    let Some((bundle, inside)) = in_app(path) else {
+        return Ok((media, path.to_string()));
+    };
+    if !apps.contains_key(&bundle) {
+        let arrest = idevice::services::house_arrest::HouseArrestClient::connect_rsd(adapter, handshake).await?;
+        let documents = arrest
+            .vend_documents(bundle.clone())
+            .await
+            .map_err(|_| format!("That app doesn't share its files ({bundle})."))?;
+        apps.insert(bundle.clone(), documents);
+    }
+    Ok((apps.get_mut(&bundle).ok_or("no such app")?, inside))
+}
+
+/// A search's paths inside an app's container, as Handset names them (under APPS_ROOT).
+fn outside(mut found: Value, inside: &str, asked: &str) -> Value {
+    if let Some(entries) = found.get_mut("entries").and_then(Value::as_array_mut) {
+        for entry in entries {
+            if let Some(path) = entry.get("path").and_then(Value::as_str) {
+                let rest = path.strip_prefix(inside).unwrap_or(path);
+                entry["path"] = json!(format!("{}{}", asked.trim_end_matches('/'), rest));
+            }
+        }
+    }
+    found
+}
+
+/// Which of the given apps share their Documents (UIFileSharingEnabled): the ones the phone opens
+/// them for. Files there show in the Files app, under On My iPhone › the app.
+async fn sharing_apps(
+    adapter: &mut idevice::tcp::handle::AdapterHandle,
+    handshake: &mut RsdHandshake,
+    command: &Value,
+) -> Fallible<Value> {
+    let mut sharing = Vec::new();
+    let bundles = command.get("bundles").and_then(Value::as_array).cloned().unwrap_or_default();
+    for bundle in bundles.iter().filter_map(Value::as_str) {
+        let arrest = idevice::services::house_arrest::HouseArrestClient::connect_rsd(&mut *adapter, &mut *handshake).await?;
+        if arrest.vend_documents(bundle).await.is_ok() {
+            sharing.push(bundle.to_string());
+        }
+    }
+    Ok(json!({"event": "sharing", "bundles": sharing}))
+}
+
+/// A folder in an app's (or app group's) container, through CoreDevice's file service.
+async fn container_list(
+    adapter: &mut idevice::tcp::handle::AdapterHandle,
+    handshake: &mut RsdHandshake,
+    domain: &str,
+    identifier: &str,
+    path: &str,
+) -> Fallible<Value> {
+    let mut files = FileServiceClient::connect_rsd(adapter, handshake).await?;
+    let domain = Domain::from_name(domain).ok_or("no such domain")?;
+    files.create_session(domain, identifier).await?;
+    let names = files.retrieve_directory_list(path).await?;
+    Ok(json!({"event": "container-list", "path": path, "names": names}))
 }
 
 async fn list_folder(afc: &mut AfcClient, path: &str) -> Fallible<Value> {
@@ -563,20 +723,49 @@ async fn list_folder(afc: &mut AfcClient, path: &str) -> Fallible<Value> {
     Ok(json!({"event": "list", "path": path, "entries": entries}))
 }
 
+/// Files go both ways a megabyte at a time, each piece one AFC request.
+const PIECE: usize = 1024 * 1024;
+
 async fn fetch_file(afc: &mut AfcClient, path: &str, to: &str) -> Fallible<Value> {
     let mut file = afc.open(path, AfcFopenMode::RdOnly).await?;
-    let mut out = tokio::fs::File::create(to).await?;
-    tokio::io::copy(&mut file, &mut out).await?;
-    file.close().await?;
+    let copied: Fallible<()> = async {
+        let mut out = tokio::fs::File::create(to).await?;
+        loop {
+            let piece = file.read_n(PIECE).await?;
+            if piece.is_empty() {
+                break;
+            }
+            tokio::io::AsyncWriteExt::write_all(&mut out, &piece).await?;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut out).await?;
+        Ok(())
+    }
+    .await;
+    // Closed whatever happened: the crate says so on standard output otherwise, where Handset
+    // reads only answers.
+    let closed = file.close().await;
+    copied?;
+    closed?;
     Ok(json!({"event": "fetched", "path": path, "to": to}))
 }
 
 async fn send_file(afc: &mut AfcClient, from: &str, path: &str) -> Fallible<Value> {
     let mut input = tokio::fs::File::open(from).await?;
     let mut file = afc.open(path, AfcFopenMode::WrOnly).await?;
-    tokio::io::copy(&mut input, &mut file).await?;
-    tokio::io::AsyncWriteExt::flush(&mut file).await?;
-    file.close().await?;
+    let copied: Fallible<()> = async {
+        let mut piece = vec![0u8; PIECE];
+        loop {
+            let length = tokio::io::AsyncReadExt::read(&mut input, &mut piece).await?;
+            if length == 0 {
+                return Ok(());
+            }
+            file.write_entire(&piece[..length]).await?;
+        }
+    }
+    .await;
+    let closed = file.close().await;
+    copied?;
+    closed?;
     Ok(json!({"event": "sent", "path": path}))
 }
 
@@ -607,10 +796,14 @@ async fn stream(options: Options) -> Fallible<()> {
 /// is used and the other given up, the cable first when both are there together. Neither
 /// reaching it, the cable's reason counts when the phone is plugged in, Wi-Fi's otherwise.
 async fn reach(options: &Options) -> Fallible<(&'static str, Reached)> {
+    // Plugged in, the cable it is: Wi-Fi is often ready first, but the cable is faster and keeps
+    // the picture off the network; a Wi-Fi link that comes first is kept in case the cable's fails.
+    let plugged = plugged_in(&options.udid).await;
     let cable = tokio::time::timeout(REACH_FOR, by_cable(&options.udid));
     let wifi = by_wifi(options);
     tokio::pin!(cable, wifi);
     let (mut cable_missed, mut wifi_missed): (Option<Missed>, Option<String>) = (None, None);
+    let mut wifi_kept: Option<Reached> = None;
     loop {
         tokio::select! {
             biased;
@@ -619,10 +812,16 @@ async fn reach(options: &Options) -> Fallible<(&'static str, Reached)> {
                 Ok(Err(missed)) => cable_missed = Some(missed),
                 Err(_) => cable_missed = Some(Missed::Failed("The iPhone is plugged in but didn't answer: unlock it.".into())),
             },
-            result = &mut wifi, if wifi_missed.is_none() => match result {
+            result = &mut wifi, if wifi_missed.is_none() && wifi_kept.is_none() => match result {
+                Ok(reached) if plugged && cable_missed.is_none() => wifi_kept = Some(reached),
                 Ok(reached) => return Ok(("over Wi-Fi", reached)),
                 Err(why) => wifi_missed = Some(why.to_string()),
             },
+        }
+        if cable_missed.is_some() {
+            if let Some(reached) = wifi_kept.take() {
+                return Ok(("over Wi-Fi", reached));
+            }
         }
         if let (Some(cable), Some(wifi)) = (&cable_missed, &wifi_missed) {
             return Err(match cable {
@@ -632,6 +831,14 @@ async fn reach(options: &Options) -> Fallible<(&'static str, Reached)> {
             .into());
         }
     }
+}
+
+/// Whether the phone is on a cable now (usbmuxd sees it over USB).
+async fn plugged_in(udid: &str) -> bool {
+    let Ok(mut usbmuxd) = UsbmuxdConnection::default().await else {
+        return false;
+    };
+    usbmuxd.get_device(udid).await.is_ok_and(|device| device.connection_type == Connection::Usb)
 }
 
 /// The phone by its cable: usbmuxd lists it while it's plugged in, and the pairing the phone keeps
@@ -648,7 +855,15 @@ async fn by_cable(udid: &str) -> Result<Reached, Missed> {
         .await
         .map_err(|e| failed(e.to_string()))?;
     let rsd_port = proxy.tunnel_info().server_rsd_port;
-    let mut adapter = proxy.create_software_tunnel().map_err(|e| failed(e.to_string()))?.to_async_handle();
+    let mut stack = proxy.create_software_tunnel().map_err(|e| failed(e.to_string()))?;
+    // Segments the size the tunnel says it takes (its MTU less headers, near 16000) are never
+    // acknowledged: whatever sends more than a few kilobytes at once (a file) stalls until the
+    // link gives up. Half that size goes through, at the cable's full speed.
+    stack.set_mss(CABLE_SEGMENT);
+    if let Ok(capture) = std::env::var("HANDSET_PCAP") {
+        stack.pcap(capture).await.map_err(|e| failed(e.to_string()))?;
+    }
+    let mut adapter = stack.to_async_handle();
     let services = adapter.connect(rsd_port).await.map_err(|e| failed(e.to_string()))?;
     let handshake = RsdHandshake::new(services).await.map_err(|e| failed(e.to_string()))?;
     Ok((adapter, handshake))
@@ -702,7 +917,13 @@ async fn over_wifi(ip: IpAddr, port: u16, pairing: &str) -> Fallible<Reached> {
     let host: IpAddr = tunnel.info.client_address.parse()?;
     let peer: IpAddr = tunnel.info.server_address.parse()?;
     let rsd_port = tunnel.info.server_rsd_port;
-    let mut adapter = Adapter::new(Box::new(tunnel.into_inner()), host, peer).to_async_handle();
+    let mtu = tunnel.info.mtu;
+    let mut stack = Adapter::new(Box::new(tunnel.into_inner()), host, peer);
+    if let Ok(capture) = std::env::var("HANDSET_PCAP") {
+        eprintln!("tunnel mtu {mtu}; capturing to {capture}");
+        stack.pcap(capture).await?;
+    }
+    let mut adapter = stack.to_async_handle();
     let handshake = RsdHandshake::new(adapter.connect(rsd_port).await?).await?;
     Ok((adapter, handshake))
 }
@@ -1071,6 +1292,26 @@ mod tests {
         let (ssrc, ntp) = (0x1234_5678, 0xE9C0_0000_8000_0000);
         assert_eq!(media_blob(ssrc, ntp, false, true, SCREEN_HEVC_FLS.as_bytes()), build_screen_media_blob(ssrc, ntp));
         assert_ne!(media_blob(ssrc, ntp, true, false, b"FLS;SW:1;"), build_screen_media_blob(ssrc, ntp));
+    }
+
+    #[test]
+    fn file_names_by_their_look() {
+        assert!(looks_like_a_file("IMG_0042.HEIC"));
+        assert!(looks_like_a_file("song.mp3"));
+        assert!(!looks_like_a_file("100APPLE"));
+        assert!(!looks_like_a_file(".hidden"));
+        assert!(!looks_like_a_file("Photos.photoslibrary-extra"));
+    }
+
+    #[test]
+    fn apps_documents_by_path() {
+        assert_eq!(in_app("/On My iPhone/org.videolan.vlc-ios"), Some(("org.videolan.vlc-ios".into(), "/Documents".into())));
+        assert_eq!(in_app("/On My iPhone/org.videolan.vlc-ios/clip.mp4"),
+                   Some(("org.videolan.vlc-ios".into(), "/Documents/clip.mp4".into())));
+        assert_eq!(in_app("/On My iPhone"), None);
+        assert_eq!(in_app("/DCIM/100APPLE"), None);
+        let found = json!({"entries": [{"path": "/Documents/a/b.mp4"}]});
+        assert_eq!(outside(found, "/Documents", "/On My iPhone/x")["entries"][0]["path"], "/On My iPhone/x/a/b.mp4");
     }
 
     #[test]
