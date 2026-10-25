@@ -406,3 +406,18 @@ python3 -m unittest discover -s tests -t .
 The tests use a stand-in Android phone (`tests/fakeadb.py`), a stand-in iPhone helper
 (`tests/fakeios.py`) and a stand-in phone service (`tests/fakeservice.py`); they never touch a
 real phone or the real service.
+
+## License
+
+Handset is free software: you can redistribute it and/or modify it under the terms of the GNU
+General Public License as published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version ([LICENSE](LICENSE)). It comes with no warranty.
+
+- **scrcpy's server**, which `install.sh` fetches from the scrcpy project and Handset sends to
+  Android phones, is Copyright © 2018 Genymobile and © 2018–2025 Romain Vimont, under the Apache
+  License 2.0.
+- **The Android robot** in Android phones' icons is reproduced or modified from work created and
+  shared by Google and used according to terms described in the Creative Commons 3.0 Attribution
+  License.
+- Android is a trademark of Google LLC; iPhone is a trademark of Apple Inc. Handset isn't
+  affiliated with or endorsed by either.
