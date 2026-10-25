@@ -1,5 +1,6 @@
 """Handset tests for listening to Ada's phone service, against a stand-in service."""
 
+import dataclasses
 import os
 import tempfile
 import time
@@ -124,3 +125,45 @@ class WatchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChoicesTest(unittest.TestCase):
+    """Handset's own say over each phone: switched off, it's offline to all of Handset; kept to its
+    cable, it's offline while it's on Wi-Fi alone."""
+
+    def test_switched_off_and_cable_only(self):
+        import json
+
+        pixel = Phone(id="P7", name="Pixel 7", platform="android", online=True, usb=True, wifi=False,
+                      ada_allowed=False, ada_doing=None, ada_paused=False, problem=None)
+        iphone = Phone(id="IPH", name="iPhone", platform="ios", online=True, usb=False, wifi=True,
+                       ada_allowed=False, ada_doing=None, ada_paused=False, problem=None)
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = os.environ.get("XDG_CONFIG_HOME")
+            os.environ["XDG_CONFIG_HOME"] = tmp
+            try:
+                self.assertEqual(service.as_handset_uses([pixel, iphone]), [pixel, iphone])  # nothing chosen
+                os.makedirs(os.path.join(tmp, "handset"))
+                with open(os.path.join(tmp, "handset", "settings.json"), "w") as file:
+                    json.dump({"disconnected": ["P7"], "cable_only": ["IPH"]}, file)
+                off, cable = service.as_handset_uses([pixel, iphone])
+                self.assertEqual((off.online, off.problem), (False, service.DISCONNECTED))
+                self.assertEqual((cable.online, cable.wifi, cable.problem), (False, False, service.CABLE_ONLY))
+                plugged = service.as_handset_uses([dataclasses.replace(iphone, usb=True)])[0]
+                self.assertEqual((plugged.online, plugged.problem), (True, None))  # by its cable: fine
+                # A watch tells its own again when they change.
+                told = []
+                choosing = service.Choosing(None, told.append)
+                choosing.heard = [pixel]
+                Choosing_all = service.Choosing.all
+                service.Choosing.all = [choosing]
+                try:
+                    service.refresh_all()
+                finally:
+                    service.Choosing.all = Choosing_all
+                self.assertEqual(told[0][0].problem, service.DISCONNECTED)
+            finally:
+                if saved is None:
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                else:
+                    os.environ["XDG_CONFIG_HOME"] = saved

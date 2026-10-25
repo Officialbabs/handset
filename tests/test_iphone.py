@@ -74,7 +74,7 @@ class LinkTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = (iphone.PAIRINGS, os.environ.get("HANDSET_IOS_HELPER"))
-        iphone.PAIRINGS = self.tmp.name
+        iphone.PAIRINGS = (self.tmp.name,)
 
     def tearDown(self):
         iphone.PAIRINGS = self.saved[0]
@@ -84,9 +84,11 @@ class LinkTest(unittest.TestCase):
             os.environ["HANDSET_IOS_HELPER"] = self.saved[1]
         self.tmp.cleanup()
 
-    def test_needs_the_pairing_ada_made(self):
+    def test_its_wifi_pairing_when_it_has_one(self):
         os.environ["HANDSET_IOS_HELPER"] = FAKE_HELPER
-        self.assertIn("Set the iPhone up with Ada", iphone.open_link("UDID-1", None))
+        cable_only = iphone.open_link("UDID-1", None)  # trusted by cable: that's enough
+        self.assertEqual(cable_only, Link("UDID-1", None, None, FAKE_HELPER))
+        self.assertEqual(cable_only.args("stream"), [FAKE_HELPER, "stream", "--udid", "UDID-1"])
         with open(os.path.join(self.tmp.name, "UDID-1.rppairing"), "w") as file:
             file.write("<plist/>")
         link = iphone.open_link("UDID-1", "192.168.18.10", "iPhone 12")
@@ -130,7 +132,7 @@ class FakeHelper(unittest.TestCase):
         self.assertEqual(self.touch, [True])
         with open(os.path.join(self.tmp.name, "args.json")) as file:
             args = json.load(file)
-        self.assertEqual(args[:5], ["stream", "--pairing", "/p.rppairing", "--udid", "UDID-1"])
+        self.assertEqual(args[:5], ["stream", "--udid", "UDID-1", "--pairing", "/p.rppairing"])
         self.assertIn("192.168.18.10", args)
 
     def test_an_app_opened_once_it_takes_input(self):
@@ -159,8 +161,44 @@ class FakeHelper(unittest.TestCase):
             time.sleep(0.4)
             self.assertEqual(heard, ["copied on the iPhone"])  # its own isn't heard back
             self.assertEqual([c["text"] for c in self.commands() if c.get("op") == "set"], ["copied on the computer"])
+            # A paste waits until the iPhone has what it pastes.
+            pasted = []
+            clip.set("to paste", then=lambda: pasted.append(open(os.path.join(self.tmp.name, "phone_clipboard")).read()))
+            spin(lambda: pasted)
+            self.assertEqual(pasted, ["to paste"])
         finally:
             clip.stop()
+
+    def test_images_on_its_clipboard(self):
+        saved = os.environ.get("XDG_RUNTIME_DIR")
+        os.environ["XDG_RUNTIME_DIR"] = self.tmp.name
+        images = []
+        clip = ClipboardLink(Link("UDID-1", "/p.rppairing", "192.168.18.10", FAKE_HELPER), lambda text: None,
+                             lambda path, mime: images.append((open(path, "rb").read(), mime)))
+        clip.start()
+        try:
+            spin(lambda: clip.process is not None and os.path.exists(os.path.join(self.tmp.name, "commands.jsonl")))
+            picture = os.path.join(self.tmp.name, "picture.png")
+            with open(picture, "wb") as file:
+                file.write(b"\x89PNG a picture")
+            done = []
+            clip.set_image(picture, "image/png", then=lambda: done.append(True))
+            spin(lambda: done)
+            with open(os.path.join(self.tmp.name, "phone_image"), "rb") as file:
+                self.assertEqual(file.read(), b"\x89PNG a picture")
+            set_image = next(c for c in self.commands() if c.get("op") == "set-image")
+            self.assertEqual(set_image["type"], "public.png")
+            # Copied on the iPhone: it comes here as a file.
+            with open(os.path.join(self.tmp.name, "copied_image"), "wb") as file:
+                file.write(b"\x89PNG from the phone")
+            spin(lambda: images)
+            self.assertEqual(images, [(b"\x89PNG from the phone", "image/png")])
+        finally:
+            clip.stop()
+            if saved is None:
+                os.environ.pop("XDG_RUNTIME_DIR", None)
+            else:
+                os.environ["XDG_RUNTIME_DIR"] = saved
 
     def test_its_files(self):
         media = os.path.join(self.tmp.name, "media")

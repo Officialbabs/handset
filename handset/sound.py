@@ -48,6 +48,18 @@ class SoundSwitch:
         else:
             self._stop(phone.id)
 
+    def choose(self, phone_id: str, on: bool, window=None):
+        """The choice made away from the phone's window (Handset's phones window): kept, and
+        carried out in `window` when it's the one showing the phone."""
+        if window is not None and window.phone and window.phone.id == phone_id:
+            self.switch(window, on)
+            window.sound_switched(on)
+            return
+        from .window import save_settings
+
+        self.app.settings["sound_here"] = [p for p in self.wanted() if p != phone_id] + ([phone_id] if on else [])
+        save_settings(self.app.settings)
+
     def resume(self, window):
         """The window's phone's sound, here if the person wants it so (when its window opens)."""
         phone = window.phone

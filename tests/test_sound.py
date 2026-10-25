@@ -4,6 +4,8 @@ import os
 import tempfile
 import unittest
 
+from gi.repository import GLib
+
 from handset import bluetooth, sound, window
 from handset.service import Phone
 
@@ -117,3 +119,28 @@ class KeepsTrying(FakeLink):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LetGoTest(unittest.TestCase):
+    """A phone that ended the Bluetooth link itself (disconnected on the phone) is left alone:
+    nothing asks it back, however its link comes and goes, until the person switches again."""
+
+    def test_disconnected_on_the_phone(self):
+        ended, asked = [], []
+        sound = bluetooth.BluetoothSound("Test iPhone", set(), ended.append)
+        sound._call = lambda method, uuid: asked.append(method)
+        sound._disconnected(None, None, None, None, None,
+                            GLib.Variant("(ss)", (bluetooth.ENDED_BY_PHONE, "Connection terminated by remote user")))
+        self.assertTrue(sound.let_go)
+        self.assertIn("disconnected", ended[0])
+        # Its notifications' link coming back doesn't bring its sound back.
+        sound._changed(None, None, None, None, None,
+                       GLib.Variant("(sa{sv}as)", ("org.bluez.Device1", {"Connected": GLib.Variant("b", True)}, [])))
+        sound.start()
+        self.assertEqual(asked, [])
+
+    def test_out_of_reach_comes_back(self):
+        sound = bluetooth.BluetoothSound("Test iPhone", set(), lambda why: None)
+        sound._disconnected(None, None, None, None, None,
+                            GLib.Variant("(ss)", ("org.bluez.Reason.Timeout", "Connection timeout")))
+        self.assertFalse(sound.let_go)

@@ -30,13 +30,15 @@ from .apps import PhoneApp
 from .log import debug
 from .media import NowPlaying, PhonePlayer
 from .notifications import Desk, Note
-from .service import Phone, Watch
+from .service import Phone, watch
 
 # A connected phone's apps are listed again this often, for the ones put on it or taken off.
 RELIST_S = 30 * 60
 RETRY_S = 2 * 60  # when listing them didn't work
 # Icons go into their entries this many at a time: the desk reads all its apps again each time.
 ICON_BATCH = 12
+# An iPhone not connected (by cable or Wi-Fi) this long: its notifications stop until it is again.
+AWAY_FOR_S = 60
 ICON_SIZE = 192
 
 
@@ -100,11 +102,24 @@ def known_iphones() -> set[str]:
         return set()
 
 
+def settings_file() -> str:
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(config, "handset", "settings.json")
+
+
+def phone_files_wanted() -> bool:
+    """Handset's settings may say no to the phones' folders ("phone_files": false)."""
+    try:
+        with open(settings_file()) as file:
+            return json.load(file).get("phone_files", True) is not False
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
 def notifications_wanted() -> bool:
     """Handset's settings may say no ("phone_notifications": false)."""
-    config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     try:
-        with open(os.path.join(config, "handset", "settings.json")) as file:
+        with open(settings_file()) as file:
             return json.load(file).get("phone_notifications", True) is not False
     except (OSError, ValueError, AttributeError):
         return True
@@ -112,7 +127,7 @@ def notifications_wanted() -> bool:
 
 class AppSync:
     def __init__(self):
-        self.watch = Watch(self._phones_changed)
+        self.watch = watch(self._phones_changed)
         self.desk: Desk | None = None
         self.notifiers: dict[str, object] = {}  # an Android phone's id → its notifications
         self.players: dict[str, PhonePlayer] = {}  # a phone's id → what it plays, on the desk
@@ -120,6 +135,10 @@ class AppSync:
         self.autopause = None  # one thing playing at a time (autopause.AutoPause)
         self.looking: set[tuple[str, str, str]] = set()  # covers being looked up
         self.ancs = None
+        self.away_timer = 0  # the iPhones went: their notifications stop when it's done
+        self.mounts: dict[str, object] = {}  # a phone's id → its folder here (phonefs.FileSystem)
+        self.mounting: set[str] = set()
+        self.phones_now: list[Phone] = []
         self.phone_names: dict[str, str] = {}
         self.online: dict[str, Phone] = {}
         self.listed: dict[str, float] = {}  # phone id → when its apps were last listed
@@ -137,6 +156,9 @@ class AppSync:
             self.autopause.stop()
         for player in self.players.values():
             player.stop()
+        for mounted in self.mounts.values():
+            mounted.stop()
+        self.mounts = {}
 
     def start(self):
         self.watch.start()
@@ -148,8 +170,39 @@ class AppSync:
         GLib.timeout_add_seconds(60, self._relist)
         apps.forget_old_icons()
         GLib.timeout_add_seconds(6 * 3600, lambda: (apps.forget_old_icons(), True)[1])
-        if notifications_wanted():
+        self.notifying = notifications_wanted()
+        if self.notifying:
             self._start_notifications()
+        # Switches flipped in Handset's window come here (its settings file, saved anew).
+        os.makedirs(os.path.dirname(settings_file()), exist_ok=True)
+        folder = Gio.File.new_for_path(os.path.dirname(settings_file()))
+        self.settings_monitor = folder.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        self.settings_monitor.connect("changed", self._settings_changed)
+
+    def _settings_changed(self, _monitor, file, _other, event):
+        if file.get_path() != settings_file() or event not in (Gio.FileMonitorEvent.CREATED,
+                                                                Gio.FileMonitorEvent.CHANGES_DONE_HINT):
+            return
+        from . import autopause
+
+        if autopause.wanted() and not self.autopause:
+            self.autopause = autopause.AutoPause(lambda: self.players)
+            self.autopause.start()
+        elif not autopause.wanted() and self.autopause:
+            self.autopause.stop()
+            self.autopause = None
+        from .service import refresh_all
+
+        refresh_all()  # a phone switched off or on, or kept to its cable, in Handset's window
+        self._mount_phones(self.phones_now)  # the phones' folders switched on or off
+        if notifications_wanted() != self.notifying:
+            # Notifications reach every phone's followers: this sync starts again, as it is now.
+            debug("notifications switched", "on" if not self.notifying else "off", "- the sync starts again")
+            GLib.idle_add(self._start_again)
+
+    def _start_again(self):
+        self.stop()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     # ---- Notifications ---------------------------------------------------------------------
 
@@ -164,6 +217,7 @@ class AppSync:
         self.ancs = Ancs(self._iphone_note, lambda phone_id, key: self.desk and self.desk.close(phone_id, key),
                          known_iphones, self._remember_iphone, self._iphone_media, self._iphone_app)
         self.ancs.start()
+        self._iphones_here(any(p.platform == "ios" for p in self.online.values()))
         folder = Gio.File.new_for_path(os.path.dirname(pair_request_path()))
         self.pair_monitor = folder.monitor_directory(Gio.FileMonitorFlags.NONE, None)
         self.pair_monitor.connect("changed", self._pair_asked)
@@ -188,10 +242,12 @@ class AppSync:
                 return
             player = self.players[phone_id] = PhonePlayer(phone_id, self.phone_names.get(phone_id, "Phone"), control)
         player.phone_name = self.phone_names.get(phone_id, player.phone_name)
-        started = bool(now and now.playing) and not (player.now and player.now.playing)
+        was, playing = bool(player.now and player.now.playing), bool(now and now.playing)
         player.show(now)
-        if started and self.autopause:
+        if self.autopause and playing and not was:
             self.autopause.phone_started(phone_id)
+        elif self.autopause and was and not playing:
+            self.autopause.phone_stopped(phone_id)  # what paused for it plays again
 
     def _iphone_media(self, now: NowPlaying | None):
         if self.ancs and self.ancs.media:
@@ -282,6 +338,9 @@ class AppSync:
     def _phones_changed(self, phones: list[Phone]):
         online = {p.id: p for p in phones if p.online}
         self.phone_names = {p.id: p.name for p in phones}
+        self.phones_now = phones
+        self._phone_entries(phones)
+        self._mount_phones(phones)
         iphones = [p.id for p in phones if p.platform == "ios"]
         if self.ancs and len(iphones) == 1 and self.ancs.phone_id != iphones[0]:
             # Its notes and what it plays go with its apps' entries.
@@ -291,6 +350,12 @@ class AppSync:
             self.ancs.phone_id = iphones[0]
             if self.ancs.media:
                 self._iphone_media(self.ancs.media.shown)
+        from .service import DISCONNECTED
+
+        iphones = [p for p in phones if p.platform == "ios"]
+        # Switched off in Handset: its notifications stop at once, not after a while.
+        self._iphones_here(any(p.online for p in iphones),
+                           at_once=bool(iphones) and all(p.problem == DISCONNECTED for p in iphones))
         gone = set(self.online) - set(online)
         came = set(online) - set(self.online)
         first, self.seen = not self.seen, True
@@ -310,6 +375,85 @@ class AppSync:
                 if player:
                     player.stop()
         self._relist()
+
+    # ---- The phones' folders (phonefs.py) --------------------------------------------------------
+
+    def _mount_phones(self, phones: list[Phone]):
+        """Each connected phone's files as a folder here (~/Phones/NAME), while it's connected."""
+        from .finder import UNTRUSTED
+
+        # Connected (a phone's service may say more of it: not on Wi-Fi, say), and trusting this computer.
+        wanted = {p.id: p for p in phones if p.online and p.problem != UNTRUSTED} if phone_files_wanted() else {}
+        for phone_id in [p for p in self.mounts if p not in wanted]:
+            threading.Thread(target=self.mounts.pop(phone_id).stop, daemon=True).start()
+        for phone in wanted.values():
+            if phone.id not in self.mounts and phone.id not in self.mounting:
+                self.mounting.add(phone.id)
+                threading.Thread(target=self._mount, args=(phone,), daemon=True).start()
+
+    def _mount(self, phone: Phone):
+        from . import android, iphone, phonefs
+
+        backend = None
+        if phone.platform == "ios":
+            link = iphone.open_link(phone.id, phone.address, phone.model)
+            backend = phonefs.IPhone(link) if isinstance(link, iphone.Link) else None
+        else:
+            serial = android.find_serial(phone.id, phone.address, phone.port)
+            backend = phonefs.Android(serial) if serial else None
+        mounted = None
+        if backend:
+            cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+            mounted = phonefs.FileSystem(backend, os.path.join(phonefs.phones_folder(), phonefs.folder_name(phone.name)),
+                                         os.path.join(cache, "handset", "files", phonefs.cache_name(phone.id)))
+            problem = mounted.start()
+            if problem:
+                debug(phone.name, "has no folder here:", problem)
+                mounted = None
+            else:
+                debug(phone.name, "is a folder here:", mounted.mountpoint)
+        GLib.idle_add(self._mounted, phone.id, mounted)
+
+    def _mounted(self, phone_id: str, mounted):
+        self.mounting.discard(phone_id)
+        if mounted is None:
+            return GLib.SOURCE_REMOVE
+        if phone_id not in self.online or not phone_files_wanted():  # gone meanwhile
+            threading.Thread(target=mounted.stop, daemon=True).start()
+        else:
+            self.mounts[phone_id] = mounted
+        return GLib.SOURCE_REMOVE
+
+    def _phone_entries(self, phones: list[Phone]):
+        """Each phone an entry of its own, opening its window (so the dock shows each under its own
+        icon); a phone the service no longer knows goes."""
+        try:
+            for phone in phones:
+                apps.write_phone_entry(phone.id, phone.name, phone.platform)
+            for phone_id in set(apps.phone_entries()) - {p.id for p in phones}:
+                apps.remove_phone_entry(phone_id)
+        except (OSError, GLib.Error) as error:
+            debug("the phones' entries weren't written:", error)
+
+    def _iphones_here(self, here: bool, at_once: bool = False):
+        """An iPhone's notifications only while it's connected by cable or Wi-Fi: on as soon as one
+        is, off once none has been for a while (a moment's drop, a phone waking, doesn't count), or
+        at once (it was switched off in Handset)."""
+        if not self.ancs:
+            return
+        if here or at_once:
+            if self.away_timer:
+                GLib.source_remove(self.away_timer)
+                self.away_timer = 0
+            self.ancs.allow(here)
+        elif self.ancs.allowed and not self.away_timer:
+            self.away_timer = GLib.timeout_add_seconds(AWAY_FOR_S, self._iphones_away)
+
+    def _iphones_away(self):
+        self.away_timer = 0
+        if self.ancs:
+            self.ancs.allow(False)
+        return GLib.SOURCE_REMOVE
 
     def _relist(self):
         for phone in self.online.values():
@@ -475,10 +619,14 @@ def icons_worker(serial: str, folder: str) -> int:
 
 
 def forget_all():
-    """Every phone app's entry and icon gone, and out of the dock (when Handset goes)."""
+    """Every phone app's entry and icon gone, and out of the dock (when Handset goes); the phones'
+    own entries too."""
     for app in apps.entries():
         apps.unpin(app.phone_id, app.app)
         apps.remove_entry(app.phone_id, app.app)
+    for phone_id in apps.phone_entries():
+        apps.dock(f"{apps.phone_app_id(phone_id)}.desktop", False)
+        apps.remove_phone_entry(phone_id)
 
 
 def main() -> int:

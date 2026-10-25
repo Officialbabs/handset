@@ -95,6 +95,7 @@ class SyncTest(unittest.TestCase):
         spin(lambda: len(apps.entries()) == 3)
         spin(lambda: not sync.busy)  # nothing of this test's left running into the next
         sync.watch.stop()
+        sync.stop()
 
     def test_entries_left_from_before_go_when_their_phone_isnt_here(self):
         apps.write_entry(apps.PhoneApp("GONE1", "Old phone", "android", "org.example.old", "Old"))
@@ -104,6 +105,7 @@ class SyncTest(unittest.TestCase):
         self.assertNotIn("Old", self.names())
         spin(lambda: not sync.busy)  # nothing of this test's left running into the next
         sync.watch.stop()
+        sync.stop()
 
     def asked(self):
         path = os.path.join(os.environ["FAKEADB_DIR"], "asked.txt")
@@ -130,6 +132,7 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.asked()[1], ["org.example.chat"])
         spin(lambda: not sync.busy)  # nothing of this test's left running into the next
         sync.watch.stop()
+        sync.stop()
 
     def test_one_sync_at_a_time(self):
         held = appsync.take_lock()
@@ -142,3 +145,40 @@ class SyncTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IPhoneNotificationsTest(unittest.TestCase):
+    """An iPhone's notifications follow whether it's connected (by cable or Wi-Fi): on at once,
+    off only after it's been gone a while."""
+
+    def test_on_at_once_off_after_a_while(self):
+        from types import SimpleNamespace
+
+        from handset import appsync
+
+        sync = appsync.AppSync.__new__(appsync.AppSync)
+        sync.away_timer = 0
+        asked = []
+        sync.ancs = SimpleNamespace(allowed=False, allow=lambda on: (asked.append(on), setattr(sync.ancs, "allowed", on)))
+        saved = appsync.AWAY_FOR_S
+        appsync.AWAY_FOR_S = 1
+        try:
+            sync._iphones_here(True)
+            self.assertEqual(asked, [True])
+            sync._iphones_here(False)
+            self.assertEqual(asked, [True])  # not yet
+            sync._iphones_here(True)  # back within the while: never off
+            context = GLib.MainContext.default()
+            end = time.monotonic() + 1.5
+            while time.monotonic() < end:
+                context.iteration(False)
+                time.sleep(0.01)
+            self.assertEqual(asked, [True, True])
+            sync._iphones_here(False)
+            end = time.monotonic() + 2.5  # whole seconds, on GLib's coarse clock
+            while time.monotonic() < end:
+                context.iteration(False)
+                time.sleep(0.01)
+            self.assertEqual(asked[-1], False)
+        finally:
+            appsync.AWAY_FOR_S = saved

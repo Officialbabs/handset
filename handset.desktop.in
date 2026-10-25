@@ -12,7 +12,7 @@ Keywords=phone;mirror;android;iphone;screen;pixel;
 StartupWMClass=io.github.Officialbabs.Handset
 StartupNotify=true
 SingleMainWindow=true
-Actions=new-window;off;
+Actions=new-window;phones;off;
 # A switch in Ada's Control Center: on while Handset is (it keeps handset.on in the runtime
 # folder); switching it on starts Handset, off runs the Turn Off action.
 X-Ada-ControlCenter=toggle
@@ -22,6 +22,10 @@ X-Ada-ControlCenter-Name=Handset
 [Desktop Action new-window]
 Name=New Window
 Exec=@EXEC@ --new-window
+
+[Desktop Action phones]
+Name=Phones and Settings
+Exec=@EXEC@ --phones
 
 [Desktop Action off]
 Name=Turn Off

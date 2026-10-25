@@ -2,6 +2,7 @@
 asks uinput and `input` for, and the live video and touchscreen against a stand-in adb."""
 
 import json
+import struct
 import os
 import tempfile
 import time
@@ -329,6 +330,26 @@ class AppMessagesTest(unittest.TestCase):
         self.assertEqual(long[:5], bytes([1, 0, 0, 1, 44]))
         self.assertEqual(len(long), 5 + 300 + 5 + 100)
 
+    def test_two_fingers(self):
+        events = android.fingers_events([(100, 200), (300, 200)], 0, 7)
+        self.assertEqual(events[:6], ["EV_ABS", "ABS_MT_SLOT", 0, "EV_ABS", "ABS_MT_TRACKING_ID", 7])
+        self.assertIn(8, events)  # the second finger, tracked on its own
+        self.assertEqual(events[-6:], ["EV_KEY", "BTN_TOUCH", 1, "EV_SYN", "SYN_REPORT", 0])
+        lifted = android.fingers_events([], 2, 7)
+        self.assertEqual(lifted.count("ABS_MT_TRACKING_ID"), 2)  # both up
+        self.assertEqual(lifted[-6:], ["EV_KEY", "BTN_TOUCH", 0, "EV_SYN", "SYN_REPORT", 0])
+        message = android.touch_message(0, 10, 20, (1080, 2400), android.PINCH_POINTER + 1)
+        self.assertEqual(struct.unpack(">BBq", message[:10])[2], android.PINCH_POINTER + 1)
+
+    def test_keyboard_shortcuts(self):
+        sent = android.combo_messages("c")
+        self.assertEqual([struct.unpack(">BBiii", sent[i:i + 14]) for i in range(0, len(sent), 14)], [
+            (0, 0, 113, 0, 0x3000), (0, 0, 31, 0, 0x3000), (0, 1, 31, 0, 0x3000), (0, 1, 113, 0, 0)])
+        redo = android.combo_messages("z", shift=True)
+        self.assertEqual(len(redo), 6 * 14)
+        self.assertEqual(struct.unpack(">BBiii", redo[28:42]), (0, 0, 54, 0, 0x3041))  # Z, Ctrl and Shift held
+        self.assertEqual(android.combo_command("v"), "input keycombination KEYCODE_CTRL_LEFT KEYCODE_V")
+
     def test_its_screen_is_the_phones_upright(self):
         self.assertEqual(display_size((1080, 2400)), (1080, 2400))
         self.assertEqual(display_size((2400, 1080)), (1080, 2400))
@@ -439,6 +460,35 @@ class ClipboardTest(FakeAdb):
         self.assertEqual(message[:14], bytes([9]) + bytes(8) + bytes([0]) + (6).to_bytes(4, "big"))
         self.assertEqual(message[14:], "héllo".encode())
         self.assertEqual(len(clipboard_message("é" * 200000)) - 14, android.MOST_CLIPBOARD)  # whole characters
+
+    def test_a_paste_waits_for_its_text(self):
+        link = ClipboardLink("FAKE7", lambda text: None)
+        link.start()
+        pasted = []
+        try:
+            spin(lambda: link.control is not None)
+            link.set("to paste", then=lambda: pasted.append(open(os.path.join(self.tmp.name, "phone_clipboard")).read()))
+            spin(lambda: pasted, seconds=3)
+            self.assertEqual(pasted, ["to paste"])  # the phone had it when the paste went
+            link.set("to paste", then=lambda: pasted.append("again"))  # there already: at once
+            self.assertEqual(pasted[-1], "again")
+        finally:
+            link.stop()
+
+    def test_an_image_on_its_clipboard(self):
+        link = ClipboardLink("FAKE7", lambda text: None)
+        picture = os.path.join(self.tmp.name, "picture.png")
+        with open(picture, "wb") as file:
+            file.write(b"\x89PNG a picture")
+        done = []
+        link.set_image(picture, "image/png", then=lambda: done.append(True))
+        spin(lambda: done)
+        clip = next(m for m in self.logged("control.jsonl") if m["type"] == "set_clip")
+        self.assertTrue(clip["uri"].startswith(android.CLIP_URI + android.CLIP_PREFIX))
+        self.assertEqual(clip["mime"], "image/png")
+        pushed = [a for a in self.logged("log.jsonl") if a[:1] == ["push"] and a[2].startswith(android.CLIP_FOLDER)]
+        self.assertEqual(len(pushed), 1)  # in the Shell app's own files: not the gallery, not Download
+        self.assertEqual(link.last, clip["uri"])  # the clip, as text, isn't heard back
 
     def test_both_ways(self):
         with open(os.path.join(self.tmp.name, "phone_clipboard"), "w") as file:

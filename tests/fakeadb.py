@@ -202,6 +202,25 @@ def move_task(task: str, display: str):
     return 0
 
 
+def track():
+    """`adb track-devices -l`: the list in FAKEADB_DIR/track (adb's lines, one per connection),
+    framed as adb frames it, again each time it changes."""
+    path = os.path.join(HERE, "track")
+    said = None
+    while True:
+        try:
+            with open(path) as file:
+                listed = file.read()
+        except OSError:
+            listed = ""
+        if listed != said:
+            data = listed.encode()
+            sys.stdout.buffer.write(b"%04x" % len(data) + data)
+            sys.stdout.flush()
+            said = listed
+        time.sleep(0.05)
+
+
 def events():
     """The phone's event log, followed: the lines put in FAKEADB_DIR/events, as they're put."""
     path = os.path.join(HERE, "events")
@@ -295,13 +314,15 @@ def clipboard_server(port):
         while True:
             kind = take(1)[0]
             if kind == 9:
-                _sequence, paste, length = struct.unpack(">QBI", take(13))
+                sequence, paste, length = struct.unpack(">QBI", take(13))
                 text = take(length).decode()
                 said[0] = text  # its own: not sent back
                 with open(path, "w") as file:
                     file.write(text)
                 with open(os.path.join(HERE, "control.jsonl"), "a") as file:
                     file.write(json.dumps({"type": "set_clipboard", "text": text, "paste": paste}) + "\n")
+                if sequence:  # acknowledged, as scrcpy's server does when asked
+                    control.sendall(bytes([1]) + struct.pack(">Q", sequence))
     except (EOFError, OSError):
         pass
     return 0
@@ -377,6 +398,17 @@ def main(args):
         listed = "".join(f"{serial}\tdevice\n" for serial in others())
         print(f"List of devices attached\n{SERIAL}\tdevice\n{listed}")
         return 0
+    if args == ["track-devices", "-l"]:
+        return track()
+    if args[:1] == ["pair"]:  # Wireless debugging's code: 123456 is right
+        if args[2:] == ["123456"]:
+            print(f"Successfully paired to {args[1]} [guid=adb-{SERIAL}-AbCdEf]")
+        else:
+            print("Failed: Wrong password or connection was dropped.")
+        return 0
+    if args[:1] == ["connect"]:
+        print(f"connected to {args[1]}")
+        return 0
     if args[:1] == ["exec-out"] and "screenrecord" in " ".join(args[1:]):
         screenrecord(" ".join(args[1:]))
     if args[:2] == ["shell", "-T"] and args[2:] == ["uinput", "-"]:
@@ -387,6 +419,12 @@ def main(args):
             return 0
         print("adb: error: no room", file=sys.stderr)  # a phone the helper can't go to
         return 1
+    if args[:1] == ["shell"] and "HandsetClip" in " ".join(args[1:]):
+        command = " ".join(args[1:]).split()
+        with open(os.path.join(HERE, "control.jsonl"), "a") as file:  # the image on the phone's clipboard
+            file.write(json.dumps({"type": "set_clip", "uri": command[-2], "mime": command[-1]}) + "\n")
+        print("set")
+        return 0
     if args[:1] == ["shell"] and "HandsetMedia" in " ".join(args[1:]):
         return media_helper()
     if args[:1] == ["push"] and args[2].startswith("/sdcard"):
@@ -446,6 +484,10 @@ def main(args):
         command = " ".join(args[1:])
         if command == "getprop ro.serialno":
             print(SERIAL)
+        elif command.startswith("getprop ro.serialno; getprop ro.product.model"):
+            print(f"{SERIAL}\nPixel 7\nFake Pixel\n17")  # who it is: its number, model, name and Android
+        elif command == "dumpsys battery":
+            print("Current Battery Service state:\n  USB powered: true\n  level: 80\n  scale: 100")
         elif command.startswith("cmd package query-activities --brief --components"):
             for _name, package, _system in APPS:
                 print(f"{package}/.Main")

@@ -1,12 +1,13 @@
 """Handset: a phone's screen in a window on the desk, through Ada's phone service. One window
 per phone: two phones, two windows, side by side.
 
-  handset                 open Handset: the windows open last time (or bring them forward)
+  handset                 open Handset: its main window, the phones a click away in it
   handset --phone NAME    show that phone (its name or id), in a window of its own
   handset --phone ID --app APP
                           one of its apps in a window of its own (what a pinned app runs)
   handset --new-window    another window, for a phone no window shows yet
-  handset --off           close every window and quit (the same windows open next time)
+  handset --phones        Handset's phones (adding one, each one's page) and its settings
+  handset --off           close every window and quit
   handset --sync          keep connected phones' apps among the desk's apps (from sign-in)
   handset --forget-apps   take every phone app off the desk and out of the dock
   handset --pair-iphone   show this computer to iPhones for a few minutes, to pair one for its
@@ -56,7 +57,6 @@ class App(Adw.Application):
         from .window import load_settings, migrated
 
         self.settings = migrated(load_settings())
-        self.turning_off = False
         self.connect("startup", self._started)
         self.clipboard = None  # the clipboard shared with the phones (clipboard.py), once started
         self.sound = None  # each phone's sound, here or on it (sound.py)
@@ -88,6 +88,10 @@ class App(Adw.Application):
         action.connect("activate", lambda *_a: self.open_window(new=True))
         self.add_action(action)
         self.set_accels_for_action("app.new-window", ["<Control><Shift>n"])
+        action = Gio.SimpleAction.new("phones", None)
+        action.connect("activate", lambda *_a: self.show_phones())
+        self.add_action(action)
+        self.set_accels_for_action("app.phones", ["<Control>comma"])
 
     # ---- Which window shows which phone -----------------------------------------------------
 
@@ -189,6 +193,35 @@ class App(Adw.Application):
         if window and window.parted:
             window.close()
 
+    def choose_phone(self, phone_id: str, connected: bool | None = None, wifi: bool | None = None):
+        """A phone switched on or off in Handset, or kept to its cable or let on Wi-Fi: saved, and
+        every window here (and the sync, through the settings file) goes by it at once."""
+        from .service import refresh_all
+        from .window import save_settings
+
+        for key, wanted in (("disconnected", connected), ("cable_only", wifi)):
+            if wanted is None:
+                continue
+            listed = [p for p in self.settings.get(key) or [] if p != phone_id]
+            self.settings[key] = listed if wanted else listed + [phone_id]
+        save_settings(self.settings)
+        refresh_all()
+
+    def is_connected(self, phone_id: str) -> bool:
+        return phone_id not in (self.settings.get("disconnected") or [])
+
+    def over_wifi(self, phone_id: str) -> bool:
+        return phone_id not in (self.settings.get("cable_only") or [])
+
+    def show_phones(self):
+        """Handset's own window (phones.py): the one open comes forward."""
+        from .phones import PhonesWindow
+
+        window = next((w for w in self.get_windows() if isinstance(w, PhonesWindow)), None) or PhonesWindow(self)
+        window.present()
+        say_on(True)
+        return window
+
     def screen_to(self, window) -> bool:
         """An iPhone's one screen, to `window`: the other windows showing that iPhone give it up,
         and the one with the link to it hands that over. Whether a link came (if not, `window`
@@ -232,19 +265,6 @@ class App(Adw.Application):
         say_on(True)
         return window
 
-    def remember_windows(self, closing=None):
-        """Which phones have windows, for next time. The last window closing is Handset
-        quitting: its phone stays, so it opens again; and so do all of them when it's turned
-        off."""
-        from .window import save_settings
-
-        if self.turning_off:
-            return
-        phones = self.handset_windows(apps=False)
-        windows = [w for w in phones if w is not closing or len(self.handset_windows()) == 1]
-        self.settings["windows"] = [w.phone.id for w in windows if w.phone]
-        save_settings(self.settings)
-
     # ---- Starting -----------------------------------------------------------------------------
 
     def do_command_line(self, command_line):
@@ -271,6 +291,9 @@ class App(Adw.Application):
         if "--new-window" in args:
             self.open_window(new=True)
             return 0
+        if "--phones" in args:
+            self.show_phones()
+            return 0
         if "--off" in args:
             self.turn_off()
             return 0
@@ -278,10 +301,12 @@ class App(Adw.Application):
         return 0
 
     def turn_off(self):
-        """Every window closes, remembered as they are, and Handset quits. With none open (it had
-        stopped without saying so), only the word that it's on goes."""
-        self.remember_windows()
-        self.turning_off = True
+        """Every window closes, and Handset quits. With none open (it had stopped without saying
+        so), only the word that it's on goes."""
+        from .phones import PhonesWindow
+
+        for window in [w for w in self.get_windows() if isinstance(w, PhonesWindow)]:
+            window.close()
         windows = self.handset_windows()
         for window in windows:
             window.close()
@@ -289,12 +314,9 @@ class App(Adw.Application):
             say_on(False)
 
     def do_activate(self):
-        windows = self.handset_windows()
-        if windows:
-            (self.get_active_window() or windows[0]).present()
-            return
-        for phone_id in self.settings.get("windows") or [None]:
-            self.open_window(phone_id)
+        """Opening Handset (its menu entry, its icon): its main window, in front, the phones a
+        click away in it (each one's Show)."""
+        self.show_phones()
 
 
 def main(argv=None) -> int:

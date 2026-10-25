@@ -53,8 +53,10 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The helper, as install.sh puts it, or as `cargo build --release` leaves it in the checkout.
 HELPER_PLACES = (os.path.expanduser("~/.local/lib/handset/handset-ios"),
                  os.path.join(HERE, "ios", "target", "release", "handset-ios"))
-# The pairing Ada's desktop made for each iPhone, by its UDID.
-PAIRINGS = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "ada", "phones")
+# The pairings that let an iPhone be reached over Wi-Fi, by its UDID: the ones Ada's desktop
+# made, then Handset's own.
+CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+PAIRINGS = (os.path.join(CONFIG, "ada", "phones"), os.path.join(CONFIG, "handset", "pairings"))
 # The digitizer's range, edge to edge, whatever the screen's size.
 SPAN = 65535
 # An iPhone 12's screen until the first picture says otherwise (its pixels, upright).
@@ -82,6 +84,20 @@ SCREENS = {
     "iPhone 16 Pro Max": (1320, 2868), "iPhone 17 Pro Max": (1320, 2868),
     "iPhone Air": (1260, 2736),
 }
+# A paste waits this long at most for the phone to say its clipboard is set.
+SET_WAIT_MS = 2500
+# Images on the clipboard, by their type here and on the phone.
+UTIS = {"image/png": "public.png", "image/jpeg": "public.jpeg"}
+
+
+def clip_folder() -> str:
+    """Where images on the clipboard wait between the computer and the phones (only this person's)."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/handset-{os.getuid()}"
+    folder = os.path.join(runtime, "handset-clipboard")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    return folder
+# A helper told to stop has this long to end its streams on the phone (over Wi-Fi too) and go.
+STOP_FOR_S = 5
 # Padding is never more than this: a bigger difference means the model's size isn't the
 # stream's, and nothing is cut.
 MOST_PADDING = 64
@@ -111,8 +127,12 @@ def helper_binary() -> str | None:
 
 
 def pairing_file(udid: str) -> str | None:
-    path = os.path.join(PAIRINGS, f"{udid}.rppairing")
-    return path if os.path.isfile(path) else None
+    """The iPhone's Wi-Fi pairing, if it has one (without, it's reached by its cable only)."""
+    for folder in PAIRINGS:
+        path = os.path.join(folder, f"{udid}.rppairing")
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def normalized(x: float, y: float, shown: tuple[int, int]) -> tuple[int, int]:
@@ -132,6 +152,8 @@ SWIPES = {
     # In from the left edge, quick, as a thumb does: a touch that starts on the screen's very
     # first pixel column, or moves slowly, isn't taken for the edge swipe.
     "back": ((0.004, 0.5), (0.72, 0.5), 220, 0),
+    # Along the bottom edge to the right: the app used before this one.
+    "previous_app": ((0.2, 0.994), (0.8, 0.994), 180, 0),
     "notifications": ((0.3, 0.0), (0.3, 0.61), 350, 0),  # down from the top left
     "quick_settings": ((0.88, 0.0), (0.88, 0.61), 350, 0),  # down from the top right
 }
@@ -142,10 +164,14 @@ class Link:
     """What Handset needs to start the helper for an iPhone."""
 
     udid: str
-    pairing: str
+    pairing: str | None  # for Wi-Fi; by cable the phone's trust in this computer is enough
     address: str | None
     helper: str
     model: str = ""
+
+    def args(self, command: str) -> list[str]:
+        """The helper's command line for `command` on this phone."""
+        return [self.helper, command, "--udid", self.udid] + (["--pairing", self.pairing] if self.pairing else [])
 
 
 def open_link(udid: str, address: str | None, model: str = "") -> Link | str:
@@ -153,10 +179,11 @@ def open_link(udid: str, address: str | None, model: str = "") -> Link | str:
     helper = helper_binary()
     if not helper:
         return "Handset's iPhone helper isn't built yet: run ./install.sh in Handset's folder."
-    pairing = pairing_file(udid)
-    if not pairing:
-        return "Set the iPhone up with Ada first (Settings › Phones), with Wi-Fi on."
-    return Link(udid, pairing, address, helper, model)
+    from .service import choices
+
+    if udid in choices()[1]:
+        return Link(udid, None, None, helper, model)  # kept to its cable in Handset: no Wi-Fi
+    return Link(udid, pairing_file(udid), address, helper, model)
 
 
 class IPhone:
@@ -189,8 +216,20 @@ class IPhone:
         self.process: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self.error: str | None = None
+        # Whether someone else shares the phone's screen now (Ada working on it): if not, streams
+        # left on the phone from before are stopped when this one starts.
+        self.shared: Callable[[], bool] = lambda: False
         self.launching: str | None = None  # an app to open once the phone takes input
         self.on_launched: Callable[[bool, str], None] | None = None  # (opened, why not)
+
+    def fingers(self, points: list[tuple[int, int]]):
+        """Several fingers at once, as the screen shows (a pinch); none: all up."""
+        if self.live_touch:
+            self._send({"op": "fingers", "points": [self._point(x, y) for x, y in points]})
+
+    def shortcut(self, letter: str, shift: bool = False):
+        """Command(+Shift)+letter: select all, copy, cut, paste, undo, redo."""
+        self._send({"op": "shortcut", "key": letter, "shift": shift})
 
     def launch(self, bundle: str):
         """Opens an app on the phone, in front: now, or once the phone takes input."""
@@ -200,7 +239,15 @@ class IPhone:
             self.launching = bundle
 
     def start(self):
-        command = [self.link.helper, "stream", "--pairing", self.link.pairing, "--udid", self.link.udid]
+        from .pairing import ddi_folder
+        from .service import has_service
+
+        command = self.link.args("stream")
+        images = None if has_service() else ddi_folder()
+        if images:
+            command += ["--images", images]  # a phone restarted has lost it: put back
+        if not self.shared():
+            command.append("--alone")
         if self.link.address:
             command += ["--address", self.link.address]
         if DEBUG:
@@ -225,8 +272,8 @@ class IPhone:
         process, self.process = self.process, None
         if process:
             try:
-                process.stdin.close()  # the helper stops the phone's stream and goes
-                process.wait(timeout=3)
+                process.stdin.close()  # the helper ends its streams on the phone, and goes
+                process.wait(timeout=STOP_FOR_S)
             except (OSError, subprocess.TimeoutExpired):
                 process.kill()
         if self.decoder:
@@ -428,7 +475,7 @@ def launch_trouble(why: str) -> str:
 def list_apps(link: Link, icons: str) -> list[tuple[str, str, str | None]] | str:
     """The phone's apps as its home screen has them, (name, bundle id, icon file or None), with
     their icons saved in the folder `icons`; or why not, in words. Slow: run it off the main loop."""
-    command = [link.helper, "apps", "--pairing", link.pairing, "--udid", link.udid, "--icons", icons]
+    command = link.args("apps") + ["--icons", icons]
     if link.address:
         command += ["--address", link.address]
     os.makedirs(icons, exist_ok=True)
@@ -475,13 +522,17 @@ class ClipboardLink:
     on GLib's main loop for each text copied on the phone, set(text) to put text on it. As
     android.ClipboardLink: it starts again by itself if the phone sleeps or goes."""
 
-    def __init__(self, link: Link, on_text: Callable[[str], None]):
+    def __init__(self, link: Link, on_text: Callable[[str], None],
+                 on_image: Callable[[str, str], None] | None = None):
         self.link = link
         self.on_text = on_text
+        self.on_image = on_image  # (file, mime): an image copied on the phone
         self.process: subprocess.Popen | None = None
         self.stopped = False
         self.last: str | None = None
         self.lock = threading.Lock()
+        self.sequence = 0
+        self.waiting: dict[int, Callable[[], None]] = {}  # a set's number → the paste waiting for it
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -493,24 +544,52 @@ class ClipboardLink:
             process.kill()
             process.wait()
 
-    def set(self, text: str):
-        if not text or text == self.last:
+    def set(self, text: str, then: Callable[[], None] | None = None):
+        """`text` on the phone's clipboard; `then` once it's there (the helper says so, or it was)."""
+        process = self.process
+        if not text or text == self.last or not process or process.poll() is not None:
+            if then:
+                then()
             return
         self.last = text
+        self._ask({"op": "set", "text": text}, then, SET_WAIT_MS)
+
+    def set_image(self, path: str, mime: str, then: Callable[[], None] | None = None):
+        """An image on the phone's clipboard (in memory there: never in Photos or Files); `then`
+        once it's there."""
         process = self.process
-        if process and process.poll() is None:
-            try:
-                with self.lock:
-                    process.stdin.write((json.dumps({"op": "set", "text": text}) + "\n").encode())
-                    process.stdin.flush()
-            except OSError:
-                pass
+        if not process or process.poll() is not None:
+            if then:
+                then()
+            return
+        self.last = None  # text copied next is news again
+        self._ask({"op": "set-image", "path": path, "type": UTIS.get(mime, "public.png")}, then, SET_WAIT_MS * 4)
+
+    def _ask(self, command: dict, then: Callable[[], None] | None, wait_ms: int):
+        """A set, numbered: the helper says that number back once it's on the phone, and the
+        paste waiting for it (`then`) goes then (or after `wait_ms`, if it never says)."""
+        self.sequence += 1
+        if then:
+            self.waiting[self.sequence] = then
+            GLib.timeout_add(wait_ms, self._set_done, self.sequence)
+        try:
+            with self.lock:
+                self.process.stdin.write((json.dumps({**command, "id": self.sequence}) + "\n").encode())
+                self.process.stdin.flush()
+        except (OSError, AttributeError):
+            self._set_done(self.sequence)
+
+    def _set_done(self, number: int):
+        then = self.waiting.pop(number, None)
+        if then:
+            then()
+        return GLib.SOURCE_REMOVE
 
     def _run(self):
         delay = 3
         while not self.stopped:
             started = time.monotonic()
-            command = [self.link.helper, "clipboard", "--pairing", self.link.pairing, "--udid", self.link.udid]
+            command = self.link.args("clipboard") + ["--clip-dir", clip_folder()]
             if self.link.address:
                 command += ["--address", self.link.address]
             try:
@@ -522,6 +601,13 @@ class ClipboardLink:
                 try:
                     event = json.loads(raw)
                 except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("event") == "clipboard" and event.get("set"):
+                    GLib.idle_add(self._set_done, event.get("id"))
+                    continue
+                if isinstance(event, dict) and event.get("event") == "clipboard" and event.get("image"):
+                    if self.on_image:
+                        GLib.idle_add(self.on_image, event["image"], event.get("type") or "image/png")
                     continue
                 text = event.get("text") if isinstance(event, dict) and event.get("event") == "clipboard" else None
                 if text and text != self.last:
@@ -553,15 +639,16 @@ class FilesSession:
     # Photos and videos go into Photos, into its album Handset: put in a folder of their own (in a
     # file-sharing app's files), then saved there by a shortcut on the iPhone, "Handset Import"
     # (its two steps: Get Contents of Folder, that folder; Save to Photo Album, Handset), run by its
-    # URL; Photos comes forward after. Once Photos has them, the copies go.
+    # URL. Once Photos has them, the copies go, and the window takes the phone back to the app it
+    # was in (`opened_shortcuts`). (Shortcuts' x-callback-url no longer calls back since iOS 26.5.)
     PHOTOS_FOLDER = "Handset"
     PHOTOS_SHORTCUT = "Handset Import"
-    PHOTOS_URL = ("shortcuts://x-callback-url/run-shortcut?name=Handset%20Import"
-                  "&x-success=photos-redirect%3A%2F%2F")
+    PHOTOS_URL = "shortcuts://run-shortcut?name=Handset%20Import"
     PHOTOS_WAIT_S = 60
 
     def __init__(self, link: Link):
         self.link = link
+        self.opened_shortcuts = False  # Shortcuts came in front for a drop: the phone goes back after
         self.process: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self._sharing: dict[str, str] | None = None
@@ -660,6 +747,7 @@ class FilesSession:
         opened = self._ask({"op": "open-url", "bundle": "com.apple.shortcuts", "url": self.PHOTOS_URL})
         if isinstance(opened, str):
             return f"{waiting} (unlock the iPhone to put them in Photos)"
+        self.opened_shortcuts = True
         deadline = time.monotonic() + self.PHOTOS_WAIT_S
         while time.monotonic() < deadline:
             time.sleep(1.5)
@@ -687,7 +775,7 @@ class FilesSession:
         """One command's answer, or why there's none, in words."""
         with self.lock:
             if not self.process or self.process.poll() is not None:
-                started = [self.link.helper, "files", "--pairing", self.link.pairing, "--udid", self.link.udid]
+                started = self.link.args("files")
                 if self.link.address:
                     started += ["--address", self.link.address]
                 try:
@@ -720,7 +808,7 @@ class FilesSession:
                 return str(answer.get("message") or "It didn't work.")
             return answer
 
-    def list_folder(self, folder: str) -> list | str:
+    def list_folder(self, folder: str, hidden: bool = False) -> list | str:
         from .android import PhoneFile
 
         if folder.rstrip("/") == self.apps_root:
@@ -731,7 +819,7 @@ class FilesSession:
             return answer
         found = [PhoneFile(e["name"], f"{folder.rstrip('/')}/{e['name']}", bool(e.get("folder")),
                            int(e.get("size") or 0), float(e.get("modified") or 0))
-                 for e in answer.get("entries", []) if e.get("name") and not e["name"].startswith(".")]
+                 for e in answer.get("entries", []) if e.get("name") and (hidden or not e["name"].startswith("."))]
         found = sorted(found, key=lambda f: (not f.folder, f.name.casefold()))
         if folder.rstrip("/") == "" and self.sharing():
             found.insert(0, PhoneFile("On My iPhone", self.apps_root, True, 0, time.time()))

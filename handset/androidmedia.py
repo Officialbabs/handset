@@ -262,6 +262,10 @@ class MediaFollower:
             debug("the media helper didn't start:", error)
             return False
         self.helper = process
+        if self.stopped:  # stopped while it started: it goes too
+            process.kill()
+            process.wait()
+            return
         said = False
         with process.stdout:
             for line in process.stdout:
@@ -315,6 +319,10 @@ class MediaFollower:
                 debug("what the phone plays can't be followed:", error)
                 return
             self.process = process
+            if self.stopped:  # stopped while it started: it goes too
+                process.kill()
+                process.wait()
+                return
             block: list[str] = []
             with process.stdout:
                 for line in process.stdout:

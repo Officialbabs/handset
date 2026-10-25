@@ -1,6 +1,6 @@
 """A phone's apps on the desk. While a phone is connected each of its apps has a menu entry of its
 own (its name, the phone's name, its icon), so it's in search and among the desk's apps like any
-other; opening it runs `handset --phone PHONE --app APP`, which shows that one app in a window of
+other (and so has each phone, opening its window); opening it runs `handset --phone PHONE --app APP`, which shows that one app in a window of
 its own. Its window carries the entry's id, so the dock counts it as that app, not as Handset. An
 app pinned to the dock keeps its entry when the phone goes; the others go with it (appsync.py
 keeps them).
@@ -201,13 +201,172 @@ def write_entry(app: PhoneApp, icon: bytes | None = None, replace: bool = True) 
     return True
 
 
+# ---- The phones' own entries -------------------------------------------------------------------
+# Each phone has an entry too ("Pixel 7"), opening its window: its window carries the entry's id,
+# so the dock shows each phone under its own icon, to pin and open on its own.
+
+def phone_app_id(phone_id: str) -> str:
+    token = hashlib.sha1(phone_id.encode()).hexdigest()[:16]
+    return f"{APP_ID}.Phone.p{token}"
+
+
+def phone_entry_path(phone_id: str) -> str:
+    return os.path.join(applications_dir(), f"{phone_app_id(phone_id)}.desktop")
+
+
+def phone_entries() -> list[str]:
+    """The phones with entries (their ids)."""
+    found = []
+    for path in glob.glob(os.path.join(glob.escape(applications_dir()), f"{APP_ID}.Phone.*.desktop")):
+        entry = GLib.KeyFile()
+        try:
+            entry.load_from_file(path, GLib.KeyFileFlags.NONE)
+            found.append(entry.get_string(ENTRY, "X-Handset-Phone"))
+        except GLib.Error:
+            continue
+    return found
+
+
+def write_phone_entry(phone_id: str, name: str, platform: str) -> bool:
+    """The phone's own entry, opening its window: True when something changed."""
+    os.makedirs(icons_dir(), exist_ok=True)
+    os.makedirs(applications_dir(), exist_ok=True)
+    data = phone_icon(name, platform)
+    picture = os.path.join(icons_dir(), f"{phone_app_id(phone_id)}-{hashlib.sha1(data).hexdigest()[:10]}.png")
+    if not os.path.exists(picture):
+        GLib.file_set_contents(picture, data)
+    entry = GLib.KeyFile()
+    entry.set_string(ENTRY, "Type", "Application")
+    entry.set_string(ENTRY, "Name", name)
+    entry.set_string(ENTRY, "Comment", f"{name}'s screen in a window, through Handset")
+    entry.set_string(ENTRY, "Keywords", f"{name};phone;mirror;handset;")
+    entry.set_string(ENTRY, "Exec", " ".join(quoted(a) for a in (launcher(), "--phone", phone_id)))
+    entry.set_string(ENTRY, "Icon", picture)
+    entry.set_string(ENTRY, "Terminal", "false")
+    entry.set_string(ENTRY, "Categories", "Utility;")
+    entry.set_string(ENTRY, "X-Handset-Phone", phone_id)
+    entry.set_string(ENTRY, "X-Handset-Platform", platform)
+    text, _length = entry.to_data()
+    path = phone_entry_path(phone_id)
+    try:
+        with open(path) as file:
+            if file.read() == text:
+                return False
+    except OSError:
+        pass
+    GLib.file_set_contents(path, text.encode())
+    return True
+
+
+def remove_phone_entry(phone_id: str):
+    for path in [phone_entry_path(phone_id)] + glob.glob(
+            os.path.join(glob.escape(icons_dir()), f"{phone_app_id(phone_id)}*.png")):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+# Apple's logo, as Lobe Icons draws it (https://github.com/lobehub/lobe-icons, "apple"; MIT License,
+# Copyright (c) LobeHub), in a 24-unit square. A trademark of Apple, naming the kind of phone.
+APPLE_LOGO = ("M11.932 6.908c.95 0 2.727-1.291 4.595-1.1.782.032 2.976.316 4.388 2.38-.113.069-2.622 1.528-2.593 "
+              "4.565.034 3.617 3.166 4.828 3.221 4.85-.029.086-.506 1.723-1.658 3.416-1.002 1.463-2.039 2.919-3.675 "
+              "2.95-1.606.03-2.125-.955-3.96-.955s-2.409.923-3.931.984c-1.581.06-2.78-1.58-3.79-3.037-2.065-2.98-3.64"
+              "-8.422-1.527-12.087 1.051-1.824 2.93-2.98 4.969-3.009 1.549-.032 3.011 1.043 3.96 1.043zM16.552 0c.153 "
+              "1.407-.411 2.817-1.251 3.833-.837 1.013-2.214 1.804-3.555 1.7-.185-1.378.495-2.814 1.27-3.712C13.883."
+              "805 15.346.05 16.553 0z")
+
+
+def apple_logo(cr, x: float, y: float, edge: float):
+    """Apple's logo, white, in the square at (x, y) `edge` wide."""
+    import gi
+
+    gi.require_version("Rsvg", "2.0")
+    from gi.repository import Rsvg
+
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#ffffff" '
+           f'fill-rule="evenodd" d="{APPLE_LOGO}"/></svg>')
+    handle = Rsvg.Handle.new_from_data(svg.encode())
+    area = Rsvg.Rectangle()
+    area.x, area.y, area.width, area.height = x, y, edge, edge
+    handle.render_document(cr, area)
+
+
+def android_head(cr, cx: float, cy: float, edge: float, eyes: tuple[float, float, float]):
+    """The Android robot's head, white, centred at (cx, cy), `edge` wide: its dome, its two
+    antennae, its eyes in the colour behind it."""
+    radius = edge / 2
+    base = cy + radius * 0.35  # the dome's flat edge, below the middle
+    cr.set_source_rgb(1, 1, 1)
+    cr.arc(cx, base, radius, 3.1416, 0)
+    cr.close_path()
+    cr.fill()
+    cr.set_line_width(edge * 0.06)
+    cr.set_line_cap(1)  # round
+    for side in (-1, 1):
+        cr.move_to(cx + side * radius * 0.42, base - radius * 0.88)
+        cr.line_to(cx + side * radius * 0.68, base - radius * 1.32)
+        cr.stroke()
+    cr.set_source_rgb(*eyes)
+    for side in (-1, 1):
+        cr.arc(cx + side * radius * 0.42, base - radius * 0.45, edge * 0.065, 0, 6.2832)
+        cr.fill()
+
+
+def phone_icon(name: str, platform: str, size: int = 192) -> bytes:
+    """A phone's icon: a phone, upright, its screen lit in the platform's colour, with the
+    platform's logo on it (Apple's, Android's robot)."""
+    import cairo
+
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(surface)
+
+    def rounded(x0, y0, x1, y1, radius):
+        cr.new_sub_path()
+        cr.arc(x1 - radius, y0 + radius, radius, -1.5708, 0)
+        cr.arc(x1 - radius, y1 - radius, radius, 0, 1.5708)
+        cr.arc(x0 + radius, y1 - radius, radius, 1.5708, 3.1416)
+        cr.arc(x0 + radius, y0 + radius, radius, 3.1416, 4.7124)
+        cr.close_path()
+
+    width = size * 0.56
+    x0, y0, x1, y1 = (size - width) / 2, size * 0.06, (size + width) / 2, size * 0.94
+    rounded(x0, y0, x1, y1, size * 0.11)
+    cr.set_source_rgb(0.11, 0.11, 0.13)
+    cr.fill()
+    inset = size * 0.035
+    top, bottom = (0.20, 0.62, 0.42), (0.10, 0.45, 0.62)  # Android: green into blue
+    if platform == "ios":
+        top, bottom = (0.36, 0.42, 0.95), (0.62, 0.30, 0.85)  # iPhone: blue into violet
+    gradient = cairo.LinearGradient(0, y0, 0, y1)
+    gradient.add_color_stop_rgb(0, *top)
+    gradient.add_color_stop_rgb(1, *bottom)
+    rounded(x0 + inset, y0 + inset, x1 - inset, y1 - inset, size * 0.08)
+    cr.set_source(gradient)
+    cr.fill()
+    rounded(size / 2 - size * 0.07, y0 + inset * 1.6, size / 2 + size * 0.07, y0 + inset * 1.6 + size * 0.035,
+            size * 0.0175)  # the camera's pill
+    cr.set_source_rgb(0.11, 0.11, 0.13)
+    cr.fill()
+    if platform == "ios":
+        edge = size * 0.36
+        apple_logo(cr, (size - edge) / 2, size / 2 - edge * 0.55, edge)
+    else:
+        middle = tuple((a + b) / 2 for a, b in zip(top, bottom))
+        android_head(cr, size / 2, size / 2, size * 0.36, middle)
+    out = io.BytesIO()
+    surface.write_to_png(out)
+    return out.getvalue()
+
+
 def forget_old_icons(older_than: float = 24 * 3600):
     """Icons no entry names any more, kept a day for the desktop's sake, gone after that."""
     named = set()
-    for app in entries():
+    paths = [entry_path(app.phone_id, app.app) for app in entries()] + [phone_entry_path(p) for p in phone_entries()]
+    for path in paths:
         entry = GLib.KeyFile()
         try:
-            entry.load_from_file(entry_path(app.phone_id, app.app), GLib.KeyFileFlags.NONE)
+            entry.load_from_file(path, GLib.KeyFileFlags.NONE)
             named.add(entry.get_string(ENTRY, "Icon"))
         except GLib.Error:
             continue

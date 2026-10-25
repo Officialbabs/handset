@@ -21,6 +21,7 @@ class FakeBus:
         self.held = []
         self.hold = False
         self.reads = {}
+        self.refuse: dict[str, str] = {}  # method → BlueZ's error for it
 
     def call(self, _name, path, _interface, method, args, _reply_type, _flags, _timeout, _cancel, callback,
              data=None):
@@ -37,6 +38,8 @@ class FakeBus:
 
     def call_finish(self, result):
         _callback, _data, path, method = result
+        if method in self.refuse:
+            raise GLib.Error(self.refuse[method])
         if method == "ReadValue":
             return GLib.Variant("(ay)", (self.reads.get(path, b""),))
         return None
@@ -85,6 +88,13 @@ class AmsTest(unittest.TestCase):
         self.assertEqual(self.bus.writes(CHARS[ams.ENTITY_UPDATE]), [bytes([0, 0, 1])])
         self.bus.answer()  # the player's asked for: then the track's, one write at a time
         self.assertEqual(self.bus.writes(CHARS[ams.ENTITY_UPDATE]), [bytes([0, 0, 1]), bytes([2, 0, 1, 2, 3])])
+
+    def test_subscribed_already_is_subscribed(self):
+        # BlueZ says In Progress to a program that's subscribed already (a connection that came
+        # back, say): the player's still asked for, not given up on.
+        self.bus.refuse["StartNotify"] = "GDBus.Error:org.bluez.Error.InProgress: In Progress"
+        self.media.attach(CHARS)
+        self.assertEqual(self.bus.writes(CHARS[ams.ENTITY_UPDATE])[:1], [bytes([0, 0, 1])])
 
     def test_a_song_playing_and_paused(self):
         self.media.attach(CHARS)
@@ -149,6 +159,60 @@ class WritesTest(unittest.TestCase):
         bus.answer()  # "/a"'s first done: its second goes
         self.assertEqual(done, [True])
         self.assertEqual(bus.calls[-1][2], b"2")
+
+
+class AncsRetryTest(unittest.TestCase):
+    """The notification service subscribed to once: "In Progress" (subscribed already) isn't a
+    refusal, and a refusal is tried again later, longer each time, never in a loop."""
+
+    def setUp(self):
+        from handset import ancs
+
+        self.ancs = ancs
+        self.client = ancs.Ancs.__new__(ancs.Ancs)  # without the system's bus
+        self.client.device, self.client.chars, self.client.media = "/dev/phone", {"x": "/dev/phone/x"}, None
+        self.client.failures, self.client.hold_until, self.client.look_timer = 0, 0.0, 0
+        self.client.address, self.remembered = "AA:BB", []
+        self.client.remember = self.remembered.append
+        self.bus = FakeBus()
+
+    def tearDown(self):
+        if self.client.look_timer:
+            GLib.source_remove(self.client.look_timer)
+
+    def started(self, uuid, error=None):
+        if error:
+            self.bus.refuse["StartNotify"] = error
+        self.client._started(self.bus, (None, None, "/dev/phone/x", "StartNotify"), uuid)
+
+    def test_off_while_the_iphone_isnt_connected(self):
+        self.client.bus, self.client.writes = self.bus, Writes(self.bus)
+        self.client.queue, self.client.waiting, self.client.buffer = [], None, b""
+        self.client.adapter, self.client.advertising, self.client.pairing_until = "/hci0", False, 0.0
+        self.client.registration, self.client.known = 1, lambda: {"AA:BB"}
+        self.client.allowed = True
+        self.client.allow(False)
+        self.assertIn(("/dev/phone", "Disconnect", None), self.bus.calls)  # its link let go
+        self.assertIsNone(self.client.device)
+        self.assertNotIn("RegisterAdvertisement", [m for _p, m, _v in self.bus.calls])  # nothing to come back to
+        self.client.allow(True)
+        self.assertIn(("/hci0", "RegisterAdvertisement", None), self.bus.calls)  # connected: it comes back
+
+    def test_subscribed_already(self):
+        self.started(self.ancs.NOTIFICATION_SOURCE, "GDBus.Error:org.bluez.Error.InProgress: In Progress")
+        self.assertEqual(self.client.device, "/dev/phone")
+        self.assertEqual(self.remembered, ["AA:BB"])
+
+    def test_refused_then_later_and_later(self):
+        self.started(self.ancs.DATA_SOURCE, "GDBus.Error:org.bluez.Error.NotPermitted: Not paired")
+        self.assertIsNone(self.client.device)
+        first = self.client.hold_until - time.monotonic()
+        self.assertAlmostEqual(first, self.ancs.RETRY_FIRST_S, delta=0.5)
+        self.started(self.ancs.NOTIFICATION_SOURCE, "GDBus.Error:org.bluez.Error.NotPermitted: Not paired")
+        self.assertEqual(self.client.failures, 1)  # the same refusal, counted once
+        self.client.device = "/dev/phone"  # it came back, and was refused again
+        self.started(self.ancs.DATA_SOURCE, "GDBus.Error:org.bluez.Error.NotPermitted: Not paired")
+        self.assertAlmostEqual(self.client.hold_until - time.monotonic(), 2 * self.ancs.RETRY_FIRST_S, delta=0.5)
 
 
 if __name__ == "__main__":

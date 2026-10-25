@@ -10,7 +10,8 @@ from types import SimpleNamespace
 
 from gi.repository import Gio, GLib
 
-from handset.autopause import AutoPause
+from handset import autopause
+from handset.autopause import AutoPause, phone_streams
 
 BUS_CONFIG = """<busconfig>
   <type>session</type>
@@ -24,6 +25,7 @@ BUS_CONFIG = """<busconfig>
 
 DESK_PLAYER = """<node><interface name="org.mpris.MediaPlayer2.Player">
   <method name="Pause"/>
+  <method name="Play"/>
   <property name="PlaybackStatus" type="s" access="read"/>
 </interface></node>"""
 
@@ -45,8 +47,25 @@ class Phone:
         self.sent.append(command)
 
 
+class FakeLowered:
+    """The sound server stands in: never the computer's own."""
+
+    def __init__(self):
+        self.said = []
+
+    def lower(self):
+        self.said.append("lower")
+
+    def restore(self):
+        self.said.append("restore")
+
+
 class AutoPauseTest(unittest.TestCase):
     def setUp(self):
+        self.saved = (autopause.SOUND_S, autopause.RESUME_AFTER_MS)
+        autopause.SOUND_S, autopause.RESUME_AFTER_MS = 0, 10
+        self.addCleanup(lambda: setattr(autopause, "SOUND_S", self.saved[0]))
+        self.addCleanup(lambda: setattr(autopause, "RESUME_AFTER_MS", self.saved[1]))
         self.tmp = tempfile.TemporaryDirectory()
         config = os.path.join(self.tmp.name, "bus.conf")
         with open(config, "w") as file:
@@ -65,6 +84,7 @@ class AutoPauseTest(unittest.TestCase):
         Gio.bus_own_name_on_connection(self.desk, "org.mpris.MediaPlayer2.desk", Gio.BusNameOwnerFlags.NONE, None, None)
         self.phones = {"PIXEL": Phone(False), "IPHONE": Phone(True)}
         self.pause = AutoPause(lambda: self.phones, bus=self.handset)
+        self.pause.lowered = FakeLowered()
         self.pause.start()
         spin(lambda: False, 0.2)
 
@@ -84,19 +104,46 @@ class AutoPauseTest(unittest.TestCase):
         self.daemon.stdout.close()
         self.tmp.cleanup()
 
+    def status(self, status):
+        self.desk_status = status
+        self.desk.emit_signal(None, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                              GLib.Variant("(sa{sv}as)", ("org.mpris.MediaPlayer2.Player",
+                                                          {"PlaybackStatus": GLib.Variant("s", status)}, [])))
+
     def test_a_phone_starting_pauses_the_rest(self):
         self.phones["PIXEL"].now.playing = True
         self.pause.phone_started("PIXEL")
-        self.assertEqual(self.phones["IPHONE"].sent, ["pause"])
+        self.assertTrue(spin(lambda: self.phones["IPHONE"].sent == ["pause"]))
         self.assertEqual(self.phones["PIXEL"].sent, [])  # not itself
         self.assertTrue(spin(lambda: self.desk_paused == ["Pause"]))
 
     def test_the_computer_starting_pauses_the_phones(self):
-        self.desk.emit_signal(None, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", "PropertiesChanged",
-                              GLib.Variant("(sa{sv}as)", ("org.mpris.MediaPlayer2.Player",
-                                                          {"PlaybackStatus": GLib.Variant("s", "Playing")}, [])))
+        self.status("Playing")
         self.assertTrue(spin(lambda: self.phones["IPHONE"].sent == ["pause"]))
         self.assertEqual(self.phones["PIXEL"].sent, [])  # not playing: left alone
+
+    def test_a_moments_sound_only_lowers_the_rest(self):
+        autopause.SOUND_S = 1
+        self.status("Playing")  # a message's tone
+        spin(lambda: False, 0.2)
+        self.status("Paused")
+        spin(lambda: False, 1.5)
+        self.assertEqual(self.phones["IPHONE"].sent, [])  # never paused
+        self.assertEqual(self.pause.lowered.said, ["lower", "restore"])
+
+    def test_what_paused_plays_again_once_its_over(self):
+        self.status("Playing")
+        self.assertTrue(spin(lambda: self.phones["IPHONE"].sent == ["pause"]))
+        self.phones["IPHONE"].now.playing = False
+        self.status("Paused")
+        self.assertTrue(spin(lambda: self.phones["IPHONE"].sent == ["pause", "play"]))
+
+    def test_the_phones_sound_among_the_servers(self):
+        listed = [{"index": 7, "properties": {"application.name": autopause.HANDSET_SOUND},
+                   "volume": {"front-left": {"value_percent": "80%"}}},
+                  {"index": 9, "properties": {"application.name": "Firefox"}, "volume": {}},
+                  {"index": 12, "properties": {"device.api": "bluez5"}, "volume": {"mono": {"value_percent": "100%"}}}]
+        self.assertEqual(phone_streams(listed), [(7, "80%"), (12, "100%")])
 
 
 if __name__ == "__main__":

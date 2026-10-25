@@ -8,7 +8,9 @@ Bluetooth on the phone, as for its notifications).
 
 The phone is trusted (BlueZ's Trusted), so it may come back by itself and BlueZ reconnects its
 sound after the link drops; and while the sound is wanted here, the phone's profiles are asked
-for again whenever it comes back in reach, and every little while until they come.
+for again whenever it comes back in reach, and every little while until they come. Not when the
+phone ended the link itself (the person disconnected it on the phone, or turned its Bluetooth
+off: BlueZ says why a link ended): then it's left alone until the person asks again.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ from .log import debug
 A2DP_SOURCE = "0000110a-0000-1000-8000-00805f9b34fb"  # the phone sends its sound
 # While the sound is wanted and the phone isn't sending it, it's asked for again this often.
 RETRY_S = 30
+# Why BlueZ says a link ended, when the phone ended it.
+ENDED_BY_PHONE = "org.bluez.Reason.Remote"
 HFP_GATEWAY = "0000111f-0000-1000-8000-00805f9b34fb"  # the phone's calls
 PROFILES = (A2DP_SOURCE, HFP_GATEWAY)
 
@@ -83,9 +87,13 @@ class BluetoothSound:
         self.stopped = False
         self.retry = 0
         self.watch = 0
+        self.ended_watch = 0
+        self.let_go = False  # the phone ended the link: not asked for again until the person asks
 
     def start(self):
         self.stopped = False
+        if self.let_go:
+            return
         try:
             self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
             self.device = choose(phones(self.bus), self.name, self.addresses)
@@ -102,6 +110,9 @@ class BluetoothSound:
             self.watch = self.bus.signal_subscribe("org.bluez", "org.freedesktop.DBus.Properties", "PropertiesChanged",
                                                    self.device, "org.bluez.Device1", Gio.DBusSignalFlags.NONE,
                                                    self._changed)
+        if not self.ended_watch:
+            self.ended_watch = self.bus.signal_subscribe("org.bluez", "org.bluez.Device1", "Disconnected", self.device,
+                                                         None, Gio.DBusSignalFlags.NONE, self._disconnected)
         self._connect()
 
     def stop(self):
@@ -109,9 +120,10 @@ class BluetoothSound:
         if self.retry:
             GLib.source_remove(self.retry)
             self.retry = 0
-        if self.watch and self.bus:
-            self.bus.signal_unsubscribe(self.watch)
-            self.watch = 0
+        for watch in (self.watch, self.ended_watch):
+            if watch and self.bus:
+                self.bus.signal_unsubscribe(watch)
+        self.watch = self.ended_watch = 0
         if self.device and self.bus:
             for uuid in PROFILES:
                 self._call("DisconnectProfile", uuid)
@@ -120,9 +132,21 @@ class BluetoothSound:
         for uuid in PROFILES:
             self._call("ConnectProfile", uuid)
 
+    def _disconnected(self, _bus, _sender, _path, _interface, _signal, parameters):
+        reason, _message = parameters.unpack()
+        debug("Bluetooth: the phone's link ended:", reason)
+        if reason == ENDED_BY_PHONE and not self.stopped:
+            # Disconnected on the phone: its choice stands. Nothing more is asked of it until the
+            # person switches the sound here again (or the phone sends it here by itself).
+            self.let_go = True
+            if self.retry:
+                GLib.source_remove(self.retry)
+                self.retry = 0
+            self._ended(f"{self.name} disconnected: switch Play Sound Here off and on to have its sound here again.")
+
     def _changed(self, _bus, _sender, _path, _interface, _signal, parameters):
         _interface, changed, _gone = parameters.unpack()
-        if changed.get("Connected") and not self.stopped:
+        if changed.get("Connected") and not self.stopped and not self.let_go:
             # Back in reach (or it came by itself): its sound asked for again, once it's settled.
             GLib.timeout_add_seconds(2, lambda: (not self.stopped and self._connect(), False)[1])
 
@@ -133,7 +157,7 @@ class BluetoothSound:
 
     def _again(self):
         self.retry = 0
-        if not self.stopped:
+        if not self.stopped and not self.let_go:
             self.start() if not self.device else self._connect()
         return GLib.SOURCE_REMOVE
 
@@ -148,7 +172,7 @@ class BluetoothSound:
             debug("Bluetooth", method, uuid[4:8], "done")
         except GLib.Error as error:
             debug("Bluetooth", method, uuid[4:8], "didn't:", error.message)
-            if method == "ConnectProfile" and uuid == A2DP_SOURCE and not self.stopped:
+            if method == "ConnectProfile" and uuid == A2DP_SOURCE and not self.stopped and not self.let_go:
                 self._ended(f"{self.name}'s sound comes here once it's near, with Bluetooth on.")
                 self._later()
 

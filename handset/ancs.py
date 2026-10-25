@@ -35,6 +35,9 @@ APP_ID, TITLE, SUBTITLE, MESSAGE, POSITIVE_LABEL, NEGATIVE_LABEL = 0, 1, 2, 3, 6
 INCOMING_CALL = 1
 MAX_LENGTH = 512
 PAIRING_S = 5 * 60
+LOOK_AFTER_MS = 500  # BlueZ's changes come in bursts (a connection's services): looked at once they're in
+# A subscription the phone refused is tried again after this long, doubling each time it fails again.
+RETRY_FIRST_S, RETRY_MOST_S = 5, 300
 
 ADVERTISEMENT_XML = """<node><interface name="org.bluez.LEAdvertisement1">
   <method name="Release"/>
@@ -141,6 +144,12 @@ class Ancs:
         self.buffer = b""
         self.app_names: dict[str, str] = {}
         self.registration = 0
+        self.look_timer = 0
+        # Notifications only while the iPhone is connected by cable or Wi-Fi (allow()): until a
+        # phone service or Handset's finder says it is, none.
+        self.allowed = False
+        self.failures = 0  # subscriptions refused in a row
+        self.hold_until = 0.0  # no new subscription before this (one was refused)
 
     # -- start, pairing and advertising
 
@@ -153,7 +162,7 @@ class Ancs:
                                   Gio.DBusSignalFlags.NONE, self._properties)
         for signal in ("InterfacesAdded", "InterfacesRemoved"):
             self.bus.signal_subscribe("org.bluez", "org.freedesktop.DBus.ObjectManager", signal, "/", None,
-                                      Gio.DBusSignalFlags.NONE, lambda *_a: GLib.idle_add(self._look))
+                                      Gio.DBusSignalFlags.NONE, lambda *_a: self._look_soon())
         GLib.timeout_add_seconds(10, self._tick)
         self._look()
 
@@ -162,8 +171,34 @@ class Ancs:
         self.pairing_until = time.monotonic() + PAIRING_S
         self._tick()
 
+    def allow(self, on: bool):
+        """The iPhone connected (by cable or Wi-Fi) or not: off, the computer stops advertising and
+        lets go of the phone's Bluetooth link, so no notification comes; on, it advertises again and
+        the phone comes back to it by itself."""
+        if on == self.allowed:
+            return
+        self.allowed = on
+        debug("iPhone notifications", "on: it's connected" if on else "off: it isn't connected")
+        if not on and self.device:
+            device = self.device
+            self._drop()
+            self.bus.call("org.bluez", device, "org.bluez.Device1", "Disconnect", None, None, Gio.DBusCallFlags.NONE,
+                          10000, None, None, None)
+        self._tick()
+        if on:
+            self._look_soon()
+
+    def _drop(self):
+        """The connected iPhone forgotten (it went, or it's let go)."""
+        self.device, self.chars = None, {}
+        self.queue, self.waiting, self.buffer = [], None, b""
+        self.writes.clear()
+        if self.media:
+            self.media.detach()
+
     def _tick(self):
-        wanted = self.device is None and (time.monotonic() < self.pairing_until or bool(self.known()))
+        pairing = time.monotonic() < self.pairing_until
+        wanted = self.device is None and (pairing or (self.allowed and bool(self.known())))
         if wanted != self.advertising:
             self._advertise(wanted)
         return GLib.SOURCE_CONTINUE
@@ -235,7 +270,7 @@ class Ancs:
     def _properties(self, _bus, _sender, path, _interface, _signal, parameters):
         interface, changed, _gone = parameters.unpack()
         if interface == "org.bluez.Device1" and {"ServicesResolved", "Connected", "Paired"} & set(changed):
-            GLib.idle_add(self._look)
+            self._look_soon()
         elif interface == "org.bluez.GattCharacteristic1" and "Value" in changed:
             value = bytes(changed["Value"])
             if path == self.chars.get(NOTIFICATION_SOURCE):
@@ -244,6 +279,16 @@ class Ancs:
                 self._data(value)
             elif self.media and self.media.owns(path):
                 self.media.changed(path, value)
+
+    def _look_soon(self, delay_ms: int = LOOK_AFTER_MS):
+        """One look once BlueZ's burst of changes is in, however many there are."""
+        if not self.look_timer:
+            self.look_timer = GLib.timeout_add(delay_ms, self._look_now)
+
+    def _look_now(self):
+        self.look_timer = 0
+        self._look()
+        return GLib.SOURCE_REMOVE
 
     def _look(self):
         """A connected device that offers the service: subscribed to, once."""
@@ -254,15 +299,19 @@ class Ancs:
         self._trust_known(objects)
         if self.device and not objects.get(self.device, {}).get("org.bluez.Device1", {}).get("Connected"):
             debug("the iPhone went")
-            self.device, self.chars = None, {}
-            self.queue, self.waiting, self.buffer = [], None, b""
-            self.writes.clear()
+            self._drop()
             self._tick()
         if self.device:
             self._look_media(objects)
             return GLib.SOURCE_REMOVE
         if self.media:
             self.media.detach()
+        if not self.allowed and time.monotonic() >= self.pairing_until:
+            return GLib.SOURCE_REMOVE  # not connected by cable or Wi-Fi: no notifications
+        left = self.hold_until - time.monotonic()
+        if left > 0:
+            self._look_soon(int(left * 1000) + 100)  # refused a moment ago: looked at again then
+            return GLib.SOURCE_REMOVE
         for path, interfaces in objects.items():
             service = interfaces.get("org.bluez.GattService1")
             if not service or service.get("UUID", "").lower() != ANCS:
@@ -322,14 +371,23 @@ class Ancs:
         try:
             bus.call_finish(result)
         except GLib.Error as error:
-            # Not paired yet (the iPhone asks to allow notifications), or it went: tried again
-            # once it's paired (or comes back).
-            debug("iPhone notifications didn't start:", uuid, error.message)
-            if self.device:
-                self.device, self.chars = None, {}
-                GLib.timeout_add_seconds(5, lambda: (self._look(), False)[1])
-            return
+            if "InProgress" in error.message:
+                pass  # BlueZ's word for "this program is subscribed already": as good as done
+            else:
+                # Not paired yet (the iPhone asks to allow notifications), or it went: tried again
+                # later, longer each time it's refused, and never more than once at a time.
+                if self.device:
+                    self.device, self.chars = None, {}
+                    if self.media:
+                        self.media.detach()
+                    self.failures += 1
+                    wait = min(RETRY_FIRST_S * 2 ** (self.failures - 1), RETRY_MOST_S)
+                    self.hold_until = time.monotonic() + wait
+                    debug("iPhone notifications didn't start:", error.message, f"- again in {wait} s")
+                    self._look_soon(wait * 1000 + 100)
+                return
         if uuid == NOTIFICATION_SOURCE and self.address:
+            self.failures = 0
             self.remember(self.address)  # it comes back to this computer now: worth advertising for
 
     def _source(self, value: bytes):

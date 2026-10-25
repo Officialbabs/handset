@@ -257,12 +257,28 @@ def down_events(tracking: int, x: int, y: int) -> list:
 
 
 def move_events(x: int, y: int) -> list:
-    return ["EV_ABS", "ABS_MT_POSITION_X", x, "EV_ABS", "ABS_MT_POSITION_Y", y,
+    return ["EV_ABS", "ABS_MT_SLOT", 0, "EV_ABS", "ABS_MT_POSITION_X", x, "EV_ABS", "ABS_MT_POSITION_Y", y,
             "EV_SYN", "SYN_REPORT", 0]
 
 
 def up_events() -> list:
-    return ["EV_ABS", "ABS_MT_TRACKING_ID", -1, "EV_KEY", "BTN_TOUCH", 0, "EV_SYN", "SYN_REPORT", 0]
+    return ["EV_ABS", "ABS_MT_SLOT", 0, "EV_ABS", "ABS_MT_TRACKING_ID", -1, "EV_KEY", "BTN_TOUCH", 0,
+            "EV_SYN", "SYN_REPORT", 0]
+
+
+def fingers_events(points: list[tuple[int, int]], had: int, tracking: int) -> list:
+    """Several fingers at once (a pinch): the first len(points) slots down or moved to the points
+    (new ones tracked from `tracking` up), the ones after them up to `had` lifted."""
+    events = []
+    for slot, (x, y) in enumerate(points):
+        events += ["EV_ABS", "ABS_MT_SLOT", slot]
+        if slot >= had:
+            events += ["EV_ABS", "ABS_MT_TRACKING_ID", (tracking + slot) % 65536]
+        events += ["EV_ABS", "ABS_MT_POSITION_X", x, "EV_ABS", "ABS_MT_POSITION_Y", y]
+    for slot in range(len(points), had):
+        events += ["EV_ABS", "ABS_MT_SLOT", slot, "EV_ABS", "ABS_MT_TRACKING_ID", -1]
+    events += ["EV_ABS", "ABS_MT_SLOT", 0, "EV_KEY", "BTN_TOUCH", 1 if points else 0, "EV_SYN", "SYN_REPORT", 0]
+    return events
 
 
 class Touch:
@@ -283,6 +299,7 @@ class Touch:
         self.ready = False
         self.ended = False
         self.tracking = 0
+        self.held = 0  # fingers down at once (a pinch)
         self.lock = threading.Lock()
 
     def start(self):
@@ -320,6 +337,14 @@ class Touch:
 
     def up(self):
         self._inject(up_events())
+
+    def fingers(self, points: list[tuple[int, int]]):
+        """Several fingers on the screen at once (none: all up)."""
+        had = self.held
+        if not had and points:
+            self.tracking = (self.tracking + 2) % 65536
+        self._inject(fingers_events(points, had, self.tracking))
+        self.held = len(points)
 
     def _inject(self, events: list):
         if self.ready:
@@ -748,6 +773,11 @@ class Android:
             self.pressed = False
             self.touch.up()
 
+    def fingers(self, points: list[tuple[int, int]]):
+        """Several fingers at once, as the screen shows (a pinch); none: all up."""
+        if self.live_touch:
+            self.touch.fingers([to_natural(x, y, self.link.natural, self.rotation) for x, y in points])
+
     def gesture(self, gesture: Gesture):
         """A whole gesture at once (a scroll, or anything when there's no live touch)."""
         if not self.live_touch:
@@ -760,6 +790,10 @@ class Android:
 
     def key(self, name: str):
         self.commands.run(key_command(name))
+
+    def shortcut(self, letter: str, shift: bool = False):
+        """Ctrl(+Shift)+letter, in order with what was typed."""
+        self.commands.run(combo_command(letter, shift))
 
     def type(self, text: str) -> int:
         """Types `text`; answers how many characters it couldn't."""
@@ -916,6 +950,7 @@ def app_versions(serial: str) -> dict[str, str]:
 INJECT_KEYCODE, INJECT_TEXT, INJECT_TOUCH, START_APP, RESET_VIDEO = 0, 1, 2, 16, 17
 DOWN, UP, MOVE = 0, 1, 2
 FINGER = -2  # scrcpy's "generic finger" pointer
+PINCH_POINTER = 0x100  # a pinch's fingers: pointers of their own from here
 KEYCODES = {
     "back": 4, "enter": 66, "delete": 67, "forward_delete": 112, "tab": 61, "escape": 111,
     "space": 62, "up": 19, "down": 20, "left": 21, "right": 22, "move_home": 122, "move_end": 123,
@@ -924,12 +959,34 @@ KEYCODES = {
 MOST_TEXT = 300  # bytes of text in one message
 
 
-def touch_message(action: int, x: int, y: int, size: tuple[int, int]) -> bytes:
+def touch_message(action: int, x: int, y: int, size: tuple[int, int], pointer: int = FINGER) -> bytes:
     """A finger down, moving or up at (x, y) of a video `size` big: the server drops one whose
-    size isn't the video's as it is now."""
+    size isn't the video's as it is now. Several at once each have a pointer of their own."""
     width, height = size
     pressure = 0 if action == UP else 0xFFFF
-    return struct.pack(">BBqiiHHHii", INJECT_TOUCH, action, FINGER, x, y, width, height, pressure, 0, 0)
+    return struct.pack(">BBqiiHHHii", INJECT_TOUCH, action, pointer, x, y, width, height, pressure, 0, 0)
+
+
+# Ctrl (and Shift) with a letter, as a keyboard sends them: select all, copy, cut, paste, undo and
+# redo in any app's text. Android's meta state for left Ctrl, left Shift; their keys.
+META_CTRL, META_SHIFT = 0x3000, 0x41
+CTRL_LEFT, SHIFT_LEFT = 113, 59
+
+
+def combo_messages(letter: str, shift: bool = False) -> bytes:
+    """INJECT_KEYCODEs for Ctrl(+Shift)+letter: the modifiers pressed, the letter, let go."""
+    code = 29 + ord(letter) - ord("a")  # KEYCODE_A is 29
+    meta = META_CTRL | (META_SHIFT if shift else 0)
+    keys = [(DOWN, CTRL_LEFT, META_CTRL)] + ([(DOWN, SHIFT_LEFT, meta)] if shift else [])
+    keys += [(DOWN, code, meta), (UP, code, meta)]
+    keys += ([(UP, SHIFT_LEFT, META_CTRL)] if shift else []) + [(UP, CTRL_LEFT, 0)]
+    return b"".join(struct.pack(">BBiii", INJECT_KEYCODE, action, key, 0, state) for action, key, state in keys)
+
+
+def combo_command(letter: str, shift: bool = False) -> str:
+    """The same as a shell command (Android 13 and later)."""
+    keys = ["KEYCODE_CTRL_LEFT"] + (["KEYCODE_SHIFT_LEFT"] if shift else []) + [f"KEYCODE_{letter.upper()}"]
+    return "input keycombination " + " ".join(keys)
 
 
 def key_messages(code: int) -> bytes:
@@ -1004,6 +1061,7 @@ class AppScreen:
         self.live_touch = False
         self.pressed = False
         self.finger = (0, 0)  # where the finger is (or was last)
+        self.held: list[tuple[int, int]] = []  # a pinch's fingers, while they're down
         self.stopped = False
         self.problem: str | None = None  # what the server said went wrong
 
@@ -1280,6 +1338,20 @@ class AppScreen:
             self.finger = self._at(x, y)
             self._send(touch_message(MOVE, *self.finger, self.shown))
 
+    def fingers(self, points: list[tuple[int, int]]):
+        """Several fingers at once (a pinch), each a pointer of its own; none: all up."""
+        if not self.live_touch:
+            return
+        had = self.held
+        messages = b""
+        for index, (x, y) in enumerate(points):
+            action = MOVE if index < len(had) else DOWN
+            messages += touch_message(action, *self._at(x, y), self.shown, PINCH_POINTER + index)
+        for index in range(len(points), len(had)):
+            messages += touch_message(UP, *had[index], self.shown, PINCH_POINTER + index)
+        self.held = [self._at(x, y) for x, y in points]
+        self._send(messages)
+
     def release(self):
         if self.pressed:
             self.pressed = False
@@ -1316,6 +1388,9 @@ class AppScreen:
         self._send(text_messages(text))
         return 0
 
+    def shortcut(self, letter: str, shift: bool = False):
+        self._send(combo_messages(letter, shift))
+
 
 # ---- The phone's clipboard ---------------------------------------------------------------------
 
@@ -1324,13 +1399,23 @@ DEVICE_CLIPBOARD, DEVICE_ACK = 0, 1
 MOST_CLIPBOARD = 262130  # bytes: more than the phone's binder takes in one go
 
 
-def clipboard_message(text: str) -> bytes:
-    """SET_CLIPBOARD: no acknowledgement asked, nothing pasted; cut to what the phone takes,
-    never splitting a character."""
+# A paste waits this long at most for the phone to say its clipboard is set.
+SET_WAIT_MS = 1500
+# Images on the phone's clipboard: files in the Shell app's own files, which its provider lends to
+# the app that pastes one (never in the gallery or the phone's files). Only the last one is kept.
+CLIP_FOLDER = "/data/user_de/0/com.android.shell/files/bugreports"
+CLIP_URI = "content://com.android.shell/bugreports/"
+CLIP_PREFIX = "handset-clip-"
+CLIP_EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg"}
+
+
+def clipboard_message(text: str, sequence: int = 0) -> bytes:
+    """SET_CLIPBOARD: acknowledged when `sequence` isn't 0, nothing pasted; cut to what the phone
+    takes, never splitting a character."""
     data = text.encode()
     if len(data) > MOST_CLIPBOARD:
         data = data[:MOST_CLIPBOARD].decode(errors="ignore").encode()
-    return struct.pack(">BQBI", SET_CLIPBOARD, 0, 0, len(data)) + data
+    return struct.pack(">BQBI", SET_CLIPBOARD, sequence, 0, len(data)) + data
 
 
 class ClipboardLink:
@@ -1349,6 +1434,8 @@ class ClipboardLink:
         self.stopped = False
         self.last = None  # the text last seen either way, so neither side hears its own echo
         self.lock = threading.Lock()
+        self.sequence = 0
+        self.waiting: dict[int, Callable[[], None]] = {}  # set's sequence → what waits for it (a paste)
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -1372,17 +1459,62 @@ class ClipboardLink:
             except (OSError, subprocess.SubprocessError):
                 pass
 
-    def set(self, text: str):
-        if not text or text == self.last:
+    def set(self, text: str, then: Callable[[], None] | None = None):
+        """`text` on the phone's clipboard; `then` once it's there (the phone says so, or it was)."""
+        control = self.control
+        if not text or text == self.last or not control:
+            if then:
+                then()
             return
         self.last = text
-        control = self.control
-        if control:
+        self.sequence += 1
+        if then:
+            self.waiting[self.sequence] = then
+            GLib.timeout_add(SET_WAIT_MS, self._set_done, self.sequence)  # in case it never says
+        try:
+            with self.lock:
+                control.sendall(clipboard_message(text, self.sequence if then else 0))
+        except OSError:
+            self._set_done(self.sequence)
+
+    def _set_done(self, sequence: int):
+        then = self.waiting.pop(sequence, None)
+        if then:
+            then()
+        return GLib.SOURCE_REMOVE
+
+    def set_image(self, path: str, mime: str, then: Callable[[], None] | None = None):
+        """An image on the phone's clipboard, for any app that takes images to paste; `then` once
+        it's there (or it couldn't be). Off the main loop: it's a push and a helper run."""
+        threading.Thread(target=self._set_image, args=(path, mime, then), daemon=True).start()
+
+    def _set_image(self, path: str, mime: str, then):
+        import hashlib
+
+        from .androidmedia import HELPER, PHONE_HELPER
+
+        with open(path, "rb") as file:
+            name = f"{CLIP_PREFIX}{hashlib.sha1(file.read()).hexdigest()[:12]}.{CLIP_EXTENSIONS.get(mime, 'png')}"
+        try:
+            # The folder only the Shell app (and adb's shell) may open; the image before goes.
+            shell(self.serial, f"mkdir -p {CLIP_FOLDER} && chmod 700 {CLIP_FOLDER} && "
+                               f"find {CLIP_FOLDER} -name '{CLIP_PREFIX}*' ! -name {name} -delete", timeout=10)
+            adb(self.serial, "push", path, f"{CLIP_FOLDER}/{name}", timeout=60)
             try:
-                with self.lock:
-                    control.sendall(clipboard_message(text))
-            except OSError:
-                pass
+                adb(self.serial, "push", HELPER, PHONE_HELPER, timeout=30)
+            except (OSError, subprocess.SubprocessError) as error:
+                debug("the phone-side jar didn't go (it may be there already):", error)
+            said = shell(self.serial, f"CLASSPATH={PHONE_HELPER} app_process / io.github.officialbabs.handset.HandsetClip "
+                                      f"{CLIP_URI}{name} {shlex.quote(mime)}", timeout=20)
+        except (OSError, subprocess.SubprocessError) as error:
+            said = str(error)
+        if said.strip() == "set":
+            self.last = CLIP_URI + name  # the clip as text, which scrcpy's server says next: not news
+            debug("an image is on the phone's clipboard")
+        else:
+            debug("the image didn't go on the phone's clipboard:", said.strip()[:200])
+        if then:
+            GLib.idle_add(then)
 
     def _run(self):
         delay = 2
@@ -1437,11 +1569,14 @@ class ClipboardLink:
                 if kind == DEVICE_CLIPBOARD:
                     (length,) = struct.unpack(">I", read_exactly(control, 4))
                     text = read_exactly(control, length).decode(errors="replace")
+                    if text.startswith(CLIP_URI + CLIP_PREFIX):
+                        continue  # Handset's own image on the clipboard, as text
                     if text and text != self.last:
                         self.last = text
                         GLib.idle_add(self.on_text, text)
                 elif kind == DEVICE_ACK:
-                    read_exactly(control, 8)
+                    (sequence,) = struct.unpack(">Q", read_exactly(control, 8))
+                    GLib.idle_add(self._set_done, sequence)
                 else:
                     break  # something this doesn't know: start afresh
         except (OSError, ConnectionError):
@@ -1451,6 +1586,19 @@ class ClipboardLink:
         if process and process.poll() is None:
             process.kill()
             process.wait()
+
+
+def screencap(serial: str, path: str) -> bool:
+    """The phone's screen as a PNG at its own size, from the phone itself."""
+    try:
+        done = subprocess.run(adb_command(serial, "exec-out", "screencap -p"), capture_output=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if done.returncode or not done.stdout.startswith(b"\x89PNG"):
+        return False
+    with open(path, "wb") as file:
+        file.write(done.stdout)
+    return True
 
 
 # ---- Files on the phone ----------------------------------------------------------------------
@@ -1469,12 +1617,13 @@ class PhoneFile:
     modified: float  # seconds since the epoch
 
 
-def parse_listing(data: bytes, folder: str) -> list[PhoneFile]:
-    """`find -printf '%M\\t%s\\t%T@\\t%f\\0'` output: folders first, then by name; hidden ones left out."""
+def parse_listing(data: bytes, folder: str, hidden: bool = False) -> list[PhoneFile]:
+    """`find -printf '%M\\t%s\\t%T@\\t%f\\0'` output: folders first, then by name; hidden ones left out
+    (unless `hidden`)."""
     found = []
     for entry in data.split(b"\0"):
         parts = entry.decode(errors="surrogateescape").split("\t", 3)
-        if len(parts) != 4 or not parts[3] or parts[3].startswith("."):
+        if len(parts) != 4 or not parts[3] or (parts[3].startswith(".") and not hidden):
             continue
         mode, size, when, name = parts
         try:
@@ -1523,7 +1672,7 @@ def find_files(serial: str, folder: str, text: str) -> list[PhoneFile] | str:
     return parse_found(result.stdout)
 
 
-def list_folder(serial: str, folder: str) -> list[PhoneFile] | str:
+def list_folder(serial: str, folder: str, hidden: bool = False) -> list[PhoneFile] | str:
     """What's in a folder on the phone, or why not, in words."""
     quoted = shlex.quote(folder.rstrip("/") + "/")
     try:
@@ -1534,7 +1683,7 @@ def list_folder(serial: str, folder: str) -> list[PhoneFile] | str:
         return f"The phone didn't answer ({error})."
     if result.returncode:
         return "The phone didn't list that folder."
-    return parse_listing(result.stdout, folder)
+    return parse_listing(result.stdout, folder, hidden)
 
 
 def free_name(serial: str, folder: str, name: str) -> str:
@@ -1690,11 +1839,15 @@ class SoundLink:
         from gi.repository import Gst
 
         Gst.init(None)
+        from .autopause import HANDSET_SOUND
+
+        # Named, so the sound server (and auto-pause, lowering it a moment) knows it as the phone's.
+        sink = f'pulsesink client-name="{HANDSET_SOUND}"' if Gst.ElementFactory.find("pulsesink") else "autoaudiosink"
         pipeline = Gst.parse_launch(
             "appsrc name=source is-live=true do-timestamp=true format=time "
             'caps="audio/x-opus,channel-mapping-family=(int)0,rate=(int)48000,channels=(int)2" ! '
             "queue max-size-time=200000000 leaky=downstream ! opusdec plc=true ! audioconvert ! audioresample ! "
-            "autoaudiosink sync=false")
+            f"{sink} sync=false")
         pipeline.set_state(Gst.State.PLAYING)
         return pipeline, pipeline.get_by_name("source")
 

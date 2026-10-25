@@ -11,12 +11,13 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from gi.repository import Gio, GLib
 
 # A watch that drops (the service restarting, say) is tried again after this long.
 RECONNECT_MS = 2000
+SERVICE = "/usr/lib/ada/desktop/bin/ada-phones"
 
 
 def socket_path() -> str:
@@ -28,6 +29,124 @@ def socket_path() -> str:
     if runtime:
         return os.path.join(runtime, "ada", "phones.sock")
     return os.path.join(f"/tmp/ada-{os.getuid()}", "ada", "phones.sock")
+
+
+# A phone switched off in Handset (Connected, in its window): listed, but not used at all.
+DISCONNECTED = "Disconnected in Handset"
+# A phone kept to its cable (Over Wi-Fi off): on Wi-Fi alone, it's as if it weren't there.
+CABLE_ONLY = "Plug it in: Wi-Fi is off for it in Handset"
+
+
+def choices() -> tuple[set[str], set[str]]:
+    """The phones switched off in Handset, and the ones kept to their cables (its settings)."""
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    try:
+        with open(os.path.join(config, "handset", "settings.json")) as file:
+            settings = json.load(file)
+    except (OSError, ValueError):
+        return set(), set()
+    if not isinstance(settings, dict):
+        return set(), set()
+    listed = lambda key: {str(p) for p in settings.get(key) or [] if isinstance(p, str)}  # noqa: E731
+    return listed("disconnected"), listed("cable_only")
+
+
+def as_handset_uses(phones: list[Phone]) -> list[Phone]:
+    """The phones with Handset's own choices applied: one switched off is offline to everything
+    in Handset (its window, notifications, clipboard, sound); one kept to its cable is offline
+    while it's on Wi-Fi alone."""
+    off, cable_only = choices()
+    kept = []
+    for phone in phones:
+        if phone.id in off:
+            phone = replace(phone, online=False, usb=False, wifi=False, problem=DISCONNECTED)
+        elif phone.id in cable_only and phone.wifi:
+            phone = replace(phone, online=phone.usb, wifi=False, problem=None if phone.usb else CABLE_ONLY)
+        kept.append(phone)
+    return kept
+
+
+class Choosing:
+    """A watch on the phones (the service's or Handset's finder) with Handset's own choices
+    applied; refresh() applies them again (they changed) to what was heard last. Every one in the
+    process is refreshed by refresh_all()."""
+
+    all: list = []
+
+    def __init__(self, inner, on_state: Callable[[list[Phone]], None]):
+        self.inner = inner
+        self.on_state = on_state
+        self.heard: list[Phone] | None = None
+
+    def start(self):
+        if self not in Choosing.all:
+            Choosing.all.append(self)
+        self.inner.start()
+
+    def stop(self):
+        if self in Choosing.all:
+            Choosing.all.remove(self)
+        self.inner.stop()
+
+    def heard_now(self, phones: list[Phone]):
+        self.heard = phones
+        self.on_state(as_handset_uses(phones))
+
+    def refresh(self):
+        if self.heard is not None:
+            self.on_state(as_handset_uses(self.heard))
+
+
+def refresh_all():
+    """Handset's choices changed (a phone switched off or on, or to its cable): every watch in
+    this process tells its own again."""
+    for choosing in list(Choosing.all):
+        choosing.refresh()
+
+
+def has_service() -> bool:
+    """Whether the desktop has a phone service to ask (Ada's); without one Handset finds the
+    phones itself (finder.py). HANDSET_PHONES=own or =service decides instead (for trying)."""
+    wanted = os.environ.get("HANDSET_PHONES")
+    if wanted in ("own", "service"):
+        return wanted == "service"
+    return os.path.exists(socket_path()) or os.path.exists(SERVICE)
+
+
+def watch(on_state: Callable[[list[Phone]], None], on_gone: Callable[[], None] | None = None):
+    """A watch on the phones, from the service or Handset's own finder, as Handset uses them
+    (as_handset_uses): start(), stop() and refresh()."""
+    choosing = Choosing(None, on_state)
+    if has_service():
+        choosing.inner = Watch(choosing.heard_now, on_gone)
+    else:
+        from .finder import Subscription
+
+        choosing.inner = Subscription(choosing.heard_now, on_gone)
+    return choosing
+
+
+# The desktop's own phone settings (Ada's Settings › Phones), where its phones are set up.
+SETTINGS = ("/usr/lib/ada/desktop/ada-surface", "/usr/share/ada/qml/settings", "show", "phones")
+
+
+def open_phone_settings() -> bool:
+    """The desktop's phone settings opened, where it has them (False where it hasn't)."""
+    if not has_service() or not os.access(SETTINGS[0], os.X_OK):
+        return False
+    import subprocess
+
+    try:
+        subprocess.Popen(SETTINGS, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        return False
+    return True
+
+
+def set_up_where() -> str:
+    """Where a phone is set up, in words to follow "set it up"."""
+    return "with Ada (Settings › Phones)" if has_service() else "in Handset (its Phones window)"
 
 
 @dataclass(frozen=True)
@@ -47,6 +166,17 @@ class Phone:
     address: str | None = None  # on Wi-Fi: where the service reaches it
     port: int | None = None
     model: str = ""  # "Pixel 7", "iPhone 12"
+    battery: int | None = None  # percent, when it's known
+    charging: bool = False
+    system: str = ""  # its version of Android or iOS ("17", "27.0.1")
+    last_seen: float | None = None  # when it was last connected (seconds since the epoch)
+
+    @property
+    def system_name(self) -> str:
+        """"Android 17", "iOS 27.0.1"; "" when not known."""
+        if not self.system:
+            return ""
+        return f"{'iOS' if self.platform == 'ios' else 'Android'} {self.system}"
 
     @property
     def ada_working(self) -> bool:
@@ -55,6 +185,7 @@ class Phone:
     @classmethod
     def from_state(cls, entry: dict) -> Phone:
         using = entry.get("using") if isinstance(entry.get("using"), dict) else None
+        battery = entry.get("battery") if isinstance(entry.get("battery"), dict) else {}
         usb, wifi = bool(entry.get("usb")), bool(entry.get("wifi"))
         return cls(
             id=str(entry.get("id") or ""),
@@ -70,6 +201,10 @@ class Phone:
             address=entry.get("address") or None,
             port=entry.get("port") if isinstance(entry.get("port"), int) else None,
             model=str(entry.get("model") or ""),
+            battery=level if isinstance(level := battery.get("level"), int) else None,
+            charging=bool(battery.get("charging")),
+            system=str(entry.get("ios" if entry.get("platform") == "ios" else "android") or ""),
+            last_seen=entry["last_seen"] / 1000 if isinstance(entry.get("last_seen"), (int, float)) else None,
         )
 
 

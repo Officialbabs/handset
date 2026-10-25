@@ -106,6 +106,9 @@ refresh_caches
 
 echo "==> Keeping connected phones' apps among your apps, from sign-in"
 mkdir -p "$(dirname "$AUTOSTART")"
+# Switched off in Handset's window (Start at Sign-In): kept off.
+HIDDEN=""
+if [ -f "$AUTOSTART" ] && grep -q '^Hidden=true' "$AUTOSTART"; then HIDDEN=1; fi
 {
     echo "[Desktop Entry]"
     echo "Type=Application"
@@ -116,6 +119,7 @@ mkdir -p "$(dirname "$AUTOSTART")"
     echo "Terminal=false"
     echo "NoDisplay=true"
     echo "X-GNOME-Autostart-enabled=true"
+    if [ -n "$HIDDEN" ]; then echo "Hidden=true"; fi
 } > "$AUTOSTART.new"
 mv "$AUTOSTART.new" "$AUTOSTART"
 # Now too, with this copy: the one running goes first.

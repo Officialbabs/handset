@@ -170,8 +170,9 @@ class Ams:
         try:
             bus.call_finish(result)
         except GLib.Error as error:
-            debug("the iPhone's now playing didn't start:", error.message)
-            return
+            if "InProgress" not in error.message:  # BlueZ's "subscribed already" is as good as done
+                debug("the iPhone's now playing didn't start:", error.message)
+                return
         path = self.chars.get(ENTITY_UPDATE)
         if uuid == ENTITY_UPDATE and path:
             # Asked for once its updates are on (it refuses before): its values come at once, then

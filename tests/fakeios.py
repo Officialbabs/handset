@@ -2,7 +2,8 @@
 """A stand-in for handset-ios in Handset's tests (HANDSET_IOS_HELPER): it speaks the helper's
 lines, sends GStreamer's test picture as its screen (H.264, the encoder there is here, and it
 says so), writes every command it gets to FAKEIOS_DIR/commands.jsonl and answers "launch"; its
-`apps` lists APPS, with an icon for the first. FAKEIOS_DARK_AFTER
+`apps` lists APPS, with an icon for the first; `setup STEP` waits a moment and is done.
+FAKEIOS_DARK_AFTER
 (seconds) stops the pictures then, as a dark iPhone does. Never a real phone."""
 
 import json
@@ -43,6 +44,9 @@ def clipboard():
     path = os.path.join(HERE, "phone_clipboard")
     said = [open(path).read() if os.path.exists(path) else None]
 
+    folder = sys.argv[sys.argv.index("--clip-dir") + 1] if "--clip-dir" in sys.argv else None
+    copied = os.path.join(HERE, "copied_image")  # an image copied on the phone, when it's there
+
     def watch():
         while True:
             time.sleep(0.1)
@@ -50,6 +54,10 @@ def clipboard():
             if text is not None and text != said[0]:
                 said[0] = text
                 print(json.dumps({"event": "clipboard", "text": text}), flush=True)
+            if folder and os.path.exists(copied):
+                os.replace(copied, os.path.join(folder, "iphone.png"))
+                print(json.dumps({"event": "clipboard", "image": os.path.join(folder, "iphone.png"),
+                                  "type": "image/png"}), flush=True)
 
     threading.Thread(target=watch, daemon=True).start()
     say(event="clipboard", ready=True)
@@ -62,6 +70,11 @@ def clipboard():
                 said[0] = command["text"]
                 with open(path, "w") as file:
                     file.write(command["text"])
+                print(json.dumps({"event": "clipboard", "set": True, "id": command.get("id")}), flush=True)
+            elif command.get("op") == "set-image":
+                with open(command["path"], "rb") as image, open(os.path.join(HERE, "phone_image"), "wb") as file:
+                    file.write(image.read())
+                print(json.dumps({"event": "clipboard", "set": True, "id": command.get("id")}), flush=True)
     return 0
 
 
@@ -138,15 +151,40 @@ def files():
     return 0
 
 
+def setup(args):
+    """A setup step (setup.rs): it waits for the person a moment, then it's done; a step named
+    in FAKEIOS_DIR/refuse fails instead, and `wifi` writes its --out file."""
+    step = args[1] if len(args) > 1 else ""
+    with open(os.path.join(HERE, "commands.jsonl"), "a") as file:
+        file.write(json.dumps({"op": "setup", "step": step, "args": args[2:]}) + "\n")
+    say(event="waiting", message=f"Do {step} on the iPhone")
+    time.sleep(float(os.environ.get("FAKEIOS_SETUP_S", "0.3")))
+    try:
+        with open(os.path.join(HERE, "refuse")) as file:
+            refused = file.read().split()
+    except OSError:
+        refused = []
+    if step in refused:
+        say(event="error", message=f"The iPhone said no to {step}.")
+        return 1
+    if step == "wifi":
+        with open(args[args.index("--out") + 1], "w") as file:
+            file.write("<plist/>")
+    say(event="done", message=f"{step} done")
+    return 0
+
+
 def main(args):
+    if args[:1] == ["setup"]:
+        return setup(args)
     if args[:1] == ["apps"]:
         return apps(args)
     if args[:1] == ["files"]:
         return files()
     if args[:1] == ["clipboard"]:
         return clipboard()
-    if args[:1] != ["stream"] or "--pairing" not in args or "--udid" not in args:
-        say(event="error", message=f"usage: stream --pairing FILE --udid UDID, not {args}")
+    if args[:1] != ["stream"] or "--udid" not in args:
+        say(event="error", message=f"usage: stream --udid UDID [--pairing FILE], not {args}")
         return 2
     with open(os.path.join(HERE, "args.json"), "w") as file:
         json.dump(args, file)

@@ -33,15 +33,31 @@ except (ImportError, ValueError):
 
 from . import NAME  # noqa: E402
 from .apps import PhoneApp  # noqa: E402
-from .gestures import Fit, Gesture, classify, inside, scroll, to_edge  # noqa: E402
+from .gestures import SCROLL_PER_NOTCH, Fit, Gesture, classify, inside, safe_box, scroll, to_edge  # noqa: E402
 from .log import debug  # noqa: E402
 from .screen import Screen  # noqa: E402
-from .service import Phone, Watch, ada_line, status_line  # noqa: E402
+from .service import Phone, ada_line, set_up_where, status_line, watch  # noqa: E402
 
 # Typed letters wait this long for more, then go to the phone together.
 TYPE_AFTER_MS = 120
-# Wheel movement gathers this long, then scrolls the phone in one swipe.
-SCROLL_AFTER_MS = 90
+# Ctrl with these goes to the phone as its keyboard's shortcut (select all, copy, paste, cut, redo,
+# undo; Command on an iPhone), with Shift too for these (redo; paste as plain text).
+EDIT_KEYS = ("a", "c", "v", "x", "y", "z")
+EDIT_KEYS_SHIFTED = ("z", "v")
+# Without a live finger (Android's `input swipe`), wheel movement gathers this long, then scrolls
+# the phone in one swipe (each swipe done before the next: overlapping, they'd fight).
+SCROLL_AFTER_MS = 320
+# A mouse wheel otherwise is a finger held on the phone: each notch moves it a step, a frame at a
+# time; it rests this long before it lifts (a finger lifted still doesn't fling the page), and as
+# long when it nears the screen's edge, to go down again further in.
+WHEEL_FRAME_MS = 16
+WHEEL_STILL_MS = 140
+# A pinch: two fingers on the phone this far apart (of its screen's shorter side) to begin with,
+# spreading and closing as the touchpad's fingers do; with Ctrl and a mouse wheel, by this much a
+# notch (up spreads them: zooms in), lifted once the wheel has rested this long.
+PINCH_START = 0.25
+PINCH_PER_NOTCH = 1.18
+PINCH_REST_MS = 350
 # A touchpad's scroll lifts its finger off the phone when no movement has come for this long
 # (in case the touchpad never says it stopped).
 LIFT_AFTER_MS = 160
@@ -59,7 +75,11 @@ PICTURE_TRIES = 3
 # A middle-button press that moves further than this drags the window instead of going home.
 MOVE_SLOP = 6
 # The most of the monitor the window takes either way, leaving room for the desktop's own bars.
-SCREEN_SHARE = 0.8
+SCREEN_SHARE = 0.9
+# App windows share one size (and whether they're maximized): the one any was given last.
+APPS_SIZE = "apps"
+# Sizes kept from this on are the person's own (before, the default was smaller): settings.
+SIZES_SINCE = 2
 # The bezel above the screen, held to move the window (there's no title bar).
 BEZEL = 22
 FRAME = BEZEL  # what the window has besides the screen
@@ -79,8 +99,8 @@ CSS = b"""
 .handset-grip { background: alpha(white, 0.32); border-radius: 3px; min-width: 44px; min-height: 5px; }
 .handset-window:not(.on-screen) .handset-bezel { background: none; }
 .handset-window:not(.on-screen) .handset-grip { background: alpha(currentColor, 0.2); }
-.handset-bezel-button { min-width: 18px; min-height: 18px; padding: 0; margin: 0 2px; border-radius: 999px;
-                        background: none; box-shadow: none; color: alpha(white, 0.5); -gtk-icon-size: 12px; }
+.handset-bezel-button { min-width: 20px; min-height: 20px; padding: 0; margin: 0 2px; border-radius: 999px;
+                        background: none; box-shadow: none; color: alpha(white, 0.55); -gtk-icon-size: 13px; }
 .handset-bezel-button:hover { background: alpha(white, 0.14); color: white; }
 .handset-bezel-button.close:hover { background: #e01b24; color: white; }
 .handset-window:not(.on-screen) .handset-bezel-button { color: inherit; opacity: 0.6; }
@@ -99,6 +119,7 @@ SHORTCUTS = (
     ("win.next-phone", ["<Control>p"]),
     ("win.phone-apps", ["<Control><Shift>a"]),
     ("win.phone-files", ["<Control><Shift>f"]),
+    ("win.screenshot", ["<Control><Shift>s", "Print"]),
     ("win.fullscreen", ["F11"]),
     ("window.close", ["<Control>w"]),
     ("app.quit", ["<Control>q"]),
@@ -135,9 +156,10 @@ def save_settings(settings: dict):
 
 
 def migrated(settings: dict) -> dict:
-    """Settings as Handset keeps them since it has a window per phone: the phones with windows
-    ("windows"), and each phone's window size ("sizes": its screen's longer side) and whether
-    it's maximized ("maximized"). The one-window settings before that move over."""
+    """Settings as Handset keeps them since it has a window per phone: each phone's window size
+    ("sizes": its screen's longer side) and whether it's maximized ("maximized"). The one-window
+    settings before that move over; which phones had windows ("windows") isn't kept any more:
+    Handset opens on its main window."""
     settings = dict(settings)
     sizes = settings.get("sizes") if isinstance(settings.get("sizes"), dict) else {}
     maximized = settings.get("maximized") if isinstance(settings.get("maximized"), dict) else {}
@@ -148,10 +170,13 @@ def migrated(settings: dict) -> dict:
             sizes.setdefault(phone, size)
         if was_maximized:
             maximized.setdefault(phone, True)
-        settings.setdefault("windows", [phone])
+    settings.pop("windows", None)
+    if settings.get("sizes_since") != SIZES_SINCE:
+        # Sizes kept before windows opened bigger were mostly the old, smaller default, never
+        # chosen: windows open at the new one, and keep what they're given from now on.
+        sizes, maximized = {}, {}
+        settings["sizes_since"] = SIZES_SINCE
     settings["sizes"], settings["maximized"] = sizes, maximized
-    if not isinstance(settings.get("windows"), list):
-        settings["windows"] = []
     return settings
 
 
@@ -226,6 +251,13 @@ class Window(Adw.ApplicationWindow):
         self.type_timer = 0
         self.scrolled = 0.0
         self.scrolled_x = 0.0
+        self.wheel_at: tuple[float, float] | None = None  # the wheel's finger, while it's down
+        self.wheel_to = (0.0, 0.0)  # where the notches so far take it
+        self.wheel_timer = 0
+        self.pinch_at: tuple[int, int] | None = None  # a pinch's middle on the phone, while it's on
+        self.pinch_scale = 1.0  # how far its fingers are spread, of where they began
+        self.pinch_to = 1.0  # Ctrl and the wheel: how far they're going
+        self.pinch_timer = 0
         self.scroll_timer = 0
         self.scroll_finger: tuple[float, float] | None = None  # the touchpad's finger on the phone
         self.lift_timer = 0
@@ -251,32 +283,44 @@ class Window(Adw.ApplicationWindow):
         self.connect("notify::is-active", self._activated)
         for name in ("default-width", "default-height", "maximized"):
             self.connect(f"notify::{name}", self._resized)
-        self.watch = Watch(self._phones_changed, self._service_gone)
+        self.watch = watch(self._phones_changed, self._service_gone)
         self.watch.start()
         if app.clipboard:
             app.clipboard.watch(self)
         self._show_status("phone-symbolic", "Looking for your phones…", "")
 
     def _mapped(self, _window):
-        """An app's window goes by the app's own id, so the dock counts it as that app. Set once
-        it's mapped: GTK gives every window the application's id as it maps it, and the
-        compositor takes the id it has when the window's first picture comes, just after."""
-        if not self.phone_app or GdkWayland is None:
-            return
+        """An app's window goes by the app's own id, so the dock counts it as that app; a phone's
+        by its phone's (apps.phone_app_id), so each phone is in the dock on its own. Set once it's
+        mapped: GTK gives every window the application's id as it maps it, and the compositor takes
+        the id it has when the window's first picture comes, just after (a phone chosen later
+        tries again)."""
+        self._take_id()
+
+    def _take_id(self):
+        from .apps import phone_app_id
+
+        phone_id = self.phone.id if self.phone else self.wanted
+        wanted = self.phone_app.id if self.phone_app else (phone_app_id(phone_id) if phone_id else None)
         surface = self.get_surface()
-        if isinstance(surface, GdkWayland.WaylandToplevel):
-            try:
-                GdkWayland.WaylandToplevel.set_application_id(surface, self.phone_app.id)
-            except (TypeError, AttributeError) as error:
-                debug("the window keeps Handset's id:", error)
+        if not wanted or GdkWayland is None or not isinstance(surface, GdkWayland.WaylandToplevel):
+            return
+        if getattr(self, "app_id", None) == wanted:
+            return
+        try:
+            GdkWayland.WaylandToplevel.set_application_id(surface, wanted)
+            self.app_id = wanted
+        except (TypeError, AttributeError) as error:
+            debug("the window keeps Handset's id:", error)
 
     def own_screen(self) -> bool:
         """Whether this window shows an app on a screen of its own (no edges to swipe from)."""
         return bool(self.phone_app) and self.device is not None and hasattr(self.device, "package")
 
     def size_key(self, phone_id: str | None) -> str | None:
-        """What this window's size is remembered by: its app, or its phone."""
-        return self.phone_app.id if self.phone_app else phone_id
+        """What this window's size is remembered by: its phone; an app's window, the one size app
+        windows share (sized once, every app opens so)."""
+        return APPS_SIZE if self.phone_app else phone_id
 
     # ---- Layout ---------------------------------------------------------------------------
 
@@ -337,11 +381,24 @@ class Window(Adw.ApplicationWindow):
         self.here_button.add_css_class("pill")
         self.here_button.add_css_class("suggested-action")
         self.here_button.connect("clicked", lambda _b: self.take_screen())
+        # Setting a phone up (in the desktop's phone settings, or Handset's own steps).
+        self.setup_button = Gtk.Button(label="Set Up a Phone…", halign=Gtk.Align.CENTER, visible=False)
+        self.setup_button.add_css_class("pill")
+        self.setup_button.add_css_class("suggested-action")
+        self.setup_button.connect("clicked", lambda _b: self._set_up_phone())
+        # A phone switched off in Handset: switched on again here.
+        self.connect_button = Gtk.Button(label="Connect", halign=Gtk.Align.CENTER, visible=False)
+        self.connect_button.add_css_class("pill")
+        self.connect_button.add_css_class("suggested-action")
+        self.connect_button.connect("clicked", lambda _b: self.phone and
+                                    self.get_application().choose_phone(self.phone.id, connected=True))
         self.picker = Gtk.DropDown(visible=False, halign=Gtk.Align.CENTER, tooltip_text="Which phone")
         self.picker.connect("notify::selected", self._picked)
         choices = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         choices.append(self.wake_button)
         choices.append(self.here_button)
+        choices.append(self.setup_button)
+        choices.append(self.connect_button)
         choices.append(self.again)
         choices.append(self.picker)
         self.status.set_child(choices)
@@ -353,16 +410,18 @@ class Window(Adw.ApplicationWindow):
         self.stack.add_named(self.frame, "screen")
         grip = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
         grip.add_css_class("handset-grip")
-        top = grip
+        # On the left a screenshot (and an app's window, the whole phone), on the right minimizing
+        # and closing: quiet until hovered.
+        top = Gtk.CenterBox(center_widget=grip)
+        starts = Gtk.Box()
         if self.phone_app:
-            # An app's window: the whole phone on the left, minimizing and closing on the right,
-            # quiet until hovered.
-            top = Gtk.CenterBox(center_widget=grip)
-            top.set_start_widget(self._bezel_button("phone-symbolic", "Show the whole phone", "win.whole-phone"))
-            ends = Gtk.Box()
-            ends.append(self._bezel_button("window-minimize-symbolic", "Minimize", "window.minimize"))
-            ends.append(self._bezel_button("window-close-symbolic", "Close", "window.close", "close"))
-            top.set_end_widget(ends)
+            starts.append(self._bezel_button("phone-symbolic", "Show the whole phone", "win.whole-phone"))
+        starts.append(self._bezel_button("camera-photo-symbolic", "Screenshot (Ctrl+Shift+S)", "win.screenshot"))
+        top.set_start_widget(starts)
+        ends = Gtk.Box()
+        ends.append(self._bezel_button("window-minimize-symbolic", "Minimize", "window.minimize"))
+        ends.append(self._bezel_button("window-close-symbolic", "Close", "window.close", "close"))
+        top.set_end_widget(ends)
         self.bezel = Gtk.WindowHandle(child=top, height_request=BEZEL,
                                       tooltip_text="Drag to move · Right-click for more")
         self.bezel.add_css_class("handset-bezel")
@@ -399,6 +458,13 @@ class Window(Adw.ApplicationWindow):
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", lambda _c, x, y: setattr(self, "pointer", (x, y)))
         self.screen.add_controller(motion)
+        # A touchpad's pinch, as two fingers pinching on the phone (to zoom a map, a photo).
+        zoom = Gtk.GestureZoom()
+        zoom.connect("begin", self._pinch_begin)
+        zoom.connect("scale-changed", lambda _g, scale: self._pinch(scale))
+        zoom.connect("end", lambda *_a: self._pinch_end())
+        zoom.connect("cancel", lambda *_a: self._pinch_end())
+        self.screen.add_controller(zoom)
         wheel = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.BOTH_AXES)
         wheel.connect("scroll", self._wheel)
         wheel.connect("scroll-end", lambda _c: self._lift_scroll())
@@ -425,6 +491,7 @@ class Window(Adw.ApplicationWindow):
         self._action("pin", lambda _a, _p: self._pin_this(True))
         self._action("unpin", lambda _a, _p: self._pin_this(False))
         self._action("whole-phone", lambda _a, _p: self.phone and self.get_application().open_window(self.phone.id))
+        self._action("screenshot", lambda _a, _p: self.screenshot())
         self._action("fullscreen", lambda _a, _p: self.unfullscreen() if self.is_fullscreen() else self.fullscreen())
         for action, accels in SHORTCUTS:
             self.get_application().set_accels_for_action(action, accels)
@@ -439,6 +506,60 @@ class Window(Adw.ApplicationWindow):
             button.add_css_class(name)
         return button
 
+    def screenshot(self):
+        """The phone's screen as a picture at its own size: in Pictures › Screenshots, and on the
+        clipboard. The whole phone's from the phone itself (an Android phone's screencap, an
+        iPhone's screen capture service); an app's own screen as it's shown here."""
+        from . import android, iphone
+
+        phone, device = self.phone, self.device
+        if not phone or not device:
+            self.say("Nothing to take a picture of yet")
+            return
+        folder = os.path.join(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES)
+                              or os.path.expanduser("~/Pictures"), "Screenshots")
+        os.makedirs(folder, exist_ok=True)
+        name = self.phone_app.name if self.phone_app else phone.name
+        path = os.path.join(folder, f"{name} {time.strftime('%Y-%m-%d %H.%M.%S')}.png")
+        serial = self._serial()
+        link = getattr(device, "link", None)
+
+        def take():
+            done = False
+            if serial and not self.phone_app:
+                done = android.screencap(serial, path)
+            elif isinstance(link, iphone.Link):
+                files = iphone.FilesSession(link)
+                answer = files._ask({"op": "screenshot", "to": path})
+                files.stop()
+                done = isinstance(answer, dict) and answer.get("event") == "screenshot"
+            GLib.idle_add(taken, done)
+
+        def taken(done: bool):
+            if not done:  # as it's shown here
+                texture = self.picture.get_paintable()
+                if not isinstance(texture, Gdk.Texture):
+                    self.say("The screenshot didn't work")
+                    return GLib.SOURCE_REMOVE
+                texture.save_to_png(path)
+            self._screenshot_taken(path)
+            return GLib.SOURCE_REMOVE
+
+        threading.Thread(target=take, daemon=True).start()
+
+    def _screenshot_taken(self, path: str):
+        from .clipboard import read_file, wl_copy
+
+        if not wl_copy(read_file(path), "image/png"):
+            try:
+                self.get_clipboard().set_texture(Gdk.Texture.new_from_filename(path))
+            except GLib.Error:
+                pass
+        toast = Adw.Toast(title="Screenshot saved and copied", button_label="Show")
+        toast.connect("button-clicked", lambda _t: Gio.AppInfo.launch_default_for_uri(
+            Gio.File.new_for_path(os.path.dirname(path)).get_uri(), None))
+        self.toasts.add_toast(toast)
+
     def _bezel_menu(self, gesture, _n, x, y):
         """Right-click on the bezel: the phone's apps (or, for an app's window, its pin)."""
         from . import apps
@@ -451,13 +572,16 @@ class Window(Adw.ApplicationWindow):
             menu.append("Unpin from the Dock" if pinned else "Pin to the Dock", "win.unpin" if pinned else "win.pin")
             menu.append("Show the Whole Phone", "win.whole-phone")
             menu.append("Phone Files…", "win.phone-files")
+            menu.append("Take a Screenshot", "win.screenshot")
             menu.append("Play Sound Here", "win.sound-here")
         else:
             menu.append("Phone Apps…", "win.phone-apps")
             menu.append("Phone Files…", "win.phone-files")
+            menu.append("Take a Screenshot", "win.screenshot")
             menu.append("Play Sound Here", "win.sound-here")
             menu.append("Pair an iPhone for Notifications…", "win.pair-iphone")
             menu.append("New Window", "app.new-window")
+            menu.append("Phones and Settings…", "app.phones")
         popover = Gtk.PopoverMenu(menu_model=menu, has_arrow=False, halign=Gtk.Align.START)
         popover.set_parent(self.bezel)
         point = Gdk.Rectangle()
@@ -500,13 +624,13 @@ class Window(Adw.ApplicationWindow):
     def _take_size(self, phone_id: str | None):
         """The size the person gave this phone's (or app's) window last time, as the monitor allows."""
         sizes, maximized = self.settings.get("sizes", {}), self.settings.get("maximized", {})
-        phone_id = self.size_key(phone_id)
-        saved = sizes.get(phone_id) if phone_id else None
+        key = self.size_key(phone_id)
+        saved = sizes.get(key) if key else None
         if not isinstance(saved, int) or saved <= 0:
             saved = None
         ratio = (lambda w, h: w / h)(*self.device.shown) if self.device else FIRST_RATIO
         self.set_default_size(*window_size(ratio, self._monitor(), saved, self.border))
-        if phone_id and maximized.get(phone_id):
+        if key and maximized.get(key):
             self.maximize()
 
     def _monitor(self) -> tuple[int, int]:
@@ -544,10 +668,20 @@ class Window(Adw.ApplicationWindow):
         action.connect("activate", callback)
         self.add_action(action)
 
+    def _set_up_phone(self):
+        """Setting a phone up: in the desktop's phone settings where it has them, else in
+        Handset's own window."""
+        from .service import open_phone_settings
+
+        if not open_phone_settings():
+            self.get_application().show_phones().add_phone()
+
     def _show_status(self, icon: str, title: str, description: str, again: bool = False,
-                     wake: bool = False):
+                     wake: bool = False, setup: bool = False, connect: bool = False):
         debug("window shows:", title, "·", description)
         self.wake_button.set_visible(wake)
+        self.connect_button.set_visible(connect)
+        self.setup_button.set_visible(setup)
         self.here_button.set_visible(self.gave_screen)
         self.status.set_icon_name(icon)
         self.status.set_title(title)
@@ -573,7 +707,7 @@ class Window(Adw.ApplicationWindow):
                 self._close_phone()
                 self.phone = None
                 self._show_status("phone-symbolic", f"{self.phone_app.phone_name} isn't here",
-                                  "Set it up with Ada (Settings › Phones), and plug it in.")
+                                  f"Set it up {set_up_where()}, and plug it in.")
                 return
             self._show_phone(phone)
             return
@@ -632,14 +766,15 @@ class Window(Adw.ApplicationWindow):
             self.phone = None
             self.set_title(NAME)
             self._show_status("phone-symbolic", "No phones yet",
-                              "Plug your phone in and set it up with Ada (Settings › Phones).")
+                              f"Plug your phone in and set it up {set_up_where()}.", setup=True)
             return
         changed = self.phone is None or self.phone.id != phone.id
         was_online = bool(self.phone and self.phone.online) and not changed
         self.phone = phone
         if changed:
             self._take_size(phone.id)
-            self.get_application().remember_windows()
+            if self.get_mapped():
+                self._take_id()  # a phone chosen once the window was open
         index = next(i for i, p in enumerate(self.phones) if p.id == phone.id)
         if self.picker.get_selected() != index:
             self.picker.set_selected(index)
@@ -648,7 +783,21 @@ class Window(Adw.ApplicationWindow):
         else:
             self.set_title(f"{phone.name} – {status_line(phone)}")
         self._show_ada(phone)
-        if phone.platform == "ios":
+        from .finder import UNTRUSTED
+        from .service import CABLE_ONLY, DISCONNECTED
+
+        if phone.problem == DISCONNECTED:
+            self._let_go()
+            self._show_status("phone-symbolic", f"{phone.name} is disconnected",
+                              "Handset leaves it alone: no screen, notifications, clipboard or sound.", connect=True)
+        elif phone.problem == CABLE_ONLY:
+            self._let_go()
+            self._show_status("phone-symbolic", f"{phone.name} is on Wi-Fi", phone.problem)
+        elif phone.problem == UNTRUSTED:
+            self._close_phone()
+            self._show_status("phone-symbolic", f"{phone.name} doesn't trust this computer yet",
+                              f"Set it up {set_up_where()}: unlock it, and tap Trust when it asks.", setup=True)
+        elif phone.platform == "ios":
             # Handset's helper looks for an iPhone by its cable and on Wi-Fi by itself; Ada's service
             # seeing it come back (plugged in, say) is a good moment to try again, though.
             if changed or (phone.online and not was_online and self.device is None and not self.opening):
@@ -659,6 +808,17 @@ class Window(Adw.ApplicationWindow):
                               "Plug it in, or keep it on the same Wi-Fi as this computer.")
         elif changed or not was_online:
             self._open()
+
+    def _let_go(self):
+        """The phone's screen closed, and its clipboard and sound let go (unless another window
+        shows it)."""
+        self._close_phone()
+        app = self.get_application()
+        showing = {w.phone.id for w in app.handset_windows() if w.phone and w.device and w is not self}
+        if app.clipboard:
+            app.clipboard.release(showing)
+        if app.sound:
+            app.sound.release(showing)
 
     def _show_ada(self, phone: Phone):
         # Ada works on the phone's own screen, not on an app's screen of its own.
@@ -708,7 +868,8 @@ class Window(Adw.ApplicationWindow):
                                         self._video_ended, self._awake_changed,
                                         on_status=self._helper_status)
             self.device.looks_dark = self.picture.is_dark
-            self._link_clipboard(lambda on_text: iphone.ClipboardLink(link, on_text))
+            self.device.shared = lambda: bool(self.phone and self.phone.ada_working)
+            self._link_clipboard(lambda on_text, on_image: iphone.ClipboardLink(link, on_text, on_image))
             if self.phone_app:
                 self.device.on_launched = self._launched
                 self.device.launch(self.phone_app.app)
@@ -728,7 +889,7 @@ class Window(Adw.ApplicationWindow):
         else:
             edge = android.stream_edge(round(min(self._monitor()) * self._monitor_scale()), link.natural)
         debug("asking the phone for video", edge or "at its own size")
-        self._link_clipboard(lambda on_text: android.ClipboardLink(link.serial, on_text))
+        self._link_clipboard(lambda on_text, _on_image: android.ClipboardLink(link.serial, on_text))
         GLib.idle_add(self._resume_sound)
         if self.phone_app:
             self.device = android.AppScreen(link, self.phone_app.app, self._frame, self._turned,
@@ -789,6 +950,8 @@ class Window(Adw.ApplicationWindow):
         def send():
             sent, where, trouble = files.deliver(paths)
             files.stop()
+            if getattr(files, "opened_shortcuts", False):
+                GLib.idle_add(self._back_to_app)
             if "set up" in where:
                 GLib.idle_add(self._photos_setup)
                 where = where.replace("set up", f"Files › On My iPhone, waiting for Photos")
@@ -802,6 +965,18 @@ class Window(Adw.ApplicationWindow):
 
         threading.Thread(target=send, daemon=True).start()
         return True
+
+    def _back_to_app(self):
+        """After a drop put Shortcuts in front: the phone back in the app it was in (this window's
+        own app, or the one used before Shortcuts)."""
+        device = self.device
+        if device is None or not getattr(device, "live_touch", False):
+            return GLib.SOURCE_REMOVE
+        if self.phone_app:
+            device.launch(self.phone_app.app)
+        else:
+            device.key("previous_app")
+        return GLib.SOURCE_REMOVE
 
     def _photos_setup(self):
         """How to have dropped photos land in the iPhone's Photos: a shortcut, made once."""
@@ -978,6 +1153,14 @@ class Window(Adw.ApplicationWindow):
             self.get_application().app_display(self, serial, display)
 
     def _close_phone(self):
+        if self.wheel_timer:
+            GLib.source_remove(self.wheel_timer)
+            self.wheel_timer = 0
+        self.wheel_at = None  # its finger goes with the phone's screen
+        if self.pinch_timer:
+            GLib.source_remove(self.pinch_timer)
+            self.pinch_timer = 0
+        self.pinch_at = None
         if self.display:
             self.get_application().app_display_gone(self)
         if self.picture_timer:
@@ -1084,7 +1267,6 @@ class Window(Adw.ApplicationWindow):
             GLib.source_remove(self.size_timer)
         self._remember_size()
         app = self.get_application()
-        app.remember_windows(closing=self)
         if self.phone and self.phone.platform == "ios" and not self.gave_screen:
             app.screen_back(self)
         others = {w.phone.id for w in app.handset_windows() if w.phone and w is not self}
@@ -1104,6 +1286,9 @@ class Window(Adw.ApplicationWindow):
         return Fit((self.screen.get_width(), self.screen.get_height()), self.device.shown)
 
     def _drag_begin(self, gesture, x, y):
+        if self.wheel_timer:  # a click while the wheel's finger is down: that finger goes first
+            GLib.source_remove(self.wheel_timer)
+        self._wheel_lift()
         if self.gave_screen:
             self.take_screen()  # a click on an iPhone's window showing its last picture
             gesture.set_state(Gtk.EventSequenceState.DENIED)
@@ -1219,11 +1404,17 @@ class Window(Adw.ApplicationWindow):
         if not self.device:
             return False
         unit = controller.get_unit()
+        if unit == Gdk.ScrollUnit.WHEEL and controller.get_current_event_state() & Gdk.ModifierType.CONTROL_MASK:
+            self._wheel_pinch(dy)  # Ctrl and the wheel: a pinch, as zooming does everywhere else
+            return True
         # A mouse wheel turned with Shift held scrolls sideways, as everywhere else.
         if unit == Gdk.ScrollUnit.WHEEL and dx == 0 and controller.get_current_event_state() & Gdk.ModifierType.SHIFT_MASK:
             dx, dy = dy, 0.0
         if unit == Gdk.ScrollUnit.SURFACE and self.device.live_touch:
             self._finger_scroll(dx, dy)
+            return True
+        if unit == Gdk.ScrollUnit.WHEEL and self.device.live_touch:
+            self._wheel_notch(dx, dy)
             return True
         # A wheel's notch is 1; a touchpad (with no live finger) says pixels.
         per = 1 if unit == Gdk.ScrollUnit.WHEEL else 40
@@ -1242,6 +1433,143 @@ class Window(Adw.ApplicationWindow):
             gesture = scroll(fit, self.pointer, down, right)
             if gesture:
                 self.device.gesture(gesture)
+        return GLib.SOURCE_REMOVE
+
+    def _wheel_notch(self, right: float, down: float):
+        """A mouse wheel's notch: the finger held for the wheel goes down where the pointer is (if
+        it isn't down already), and is to move a step against the scroll."""
+        fit = self._fit()
+        if not fit:
+            return
+        sw, sh = self.device.shown
+        if self.wheel_at is None:
+            start = fit.to_screen(*self.pointer)
+            if start is None:
+                return
+            x, y = inside((sw, sh), *start)
+            self.wheel_at = self.wheel_to = (float(x), float(y))
+            self.device.press(x, y)
+        x, y = self.wheel_to
+        self.wheel_to = (x - right * SCROLL_PER_NOTCH * sw, y - down * SCROLL_PER_NOTCH * sh)
+        self._wheel_go(WHEEL_FRAME_MS)
+
+    def _wheel_go(self, after: int):
+        if self.wheel_timer:
+            GLib.source_remove(self.wheel_timer)
+        self.wheel_timer = GLib.timeout_add(after, self._wheel_step)
+
+    def _wheel_step(self):
+        """A frame of the wheel's finger: a part of the way to where the notches take it, kept off
+        the screen's edges; there, still, then up, and down again on the far side for the rest;
+        arrived, still, then up."""
+        self.wheel_timer = 0
+        if self.wheel_at is None or not self.device:
+            return GLib.SOURCE_REMOVE
+        (x, y), (tx, ty) = self.wheel_at, self.wheel_to
+        left, top, right, bottom = safe_box(self.device.shown)
+        cx, cy = min(max(tx, left), right), min(max(ty, top), bottom)
+        nx, ny = x + (cx - x) * 0.35, y + (cy - y) * 0.35
+        if abs(cx - nx) < 1.5 and abs(cy - ny) < 1.5:
+            nx, ny = cx, cy
+        if (round(nx), round(ny)) != (round(x), round(y)):
+            self.wheel_at = (nx, ny)
+            self.device.drag(round(nx), round(ny))
+            self._wheel_go(WHEEL_FRAME_MS)
+        elif (cx, cy) != (tx, ty):
+            self.wheel_timer = GLib.timeout_add(WHEEL_STILL_MS, self._wheel_again)  # the rest from further in
+        else:
+            self.wheel_timer = GLib.timeout_add(WHEEL_STILL_MS, self._wheel_lift)
+        return GLib.SOURCE_REMOVE
+
+    def _wheel_again(self):
+        """At the edge, still: up, and down again on the far side, for what's left of the way."""
+        self.wheel_timer = 0
+        if self.wheel_at is None or not self.device:
+            return GLib.SOURCE_REMOVE
+        (x, y), (tx, ty) = self.wheel_at, self.wheel_to
+        left, top, right, bottom = safe_box(self.device.shown)
+        sx = right if tx < left else left if tx > right else x
+        sy = bottom if ty < top else top if ty > bottom else y
+        self.device.release()
+        self.wheel_at, self.wheel_to = (float(sx), float(sy)), (sx + tx - x, sy + ty - y)
+        self.device.press(round(sx), round(sy))
+        self._wheel_go(WHEEL_FRAME_MS)
+        return GLib.SOURCE_REMOVE
+
+    # ---- Pinching ------------------------------------------------------------------------------
+
+    def _pinch_fingers(self, scale: float) -> list[tuple[int, int]]:
+        """The pinch's two fingers, either side of its middle, kept on the screen."""
+        sw, sh = self.device.shown
+        half = PINCH_START * min(sw, sh) * scale / 2
+        cx, cy = self.pinch_at
+        return [(round(min(max(cx - half, 0), sw - 1)), cy), (round(min(max(cx + half, 0), sw - 1)), cy)]
+
+    def _pinch_start(self, x: float, y: float) -> bool:
+        """Two fingers down on the phone either side of the window's point (x, y)."""
+        fit = self._fit()
+        device = self.device
+        if not fit or not device or not getattr(device, "live_touch", False) or not hasattr(device, "fingers"):
+            return False
+        at = fit.to_screen(x, y)
+        if at is None:
+            return False
+        self._wheel_lift()  # one gesture at a time
+        self.pinch_at, self.pinch_scale = at, 1.0
+        device.fingers(self._pinch_fingers(1.0))
+        return True
+
+    def _pinch_begin(self, gesture, _sequence):
+        found, x, y = gesture.get_bounding_box_center()
+        if not found or not self._pinch_start(x, y):
+            gesture.set_state(Gtk.EventSequenceState.DENIED)
+
+    def _pinch(self, scale: float):
+        if self.pinch_at is not None and self.device:
+            self.pinch_scale = min(max(scale, 0.2), 5.0)
+            self.device.fingers(self._pinch_fingers(self.pinch_scale))
+
+    def _pinch_end(self):
+        if self.pinch_timer:
+            GLib.source_remove(self.pinch_timer)
+            self.pinch_timer = 0
+        if self.pinch_at is not None:
+            self.pinch_at = None
+            if self.device:
+                self.device.fingers([])
+        return GLib.SOURCE_REMOVE
+
+    def _wheel_pinch(self, dy: float):
+        """Ctrl and a notch of the wheel: the fingers (put down where the pointer is, the first
+        time) spread or close a step, a frame at a time, and lift once the wheel rests."""
+        if self.pinch_at is None:
+            if not self._pinch_start(*self.pointer):
+                return
+            self.pinch_to = 1.0
+        self.pinch_to = min(max(self.pinch_to * PINCH_PER_NOTCH ** -dy, 0.2), 5.0)
+        if self.pinch_timer:
+            GLib.source_remove(self.pinch_timer)
+        self.pinch_timer = GLib.timeout_add(WHEEL_FRAME_MS, self._pinch_step)
+
+    def _pinch_step(self):
+        self.pinch_timer = 0
+        if self.pinch_at is None or not self.device:
+            return GLib.SOURCE_REMOVE
+        step = (self.pinch_to - self.pinch_scale) * 0.35
+        if abs(self.pinch_to - self.pinch_scale) < 0.01:
+            self.pinch_timer = GLib.timeout_add(PINCH_REST_MS, self._pinch_end)  # still, then up
+            return GLib.SOURCE_REMOVE
+        self.pinch_scale += step
+        self.device.fingers(self._pinch_fingers(self.pinch_scale))
+        self.pinch_timer = GLib.timeout_add(WHEEL_FRAME_MS, self._pinch_step)
+        return GLib.SOURCE_REMOVE
+
+    def _wheel_lift(self):
+        self.wheel_timer = 0
+        if self.wheel_at is not None:
+            self.wheel_at = None
+            if self.device:
+                self.device.release()
         return GLib.SOURCE_REMOVE
 
     def _finger_scroll(self, dx: float, dy: float):
@@ -1301,6 +1629,12 @@ class Window(Adw.ApplicationWindow):
     def _key_pressed(self, _controller, keyval, _keycode, state):
         if not self.device:
             return False
+        if state & Gdk.ModifierType.CONTROL_MASK and not state & (Gdk.ModifierType.ALT_MASK | Gdk.ModifierType.SUPER_MASK):
+            letter = (Gdk.keyval_name(Gdk.keyval_to_lower(keyval)) or "").lower()
+            shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+            if letter in EDIT_KEYS and (not shift or letter in EDIT_KEYS_SHIFTED):
+                self._edit(letter, shift)
+                return True
         if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK | Gdk.ModifierType.SUPER_MASK):
             return False  # the window's own shortcuts
         if not self.device.awake:
@@ -1325,6 +1659,25 @@ class Window(Adw.ApplicationWindow):
         if text and self.device and self.device.type(text):
             self.toasts.add_toast(Adw.Toast(title="Only plain letters, digits and punctuation can be typed"))
         return GLib.SOURCE_REMOVE
+
+    def _edit(self, letter: str, shift: bool):
+        """Select all, copy, cut, paste, undo and redo on the phone, as its keyboard's own shortcuts
+        (Command on an iPhone): what's copied there comes onto this computer's clipboard, and a
+        paste puts this computer's clipboard on the phone first."""
+        device = self.device
+        if not hasattr(device, "shortcut"):
+            return
+        if not device.awake:
+            device.wake()
+            return
+        if self.type_timer:  # what was typed goes first
+            GLib.source_remove(self.type_timer)
+            self._type_now()
+        clipboard = self.get_application().clipboard
+        if letter == "v" and clipboard and self.phone:
+            clipboard.paste_then(self.phone.id, lambda: self.device is device and device.shortcut(letter, shift))
+        else:
+            device.shortcut(letter, shift)
 
     def _key(self, name: str):
         if not self.device:

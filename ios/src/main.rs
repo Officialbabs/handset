@@ -33,10 +33,11 @@
 //! (named like the text, in any case, in the folder and the folders in it);
 //! or {"event":"error","op","path","message"}.
 //!
-//!     handset-ios stream --pairing FILE --udid UDID [--address IP] [--port PORT] [--verbose]
-//!     handset-ios apps --pairing FILE --udid UDID [--address IP] [--icons DIR] [--verbose]
-//!     handset-ios clipboard --pairing FILE --udid UDID [--address IP] [--verbose]
-//!     handset-ios files --pairing FILE --udid UDID [--address IP] [--verbose]
+//!     handset-ios stream --udid UDID [--pairing FILE] [--address IP] [--port PORT] [--verbose]
+//!     handset-ios apps --udid UDID [--pairing FILE] [--address IP] [--icons DIR] [--verbose]
+//!     handset-ios clipboard --udid UDID [--pairing FILE] [--address IP] [--verbose]
+//!     handset-ios files --udid UDID [--pairing FILE] [--address IP] [--verbose]
+//!     handset-ios setup STEP --udid UDID [--images FOLDER] [--out FILE]   (setup.rs)
 
 use std::error::Error;
 use std::io::Write;
@@ -52,7 +53,8 @@ use idevice::core_device::{
     AppIconTarget, AppServiceClient, CallInfoBlob, CoreDeviceServiceClient, DataInclusionPolicy, Domain,
     FileServiceClient, GENERAL_PASTEBOARD,
     IconServiceClient,
-    PasteboardServiceClient, PasteboardSnapshot, DisplayServiceClient, HevcDepacketizer, RtpPacket, build_screen_audio_offer,
+    PasteboardPayload, PasteboardServiceClient, PasteboardSnapshot, DisplayServiceClient, UTI_JPEG, UTI_PNG,
+    ImageFormat, ScreenCaptureServiceClient, HevcDepacketizer, RtpPacket, build_screen_audio_offer,
     build_start_audio_parameters, build_start_video_parameters,
 };
 use idevice::remote_pairing::{RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native};
@@ -60,7 +62,8 @@ use idevice::rsd::RsdHandshake;
 use idevice::services::core_device::display_stream::negotiation::NEGOTIATOR_MODE_COREDEVICE_SCREEN;
 use idevice::services::core_device::display_stream::{build_keyframe_request, build_liveness, is_rtcp};
 use idevice::services::core_device::hid::{
-    ButtonState, IndigoHidClient, TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE, UniversalHidServiceClient,
+    ButtonState, IndigoHidClient, TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE, TouchscreenContact,
+    UniversalHidServiceClient,
 };
 use futures::StreamExt;
 use idevice::tcp::adapter::Adapter;
@@ -68,6 +71,8 @@ use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+
+mod setup;
 
 type Fallible<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -167,8 +172,14 @@ fn status(text: &str) {
 struct Options {
     command: String,
     icons: Option<String>,
-    pairing: String,
+    pairing: Option<String>,
     udid: String,
+    step: Option<String>,  // setup's
+    images: Option<String>,  // Xcode's developer disk image, for a phone that has lost it (setup.rs)
+    out: Option<String>,
+    clip_dir: Option<String>,  // clipboard's: where an image copied on the phone is written
+    stop: bool,  // media's: every stream the phone has, stopped
+    alone: bool,  // stream's: no one else shares the phone's screen now, so streams left from before are stopped
     address: Option<IpAddr>,
     port: Option<u16>,
     verbose: bool,
@@ -177,14 +188,23 @@ struct Options {
 fn options() -> Result<Options, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().cloned().unwrap_or_default();
-    if !["stream", "apps", "clipboard", "files"].contains(&command.as_str()) {
-        return Err("usage: handset-ios stream|apps|clipboard|files --pairing FILE --udid UDID [--address IP] [--port PORT]".into());
+    if !["stream", "apps", "clipboard", "files", "setup", "media"].contains(&command.as_str()) {
+        return Err("usage: handset-ios stream|apps|clipboard|files --udid UDID [--pairing FILE] [--address IP] [--port PORT], \
+                    or handset-ios setup trust|developer-mode|ddi|wifi --udid UDID [--images FOLDER] [--out FILE]"
+            .into());
     }
     let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let step = if command == "setup" { args.get(1).cloned() } else { None };
     Ok(Options {
         command,
         icons: value("--icons"),
-        pairing: value("--pairing").ok_or("--pairing FILE is needed")?,
+        pairing: value("--pairing"),
+        step,
+        images: value("--images"),
+        out: value("--out"),
+        clip_dir: value("--clip-dir"),
+        stop: args.iter().any(|a| a == "--stop"),
+        alone: args.iter().any(|a| a == "--alone"),
         udid: value("--udid").ok_or("--udid UDID is needed")?,
         address: value("--address").map(|a| a.parse().map_err(|_| format!("{a} isn't an address"))).transpose()?,
         port: value("--port").map(|p| p.parse().map_err(|_| format!("{p} isn't a port"))).transpose()?,
@@ -306,6 +326,7 @@ async fn work_input(
     mut commands: mpsc::Receiver<Value>,
 ) {
     let (mut last_x, mut last_y) = (0u16, 0u16);
+    let mut held: Vec<(u16, u16)> = Vec::new(); // a pinch's fingers, while they're down
     let at = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0).min(65535) as u16;
     while let Some(command) = commands.recv().await {
         let result: Result<(), idevice::IdeviceError> = async {
@@ -315,6 +336,27 @@ async fn work_input(
                     touch.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, last_x, last_y, None).await?;
                 }
                 "up" => touch.send_touchscreen(TOUCHSCREEN_STATE_RELEASE, last_x, last_y, None).await?,
+                "fingers" => {
+                    // Several fingers at once (a pinch): each point a contact of its own; the ones
+                    // down before and not now are lifted where they were.
+                    let points: Vec<(u16, u16)> = command
+                        .get("points")
+                        .and_then(Value::as_array)
+                        .map(|all| all.iter().filter_map(|p| Some((at(p, "x"), at(p, "y")))).take(5).collect())
+                        .unwrap_or_default();
+                    let mut contacts: Vec<TouchscreenContact> = points
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(x, y))| TouchscreenContact { identity: i as u8, touching: true, x, y })
+                        .collect();
+                    for (i, &(x, y)) in held.iter().enumerate().skip(points.len()) {
+                        contacts.push(TouchscreenContact { identity: i as u8, touching: false, x, y });
+                    }
+                    if !contacts.is_empty() {
+                        touch.send_multitouch(&contacts, None).await?;
+                    }
+                    held = points;
+                }
                 "button" => {
                     if let Some((code, hold)) = command.get("name").and_then(Value::as_str).and_then(button_usage) {
                         keys.send_button(0x0C, code, ButtonState::Down).await?;
@@ -340,6 +382,24 @@ async fn work_input(
                             keys.send_keyboard(0xE1, ButtonState::Up).await?;
                         }
                         tokio::time::sleep(Duration::from_millis(12)).await;
+                    }
+                }
+                "shortcut" => {
+                    // Command (and Shift) with a letter, held as a keyboard holds them: select all,
+                    // copy, cut, paste, undo and redo, in any app's text.
+                    let letter = command.get("key").and_then(Value::as_str).and_then(|k| k.chars().next());
+                    let shift = command.get("shift").and_then(Value::as_bool).unwrap_or(false);
+                    if let Some((code, _)) = letter.filter(char::is_ascii_lowercase).and_then(usage) {
+                        keys.send_keyboard(0xE3, ButtonState::Down).await?;
+                        if shift {
+                            keys.send_keyboard(0xE1, ButtonState::Down).await?;
+                        }
+                        keys.send_keyboard(code, ButtonState::Down).await?;
+                        keys.send_keyboard(code, ButtonState::Up).await?;
+                        if shift {
+                            keys.send_keyboard(0xE1, ButtonState::Up).await?;
+                        }
+                        keys.send_keyboard(0xE3, ButtonState::Up).await?;
                     }
                 }
                 "launch" => {
@@ -463,6 +523,8 @@ const APPS_FOR: Duration = Duration::from_secs(30);
 const ICON_FOR: Duration = Duration::from_secs(5);
 /// Text up to this size comes with a look at the clipboard; bigger, it's left on the phone.
 const CLIPBOARD_TEXT: i64 = 256 * 1024;
+/// The biggest image put on the phone's clipboard (Handset sends a smaller one above it).
+const MOST_IMAGE: usize = 20 * 1024 * 1024;
 /// How often the clipboard's change count is looked at, besides the phone's own word of changes.
 const CLIPBOARD_LOOK: Duration = Duration::from_secs(3);
 
@@ -506,11 +568,26 @@ async fn clipboard(options: Options) -> Fallible<()> {
     loop {
         tokio::select! {
             snapshot = pushes.recv(), if listening => match snapshot {
-                Some(snapshot) => news(snapshot, &mut count, &mut last),
+                Some(snapshot) => news(&mut board, snapshot, &mut count, &mut last, options.clip_dir.as_deref()).await,
                 None => listening = false,
             },
             command = commands.recv() => {
                 let Some(command) = command else { break };
+                if command.get("op").and_then(Value::as_str) == Some("set-image") {
+                    // An image on the phone's clipboard (in memory: never in Photos or Files).
+                    let path = command.get("path").and_then(Value::as_str).unwrap_or("");
+                    let uti = command.get("type").and_then(Value::as_str).unwrap_or(UTI_PNG).to_string();
+                    match tokio::fs::read(path).await {
+                        Ok(bytes) if bytes.len() <= MOST_IMAGE => {
+                            board.set_image(&bytes, &uti, GENERAL_PASTEBOARD).await?;
+                            last = None;
+                            count = board.get_with_policy(GENERAL_PASTEBOARD, DataInclusionPolicy::AllPromised).await?.change_count;
+                        }
+                        Ok(_) => eprintln!("an image too big for the phone's clipboard"),
+                        Err(why) => eprintln!("the image to put on the phone's clipboard: {why}"),
+                    }
+                    println!("{}", json!({"event": "clipboard", "set": true, "id": command.get("id")}));
+                }
                 if command.get("op").and_then(Value::as_str) == Some("set") {
                     let text = command.get("text").and_then(Value::as_str).unwrap_or("").to_string();
                     if !text.is_empty() && last.as_deref() != Some(text.as_str()) {
@@ -518,13 +595,16 @@ async fn clipboard(options: Options) -> Fallible<()> {
                         last = Some(text);
                         count = board.get_with_policy(GENERAL_PASTEBOARD, DataInclusionPolicy::AllPromised).await?.change_count;
                     }
+                    // It's on the phone: a paste waiting for it may go (on standard output, where
+                    // Handset reads this command's news).
+                    println!("{}", json!({"event": "clipboard", "set": true, "id": command.get("id")}));
                 }
             }
             _ = look.tick() => {
                 let now = board.get_with_policy(GENERAL_PASTEBOARD, DataInclusionPolicy::AllPromised).await?;
                 if now.change_count.is_some() && now.change_count != count {
                     let snapshot = board.get_with_policy(GENERAL_PASTEBOARD, DataInclusionPolicy::Threshold(CLIPBOARD_TEXT)).await?;
-                    news(snapshot, &mut count, &mut last);
+                    news(&mut board, snapshot, &mut count, &mut last, options.clip_dir.as_deref()).await;
                 }
             }
         }
@@ -545,6 +625,20 @@ async fn files(options: Options) -> Fallible<()> {
         let (op, path) = (field("op"), field("path"));
         let answer = match op.as_str() {
             "open-url" => open_url(&mut adapter, &handshake, &field("bundle"), &field("url")).await,
+            "rename" => {
+                // Within one place (the media folders, or one app's files): the phone renames there.
+                let to = field("to");
+                match (in_app(&path).map(|(bundle, _)| bundle), in_app(&to).map(|(bundle, _)| bundle)) {
+                    (a, b) if a != b => Err("A file moves only within its own place on the iPhone.".into()),
+                    _ => match place(&mut afc, &mut apps, &mut adapter, &mut handshake, &path).await {
+                        Err(why) => Err(why),
+                        Ok((files, inside)) => {
+                            let target = in_app(&to).map(|(_, inner)| inner).unwrap_or_else(|| to.clone());
+                            files.rename(&inside, &target).await.map(|_| json!({"event": "renamed", "path": path})).map_err(Into::into)
+                        }
+                    },
+                }
+            }
             "list" | "fetch" | "send" | "remove" | "find" | "mkdir" | "names" => {
                 match place(&mut afc, &mut apps, &mut adapter, &mut handshake, &path).await {
                     Err(why) => Err(why),
@@ -563,6 +657,7 @@ async fn files(options: Options) -> Fallible<()> {
                     }),
                 }
             }
+            "screenshot" => screenshot(&mut adapter, &mut handshake, &field("to")).await,
             "container-list" => container_list(&mut adapter, &mut handshake, &field("domain"), &field("identifier"), &path).await,
             "sharing" => sharing_apps(&mut adapter, &mut handshake, &command).await,
             _ => continue,
@@ -675,6 +770,14 @@ fn in_app(path: &str) -> Option<(String, String)> {
     let rest = path.strip_prefix(APPS_ROOT)?.strip_prefix('/')?;
     let (bundle, inner) = rest.split_once('/').unwrap_or((rest, ""));
     (!bundle.is_empty()).then(|| (bundle.to_string(), format!("/Documents/{inner}").trim_end_matches('/').to_string()))
+}
+
+/// The phone's screen as a PNG at its own size, written to `to` (Apple's screen capture service).
+async fn screenshot(adapter: &mut idevice::tcp::handle::AdapterHandle, handshake: &mut RsdHandshake, to: &str) -> Fallible<Value> {
+    let mut capture = ScreenCaptureServiceClient::connect_rsd(&mut *adapter, &mut *handshake).await?;
+    let image = capture.take_screenshot(None, ImageFormat::Png).await?;
+    tokio::fs::write(to, &image).await?;
+    Ok(json!({"event": "screenshot", "path": to}))
 }
 
 /// The files a path is among (the media folders', or an app's, opened once through house
@@ -811,12 +914,26 @@ async fn send_file(afc: &mut AfcClient, from: &str, path: &str) -> Fallible<Valu
     Ok(json!({"event": "sent", "path": path}))
 }
 
-/// A clipboard snapshot: its text said, if it's new.
-fn news(snapshot: PasteboardSnapshot, count: &mut Option<i64>, last: &mut Option<String>) {
+/// A clipboard snapshot, if it's new: an image in it written to `clip_dir` and said (its path);
+/// else its text said.
+async fn news(
+    board: &mut PasteboardServiceClient<Box<dyn idevice::ReadWrite>>,
+    snapshot: PasteboardSnapshot,
+    count: &mut Option<i64>,
+    last: &mut Option<String>,
+    clip_dir: Option<&str>,
+) {
     if snapshot.change_count.is_some() && snapshot.change_count == *count {
         return;
     }
     *count = snapshot.change_count;
+    if let Some(folder) = clip_dir {
+        if let Some((path, mime)) = image_news(board, &snapshot, folder).await {
+            println!("{}", json!({"event": "clipboard", "image": path, "type": mime}));
+            *last = None;
+            return;
+        }
+    }
     if let Some(text) = snapshot.text() {
         if last.as_deref() != Some(text.as_str()) {
             println!("{}", json!({"event": "clipboard", "text": text}));
@@ -825,11 +942,49 @@ fn news(snapshot: PasteboardSnapshot, count: &mut Option<i64>, last: &mut Option
     }
 }
 
+/// An image copied on the phone (PNG or JPEG, fetched when the phone only promised it), written
+/// to `folder`: its path and type.
+async fn image_news(
+    board: &mut PasteboardServiceClient<Box<dyn idevice::ReadWrite>>,
+    snapshot: &PasteboardSnapshot,
+    folder: &str,
+) -> Option<(String, &'static str)> {
+    for item in &snapshot.items {
+        for (uti, mime, ext) in [(UTI_PNG, "image/png", "png"), (UTI_JPEG, "image/jpeg", "jpg")] {
+            if !item.types.iter().any(|t| t == uti) {
+                continue;
+            }
+            let inline = item.data.iter().find(|e| e.uti == uti).and_then(|e| match &e.payload {
+                PasteboardPayload::Inline(bytes) => Some(bytes.clone()),
+                _ => None,
+            });
+            let bytes = match inline {
+                Some(bytes) => bytes,
+                None => board.resolve(GENERAL_PASTEBOARD, item.index as i64, uti).await.ok().flatten()?,
+            };
+            let path = std::path::Path::new(folder).join(format!("iphone.{ext}"));
+            let partial = path.with_extension("new");
+            tokio::fs::write(&partial, &bytes).await.ok()?;
+            tokio::fs::rename(&partial, &path).await.ok()?;
+            return Some((path.to_string_lossy().into_owned(), mime));
+        }
+    }
+    None
+}
+
 async fn stream(options: Options) -> Fallible<()> {
     status("Looking for the iPhone on its cable and on Wi-Fi");
     let (way, (mut adapter, mut handshake)) = reach(&options).await?;
     if options.verbose {
         eprintln!("phone {} reached {way}", options.udid);
+    }
+    if let Some(images) = options.images.clone() {
+        // A restart takes the developer disk image away (the touch service is in it): put back.
+        match setup::ensure_ddi(&mut adapter, &mut handshake, &images).await {
+            Ok(true) => status("Apple's developer disk image is back on the iPhone"),
+            Ok(false) => {}
+            Err(why) => status(&why.to_string()),
+        }
     }
     stream_screen(options, way, &mut adapter, &mut handshake).await
 }
@@ -915,6 +1070,9 @@ async fn by_cable(udid: &str) -> Result<Reached, Missed> {
 /// with the pairing Ada's desktop made. Its reasons are only ever shown when the phone isn't
 /// plugged in either.
 async fn by_wifi(options: &Options) -> Fallible<Reached> {
+    let Some(pairing) = options.pairing.as_deref() else {
+        return Err("The iPhone isn't plugged in: plug it in (it isn't set up for Wi-Fi).".into());
+    };
     let (ip, port) = match (options.address, options.port) {
         (Some(ip), Some(port)) => (ip, port),
         (address, _) => {
@@ -929,7 +1087,7 @@ async fn by_wifi(options: &Options) -> Fallible<Reached> {
     if options.verbose {
         eprintln!("phone {} at {ip}:{port}", options.udid);
     }
-    tokio::time::timeout(REACH_FOR, over_wifi(ip, port, &options.pairing))
+    tokio::time::timeout(REACH_FOR, over_wifi(ip, port, pairing))
         .await
         .map_err(|_| "The iPhone went to sleep or left Wi-Fi: it didn't answer.")?
 }
@@ -997,6 +1155,16 @@ async fn stream_screen(
     };
     let our_ssrc = uuid::Uuid::new_v4().as_u128() as u32;
     let (audio_port, video_port) = (audio.local_port(), video.local_port());
+    let ports = (audio_port, video_port);
+    if options.alone {
+        // Streams no one ended (a helper that was killed, or a crash) go on sending to no one for
+        // up to an hour, holding the phone's sound and screen: with no one else sharing the
+        // screen, they're stopped first.
+        if let Some((_, true)) = streams(&mut display, ports).await {
+            eprintln!("stopping streams left on the phone from before");
+            let _ = display.stop_media_stream().await;
+        }
+    }
     start_screen(&mut display, &call, (&ours, audio_port, video_port), &theirs, our_ssrc).await?;
     say(json!({"event": "video", "codec": "h265"}));
 
@@ -1107,14 +1275,31 @@ async fn stream_screen(
                 }
                 let unanswered = awaiting.is_some_and(|since| since.elapsed() > KEYFRAME_FOR);
                 if heard.elapsed() > QUIET || unanswered {
-                    if options.verbose {
-                        eprintln!("the phone's stream went quiet: starting it again");
-                    }
                     heard = Instant::now();
+                    // A dark screen sends nothing, and its stream lights up with it: only a stream
+                    // someone stopped is started again (one started beside it would pile up on the
+                    // phone, each holding its sound and screen). One that stopped answering is
+                    // ended first, when it's the only one (the phone stops them all at once).
+                    match streams(&mut display, ports).await {
+                        None => {
+                            return Err(format!("The iPhone's link {way} went: it was unplugged, went to sleep or left Wi-Fi.").into());
+                        }
+                        Some((true, others)) => {
+                            if !unanswered || others {
+                                continue;
+                            }
+                            let _ = display.stop_media_stream().await;
+                        }
+                        Some((false, _)) => {}
+                    }
+                    if options.verbose {
+                        eprintln!("the phone's stream stopped: starting it again");
+                    }
                     media_ssrc = 0; // and a keyframe is asked for again
                     losses = Losses::default();
                     // The new stream's first frames are a keyframe's: shown from there.
                     frames = HevcDepacketizer::new();
+                    awaiting = None;
                     if let Err(why) = start_screen(&mut display, &call, (&ours, audio_port, video_port), &theirs, our_ssrc).await {
                         // The connection itself is gone (the phone was unplugged, slept, or left
                         // Wi-Fi): Handset starts over, with a new one, whichever way is there.
@@ -1127,8 +1312,60 @@ async fn stream_screen(
             _ = ended.recv() => break,
         }
     }
-    // No stop_media_stream: it stops every stream the phone has (stopAll), Ada's too, and her
-    // touches with it. Closing the tunnel ends this one.
+    // Ended: this helper's streams end with it, or the phone goes on capturing its sound and
+    // screen for no one (it keeps a stream an hour). The phone only stops all its streams at once:
+    // done when they're all this helper's, never with someone else's among them (Ada's).
+    if let Some((true, false)) = streams(&mut display, ports).await {
+        let _ = display.stop_media_stream().await;
+        if options.verbose {
+            eprintln!("the phone's stream stopped");
+        }
+    }
+    Ok(())
+}
+
+/// Whether the phone's screen server is sending to this helper (its two ports), and whether to
+/// anyone else; None when it can't be asked (the link went).
+async fn streams(
+    display: &mut DisplayServiceClient<Box<dyn idevice::ReadWrite>>,
+    (audio_port, video_port): (u16, u16),
+) -> Option<(bool, bool)> {
+    let status = tokio::time::timeout(Duration::from_secs(5), display.get_media_stream_server_status()).await.ok()?.ok()?;
+    let sessions = status.as_dictionary().and_then(|s| s.get("sessions")).and_then(|s| s.as_array());
+    let (mut ours, mut others) = (false, false);
+    for session in sessions.into_iter().flatten() {
+        let port = session
+            .as_dictionary()
+            .and_then(|s| s.get("connection"))
+            .and_then(|c| c.as_dictionary())
+            .and_then(|c| c.get("receiver"))
+            .and_then(|r| r.as_dictionary())
+            .and_then(|r| r.get("port"))
+            .and_then(|p| p.as_unsigned_integer());
+        if port == Some(audio_port as u64) || port == Some(video_port as u64) {
+            ours = true;
+        } else {
+            others = true;
+        }
+    }
+    Some((ours, others))
+}
+
+/// What the phone's screen-sharing server has going, written out (`media`), and with `--stop`
+/// every stream it has stopped then: for a phone left holding streams no one ended.
+async fn media(options: Options) -> Fallible<()> {
+    let (way, (mut adapter, mut handshake)) = reach(&options).await?;
+    let mut display = DisplayServiceClient::connect_rsd(&mut adapter, &mut handshake).await?;
+    let mut out = std::io::stdout();
+    writeln!(out, "reached {way}")?;
+    plist::to_writer_xml(&mut out, &display.get_media_stream_server_status().await?)?;
+    if options.stop {
+        writeln!(out, "\nstopping every stream")?;
+        plist::to_writer_xml(&mut out, &display.stop_media_stream().await?)?;
+        writeln!(out, "\nnow")?;
+        plist::to_writer_xml(&mut out, &display.get_media_stream_server_status().await?)?;
+    }
+    writeln!(out)?;
     Ok(())
 }
 
@@ -1283,6 +1520,9 @@ async fn main() {
         "apps" => list_apps(options).await,
         "clipboard" => clipboard(options).await,
         "files" => files(options).await,
+        "media" => media(options).await,
+        "setup" => setup::setup(options.step.as_deref().unwrap_or(""), &options.udid, options.images.as_deref(),
+                                options.out.as_deref()).await,
         _ => stream(options).await,
     };
     if let Err(why) = done {
