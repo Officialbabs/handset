@@ -432,6 +432,9 @@ def main(args):
     if args[:1] == ["connect"]:
         print(f"connected to {args[1]}")
         return 0
+    if args[:1] == ["tcpip"]:
+        print(f"restarting in TCP mode port: {args[1]}")
+        return 0
     if args[:1] == ["exec-out"] and "screenrecord" in " ".join(args[1:]):
         screenrecord(" ".join(args[1:]))
     if args[:2] == ["shell", "-T"] and args[2:] == ["uinput", "-"]:
@@ -517,6 +520,13 @@ def main(args):
         elif command == "pm list packages --show-versioncode":
             for _name, package, _system in APPS:
                 print(f"package:{package} versionCode:{versions().get(package, 1)}")
+        elif command == "ip -o -4 addr":
+            # Its addresses: FAKEADB_DIR/wifi's lines ("<n>: <interface>    inet <address>/24 … scope
+            # global …") after its own loopback; none there, it's not on Wi-Fi.
+            print("1: lo    inet 127.0.0.1/8 scope host lo")
+            if os.path.exists(os.path.join(HERE, "wifi")):
+                with open(os.path.join(HERE, "wifi")) as file:
+                    print(file.read(), end="")
         elif command == "wm size":
             print(f"Physical size: {NATURAL[0]}x{NATURAL[1]}")
         elif command.startswith("cd /sdcard && find ."):

@@ -11,7 +11,8 @@ import unittest
 from gi.repository import GLib
 
 from handset import pairing, phones
-from handset.pairing import AndroidWifi, IPhoneStep, ddi_folder, fetch_ddi, paired, parse_address
+from handset.pairing import (AndroidWifi, IPhoneStep, ddi_folder, fetch_ddi, paired, parse_address, wifi_address,
+                             wifi_by_cable)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -51,6 +52,17 @@ class WordsTest(unittest.TestCase):
         self.assertTrue(paired("Successfully paired to 192.168.1.5:41235 [guid=adb-X-Y]"))
         self.assertFalse(paired("Failed: Wrong password or connection was dropped."))
 
+    def test_the_phones_wifi_address(self):
+        loopback = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n"
+        # A Pixel 7 on Android 17: its Wi-Fi on wlan1, wlan0 down.
+        self.assertEqual(wifi_address(loopback + "48: wlan1    inet 192.168.18.11/24 brd 192.168.18.255 scope global "
+                                                 "dynamic wlan1\\       valid_lft 86106sec preferred_lft 86106sec"),
+                         "192.168.18.11")
+        self.assertEqual(wifi_address(loopback + "30: wlan0    inet 192.168.1.20/24 brd 192.168.1.255 scope global "
+                                                 "wlan0"), "192.168.1.20")
+        self.assertIsNone(wifi_address(loopback + "31: swlan0    inet 192.168.43.1/24 scope global swlan0"))  # hotspot
+        self.assertIsNone(wifi_address(loopback))
+
 
 class AndroidWifiTest(Temporary):
     def pair(self, code):
@@ -78,6 +90,20 @@ class AndroidWifiTest(Temporary):
         done = []
         AndroidWifi(lambda words: None, done.append).pair("12", "192.168.1.5:41235")
         self.assertEqual(done, ["The code is the six digits the phone shows."])
+
+
+class WifiByCableTest(Temporary):
+    def test_turned_on_by_its_cable(self):
+        with open(os.path.join(self.tmp.name, "wifi"), "w") as file:
+            file.write("48: wlan1    inet 192.168.18.11/24 brd 192.168.18.255 scope global dynamic wlan1\n")
+        self.assertEqual(wifi_by_cable("FAKE7"), ("192.168.18.11", 5555))
+        with open(os.path.join(self.tmp.name, "log.jsonl")) as file:
+            log = file.read()
+        self.assertIn('["tcpip", "5555"]', log)
+        self.assertIn('["connect", "192.168.18.11:5555"]', log)
+
+    def test_not_on_wifi(self):
+        self.assertIn("isn't on Wi-Fi", wifi_by_cable("FAKE7"))
 
 
 class DiskImageTest(Temporary):

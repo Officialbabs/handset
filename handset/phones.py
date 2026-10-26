@@ -502,7 +502,12 @@ class PhonePage(Adw.NavigationPage):
             here.add(pair)
         page.add(here)
 
-        if window.own and phone.platform == "android":
+        # Turning adb to Wi-Fi by the cable: Handset's own phones; on a desktop with a phone
+        # service, an Android phone the service has no Wi-Fi for (it looked for it on wlan0 alone,
+        # say), so it works over Wi-Fi anyway.
+        from .service import CABLE_ONLY
+
+        if phone.platform == "android" and (window.own or (not phone.wifi and phone.problem != CABLE_ONLY)):
             wifi = Adw.PreferencesGroup()
             self.wifi = Adw.ButtonRow(title="Use Over Wi-Fi Too", start_icon_name="network-wireless-symbolic")
             self.wifi.connect("activated", lambda _r: self._wifi())

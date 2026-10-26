@@ -73,7 +73,9 @@ explains what to do on the phone and moves on as soon as the phone is ready.
   phone.
 - **Android over Wi-Fi**, in either of two ways:
   - **Use Over Wi-Fi Too**, while the phone is connected by cable. This lasts until the phone
-    restarts, and Handset reconnects automatically when it comes back.
+    restarts, and Handset reconnects automatically when it comes back. It finds the phone's Wi-Fi
+    on whichever interface it's on (a Pixel 7 on Android 17 uses `wlan1`, not `wlan0`). On Ada
+    it's offered for a phone the system's phone service has no Wi-Fi for.
   - **Wireless debugging with a pairing code** (Android 11 and later). Pairing-ready phones are
     found on the local network through Avahi (mDNS), and Handset reconnects whenever the phone is
     back on the network.
@@ -637,7 +639,7 @@ Handset is developed and validated on the following configuration:
 | Android | Android 17 |
 | iOS | iOS 27 |
 
-**Automated tests:** 255 tests across 26 test files run against a simulated Android device, a
+**Automated tests:** 258 tests across 26 test files run against a simulated Android device, a
 simulated iPhone helper and a simulated phone service, with no hardware required:
 
 ```sh

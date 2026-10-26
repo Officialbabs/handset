@@ -118,7 +118,9 @@ button in Phones and Settings adds one:
   computer on the phone. A phone adb can't open ("no permissions") needs the Android udev rules.
 - **An Android phone over Wi-Fi**, in either of two ways:
   - **Use Over Wi-Fi Too** on the phone's page while it's plugged in. adb stays on Wi-Fi until the
-    phone restarts, and Handset reconnects when it's back.
+    phone restarts, and Handset reconnects when it's back. It finds the phone's Wi-Fi on whichever
+    interface it uses (a Pixel 7 on Android 17 has it on `wlan1`). On Ada it's offered for a phone
+    the system's phone service has no Wi-Fi for.
   - **Wireless debugging's pairing code** (Android 11 and later). Handset finds the phone on the
     network through Avahi, and reconnects whenever it's back on the Wi-Fi.
 - **An iPhone by cable**, one step at a time, each saying what to do on the phone:

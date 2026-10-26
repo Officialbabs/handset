@@ -157,19 +157,28 @@ def connect(at: tuple[str, int], command: Callable[..., list[str]]) -> str | Non
     return "The phone didn't connect: keep Wireless debugging on, and try again."
 
 
+def wifi_address(listing: str) -> str | None:
+    """The phone's Wi-Fi address from `ip -o -4 addr`: on whichever wlan interface is up (wlan0 on
+    most phones; a Pixel 7 on Android 17 has its Wi-Fi on wlan1, wlan0 down), never a hotspot's."""
+    for line in listing.splitlines():
+        found = re.match(r"\d+:\s+(wlan\d+)\s+inet (\d+\.\d+\.\d+\.\d+)/\d+.*scope global", line)
+        if found:
+            return found.group(2)
+    return None
+
+
 def wifi_by_cable(serial: str) -> tuple[str, int] | str:
     """adb on Wi-Fi as well, turned on while the phone's plugged in (`adb tcpip`, which lasts
     until it restarts): where it's reachable, or why not."""
     from .android import adb, shell
 
     try:
-        said = shell(serial, "ip -o -4 addr show wlan0", timeout=10)
+        said = shell(serial, "ip -o -4 addr", timeout=10)
     except (OSError, subprocess.SubprocessError):
         said = ""
-    found = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/", said)
-    if not found:
+    address = wifi_address(said)
+    if not address:
         return "The phone isn't on Wi-Fi: join a network on it, and try again."
-    address = found.group(1)
     try:
         adb(serial, "tcpip", "5555", timeout=15)
     except (OSError, subprocess.SubprocessError) as error:
