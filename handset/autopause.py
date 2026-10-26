@@ -8,7 +8,9 @@ A sound on the computer first only lowers the phones' sound playing here (throug
 server): a notification's chime, a message's tone, is over in a moment, and what was playing goes
 on as it was. A phone's never lowers the phones' sound: that's its own. Still playing a few seconds
 on, it's something to listen to: the others pause, and play again once it stops (if nothing else
-was started meanwhile). The next song, or a moment's buffering, is the same thing going on, not
+was started meanwhile). A track shorter than SHORT_S is a sound whatever it does (a web page's
+chime is one, its player left saying it plays after it's done, or two chimes one after the other):
+it never pauses anything. The next song, or a moment's buffering, is the same thing going on, not
 something starting. Off with `"auto_pause": false` in Handset's settings.
 """
 
@@ -36,6 +38,9 @@ OURS = MPRIS + "Handset."  # the phones' own players (media.PhonePlayer)
 PHONE_PROGRAMS = ("mpris-proxy", "handset", "kdeconnectd")
 # Shorter than this, a sound is a notification's: the others are only lowered meanwhile.
 SOUND_S = 3
+# A track this short (its player says how long it is) is a sound, never something to listen to: a
+# notification's chime in a web page (WebKit and browsers show their pages' sounds as players).
+SHORT_S = 20
 LOWERED = "30%"  # how loud the phones' sound is while another plays a moment
 # Playing again within this long of stopping, it's the same thing going on (the next song, a
 # moment's buffering): nothing's lowered, and what paused for it stays paused. What paused for
@@ -123,6 +128,7 @@ class AutoPause:
         self.lowered = Lowered()
         self.waiting: dict[str, int] = {}  # what started (a phone's id, a player's bus name) → its timer
         self.desk_status: dict[str, str] = {}  # the computer's players, as they last said
+        self.desk_length: dict[str, float] = {}  # their tracks' lengths, in seconds, when they say
         # What paused for what: its key → {("phone", id) or ("desk", name)}, and when.
         self.held: dict[str, tuple[set[tuple[str, str]], float]] = {}
         self.stopped_at: dict[str, float] = {}  # what was playing and stopped: its key → when
@@ -155,25 +161,58 @@ class AutoPause:
 
     def phone_started(self, phone_id: str):
         """A phone started playing: the others give way (a moment on, if it's still playing)."""
-        self._started(f"phone:{phone_id}", lambda: self._phone_playing(phone_id), lambda: self._phone_gives_way(phone_id),
-                      lower=False)
+        self._started(f"phone:{phone_id}", lambda: self._phone_playing(phone_id),
+                      lambda: self._phone_gives_way(phone_id), lower=False)
 
     def _changed(self, bus, sender, _path, _interface, _signal, parameters):
         _interface, changed, _gone = parameters.unpack()
+        if sender == bus.get_unique_name():
+            return
+        if isinstance(changed.get("Metadata"), dict):
+            self._remember_length(sender, changed["Metadata"])
         status = changed.get("PlaybackStatus")
-        if status is None or sender == bus.get_unique_name() or self._a_phone(sender):
+        if status is None or self._a_phone(sender):
             return
         key = f"desk:{sender}"
         if status == "Playing":
-            self._started(key, lambda: self.desk_status.get(sender) == "Playing", lambda: self._desk_gives_way(sender))
+            if "Metadata" not in changed:
+                self._ask_length(sender)  # not said with it: asked, in time for the wait's end
+            self._started(key, lambda: self._desk_listening(sender), lambda: self._desk_gives_way(sender))
         else:
             self._ended(key)
         self.desk_status[sender] = status
+
+    def _remember_length(self, name: str, metadata: dict):
+        length = metadata.get("mpris:length")
+        if isinstance(length, int) and length > 0:
+            self.desk_length[name] = length / 1_000_000
+        else:
+            self.desk_length.pop(name, None)
+
+    def _ask_length(self, name: str):
+        def got(bus, result):
+            try:
+                metadata = bus.call_finish(result).unpack()[0]
+            except GLib.Error:
+                return
+            if isinstance(metadata, dict):
+                self._remember_length(name, metadata)
+
+        self.bus.call(name, PATH, "org.freedesktop.DBus.Properties", "Get",
+                      GLib.Variant("(ss)", (PLAYER, "Metadata")), GLib.VariantType("(v)"),
+                      Gio.DBusCallFlags.NONE, 2000, None, got)
+
+    def _desk_listening(self, name: str) -> bool:
+        """Whether a player on the computer plays something to listen to: playing, and not a
+        sound (a track under SHORT_S)."""
+        length = self.desk_length.get(name)
+        return self.desk_status.get(name) == "Playing" and not (length and length < SHORT_S)
 
     def _gone(self, _bus, _sender, _path, _interface, _signal, parameters):
         name, _old, new = parameters.unpack()
         if name.startswith(":") and not new:
             self.desk_status.pop(name, None)
+            self.desk_length.pop(name, None)
             self._ended(f"desk:{name}")
             self.stopped_at.pop(f"desk:{name}", None)  # gone: it won't be back
 
@@ -235,8 +274,11 @@ class AutoPause:
     # -- giving way, and coming back
 
     def _phone_playing(self, phone_id: str) -> bool:
+        """Whether a phone plays something to listen to: playing, and not a sound (a track under
+        SHORT_S, when the phone says how long it is)."""
         player = self.phones().get(phone_id)
-        return bool(player and player.now and player.now.playing)
+        now = player.now if player else None
+        return bool(now and now.playing and not (0 < now.duration < SHORT_S))
 
     def _phone_gives_way(self, phone_id: str):
         paused = set()
@@ -245,8 +287,8 @@ class AutoPause:
                 debug("auto pause: the phone", other)
                 player.control("pause", 0.0)
                 paused.add(("phone", other))
-        for name, status in list(self.desk_status.items()):
-            if status == "Playing" and not self._a_phone(name):
+        for name in list(self.desk_status):
+            if self._desk_listening(name) and not self._a_phone(name):
                 debug("auto pause:", name)
                 self._desk_call(name, "Pause")
                 paused.add(("desk", name))
@@ -265,19 +307,23 @@ class AutoPause:
                 self._pause_if_playing(name, phone_id)
 
     def _pause_if_playing(self, name: str, phone_id: str):
+        """A player Handset hadn't heard from paused, if it plays something to listen to (not a
+        sound: one left saying it plays after its chime would only chime again when resumed)."""
         def got(bus, result):
             try:
-                status = bus.call_finish(result).unpack()[0]
+                said = bus.call_finish(result).unpack()[0]
             except GLib.Error:
                 return
-            if status == "Playing" and not self._a_phone(name):
+            if isinstance(said.get("Metadata"), dict):
+                self._remember_length(name, said["Metadata"])
+            self.desk_status[name] = str(said.get("PlaybackStatus", ""))
+            if self._desk_listening(name) and not self._a_phone(name):
                 debug("auto pause:", name)
                 self._desk_call(name, "Pause")
                 self._hold(f"phone:{phone_id}", {("desk", name)})
 
-        self.bus.call(name, PATH, "org.freedesktop.DBus.Properties", "Get",
-                      GLib.Variant("(ss)", (PLAYER, "PlaybackStatus")), GLib.VariantType("(v)"),
-                      Gio.DBusCallFlags.NONE, 2000, None, got)
+        self.bus.call(name, PATH, "org.freedesktop.DBus.Properties", "GetAll", GLib.Variant("(s)", (PLAYER,)),
+                      GLib.VariantType("(a{sv})"), Gio.DBusCallFlags.NONE, 2000, None, got)
 
     def _desk_gives_way(self, sender: str):
         paused = set()
@@ -296,8 +342,8 @@ class AutoPause:
     def _resume(self, paused: set[tuple[str, str]]):
         """What paused for something that's over plays again, unless something else plays now
         (the person started it) or it was started again meanwhile."""
-        playing = any(p.now and p.now.playing for p in self.phones().values()) or \
-            any(s == "Playing" for n, s in self.desk_status.items() if not self._a_phone(n))
+        playing = any(self._phone_playing(phone_id) for phone_id in self.phones()) or \
+            any(self._desk_listening(n) for n in self.desk_status if not self._a_phone(n))
         if playing:
             return GLib.SOURCE_REMOVE
         for kind, name in paused:

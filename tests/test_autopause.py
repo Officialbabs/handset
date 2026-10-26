@@ -27,6 +27,7 @@ DESK_PLAYER = """<node><interface name="org.mpris.MediaPlayer2.Player">
   <method name="Pause"/>
   <method name="Play"/>
   <property name="PlaybackStatus" type="s" access="read"/>
+  <property name="Metadata" type="a{sv}" access="read"/>
 </interface></node>"""
 
 
@@ -40,7 +41,7 @@ def spin(until, timeout=3.0):
 
 class Phone:
     def __init__(self, playing):
-        self.now = SimpleNamespace(playing=playing)
+        self.now = SimpleNamespace(playing=playing, duration=0.0)  # media.NowPlaying: no length said
         self.sent = []
 
     def control(self, command, place):
@@ -78,6 +79,7 @@ class AutoPauseTest(unittest.TestCase):
         self.desk = Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
         # The computer's own player, playing.
         self.desk_status = "Playing"
+        self.desk_length = 0  # its track's length in µs (0: it doesn't say)
         self.desk_paused = []
         info = Gio.DBusNodeInfo.new_for_xml(DESK_PLAYER).interfaces[0]
         self.desk.register_object_with_closures2("/org/mpris/MediaPlayer2", info, self._desk_call, self._desk_get, None)
@@ -93,6 +95,8 @@ class AutoPauseTest(unittest.TestCase):
         invocation.return_value(None)
 
     def _desk_get(self, _bus, _sender, _path, _interface, name):
+        if name == "Metadata":
+            return GLib.Variant("a{sv}", {"mpris:length": GLib.Variant("x", self.desk_length)} if self.desk_length else {})
         return GLib.Variant("s", self.desk_status)
 
     def tearDown(self):
@@ -104,11 +108,16 @@ class AutoPauseTest(unittest.TestCase):
         self.daemon.stdout.close()
         self.tmp.cleanup()
 
-    def status(self, status):
+    def status(self, status, length_s: float | None = None):
+        """The computer's player says it plays (or not); with `length_s`, its track's length too,
+        in the same signal (otherwise Handset asks for it)."""
         self.desk_status = status
+        changed = {"PlaybackStatus": GLib.Variant("s", status)}
+        if length_s is not None:
+            self.desk_length = int(length_s * 1_000_000)
+            changed["Metadata"] = GLib.Variant("a{sv}", {"mpris:length": GLib.Variant("x", self.desk_length)})
         self.desk.emit_signal(None, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", "PropertiesChanged",
-                              GLib.Variant("(sa{sv}as)", ("org.mpris.MediaPlayer2.Player",
-                                                          {"PlaybackStatus": GLib.Variant("s", status)}, [])))
+                              GLib.Variant("(sa{sv}as)", ("org.mpris.MediaPlayer2.Player", changed, [])))
 
     def test_a_phone_starting_pauses_the_rest(self):
         self.phones["PIXEL"].now.playing = True
@@ -165,6 +174,42 @@ class AutoPauseTest(unittest.TestCase):
         self.pause.phone_started("PIXEL")
         spin(lambda: False, 1.0)
         self.assertEqual(self.desk_paused, ["Pause"])  # the computer's player not played in between
+
+    def test_chimes_never_pause_the_music(self):
+        autopause.SOUND_S = 1
+        for case, said_with_it in (("said with it", True), ("asked for", False)):
+            with self.subTest(case):
+                self.phones["IPHONE"].sent.clear()
+                self.pause.lowered.said.clear()
+                self.desk_length = 1_500_000
+                # Two notification chimes one after the other: the page's player plays on past the wait.
+                self.status("Playing", 1.5 if said_with_it else None)
+                spin(lambda: False, 2.3)
+                self.assertEqual(self.phones["IPHONE"].sent, [])  # the music plays on
+                self.assertEqual(self.pause.lowered.said, ["lower", "restore"])  # only lowered a moment
+                self.status("Stopped")
+                spin(lambda: False, 0.2)
+
+    def test_a_chime_left_playing_is_no_music(self):
+        autopause.BETWEEN_MS = 10
+        self.status("Playing", 1.2)  # a chime, its player left saying it plays
+        spin(lambda: False, 0.2)
+        self.phones["PIXEL"].now.playing = True
+        self.pause.phone_started("PIXEL")
+        self.assertTrue(spin(lambda: self.phones["IPHONE"].sent == ["pause"]))
+        spin(lambda: False, 0.3)
+        self.assertEqual(self.desk_paused, [])  # never paused, so never chimes again on a resume
+        self.phones["IPHONE"].now.playing = False  # as it said once paused
+        self.phones["PIXEL"].now.playing = False
+        self.pause.phone_stopped("PIXEL")
+        self.assertTrue(spin(lambda: self.phones["IPHONE"].sent == ["pause", "play"]))  # not held up by it
+
+    def test_a_phones_short_sound_isnt_music(self):
+        autopause.SOUND_S = 0
+        self.phones["PIXEL"].now = SimpleNamespace(playing=True, duration=2.0)
+        self.pause.phone_started("PIXEL")
+        spin(lambda: False, 0.5)
+        self.assertEqual(self.phones["IPHONE"].sent, [])
 
     def test_what_paused_plays_again_once_its_over(self):
         self.status("Playing")

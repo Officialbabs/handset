@@ -424,6 +424,9 @@ devices:
 - **Short sounds** on the computer (a message tone, a notification chime) only lower the phones'
   audio routed to the computer for a moment. They pause nothing. A phone starting to play never
   lowers its own sound.
+- **A track shorter than 20 seconds is a sound, not music,** however long its player says it's
+  playing: two notification chimes in a row in a web page (WhatsApp Web in Natter or a browser),
+  or a page's player left saying it plays, never pause anything or hold up a resume.
 - **The next track,** or a moment of buffering, counts as the same playback continuing. Nothing is
   lowered and nothing resumes in between.
 - **Players that stand for a phone are left alone,** so a phone never pauses itself. These include
@@ -622,7 +625,7 @@ Handset is developed and validated on the following configuration:
 | Android | Android 17 |
 | iOS | iOS 27 |
 
-**Automated tests:** 245 tests across 25 test files run against a simulated Android device, a
+**Automated tests:** 248 tests across 25 test files run against a simulated Android device, a
 simulated iPhone helper and a simulated phone service, with no hardware required:
 
 ```sh

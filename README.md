@@ -330,6 +330,8 @@ that control the phone.
 - When it stops, whatever it paused plays again.
 - A brief sound on the computer, such as a message tone, only lowers the phones' audio for a
   moment and pauses nothing. A phone starting to play never lowers its own sound.
+- A track shorter than 20 seconds is a sound, never music: a web page's notification chime (two
+  in a row, or one whose player keeps saying it plays) never pauses anything.
 - The next track, or a moment of buffering, counts as the same playback going on.
 
 To turn it off, set `"auto_pause": false` in `~/.config/handset/settings.json`.
