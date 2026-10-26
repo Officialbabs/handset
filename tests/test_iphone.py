@@ -177,6 +177,23 @@ class FakeHelper(unittest.TestCase):
         self.assertEqual([c["bundle"] for c in self.commands() if c["op"] == "launch"],
                          ["org.example.chat", "org.example.gone"])
 
+    def test_what_an_app_came_in_front_of(self):
+        launched, front = [], []
+        self.phone.on_launched = lambda ok, why: launched.append(ok)
+        self.phone.on_front = front.append
+        with open(os.path.join(self.tmp.name, "front"), "w") as file:
+            file.write("home")
+        self.phone.launch("org.example.chat", front=True)  # kept until it takes input, asked with it
+        self.phone.start()
+        spin(lambda: front)
+        with open(os.path.join(self.tmp.name, "front"), "w") as file:
+            file.write("com.apple.Maps")
+        self.phone.launch("org.example.chat", front=True)
+        self.phone.launch("org.example.chat")  # not asked: nothing said
+        spin(lambda: len(launched) >= 3)
+        self.assertEqual(front, [True, False])
+        self.assertEqual([c.get("front") for c in self.commands() if c["op"] == "launch"], [True, True, None])
+
     def test_its_clipboard_both_ways(self):
         heard = []
         clip = ClipboardLink(Link("UDID-1", "/p.rppairing", "192.168.18.10", FAKE_HELPER), heard.append)

@@ -77,6 +77,35 @@ class HomeTest(unittest.TestCase):
         self.assertEqual(phone.keys, ["home"])
         self.assertFalse(phone.stopped)  # that window's screen goes on
 
+    def minimizing(self, home_before, awake=True):
+        app, phone = FakeApp(), FakeIPhone(awake=awake)
+        shown = a_window(app, phone)
+        shown.home_before, shown.sent_home, shown.minimized = home_before, False, False
+        shown.minimize = lambda: setattr(shown, "minimized", True)
+        shown.phone_app = SimpleNamespace(app="org.example.chat")
+        Window.minimize_window(shown)
+        self.assertTrue(shown.minimized)  # minimized whatever the iPhone does
+        return shown, phone
+
+    def test_minimized_over_the_home_screen_goes_home(self):
+        shown, phone = self.minimizing(True)
+        self.assertEqual(phone.keys, ["home"])
+        self.assertTrue(shown.sent_home)
+        # Back to the window: its app comes back.
+        launched = []
+        phone.launch = lambda app, front=False: launched.append((app, front))
+        shown.is_active, shown.gave_screen = (lambda: True), False
+        Window._activated(shown)
+        self.assertEqual(launched, [("org.example.chat", True)])
+        self.assertFalse(shown.sent_home)
+
+    def test_minimized_over_another_app_stays(self):
+        for home_before, awake in ((False, True), (None, True), (True, False)):
+            with self.subTest(home_before=home_before, awake=awake):
+                shown, phone = self.minimizing(home_before, awake)
+                self.assertEqual(phone.keys, [])
+                self.assertFalse(shown.sent_home)
+
     def test_a_dark_iphone_stays_dark(self):
         app, phone = FakeApp(), FakeIPhone(awake=False)
         closing = a_window(app, phone)

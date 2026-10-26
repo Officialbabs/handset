@@ -12,7 +12,8 @@
 //!   {"event":"video","codec":"h265"}, {"event":"input","ready":true}, {"event":"error"}.
 //!
 //! The end of standard input stops the phone's stream and ends the helper. {"op":"launch",
-//! "bundle"} opens an app on the phone (said back as {"event":"launch","ok"}).
+//! "bundle"} opens an app on the phone (said back as {"event":"launch","ok"}; with "front": true,
+//! also "home", whether the home screen was in front before, when the phone says).
 //!
 //! `apps` lists the phone's apps instead, one JSON object per line on standard output
 //! ({"name","bundle","icon"}), with each icon saved as a PNG in the --icons folder.
@@ -335,7 +336,7 @@ fn button_usage(name: &str) -> Option<(u64, u64)> {
 async fn work_input(
     mut touch: UniversalHidServiceClient<Box<dyn idevice::ReadWrite>>,
     mut keys: IndigoHidClient<Box<dyn idevice::ReadWrite>>,
-    mut apps: Option<AppServiceClient<Box<dyn idevice::ReadWrite>>>,
+    launches: mpsc::Sender<(String, bool)>,
     mut commands: mpsc::Receiver<Value>,
 ) {
     let (mut last_x, mut last_y) = (0u16, 0u16);
@@ -416,16 +417,10 @@ async fn work_input(
                     }
                 }
                 "launch" => {
-                    // In front, as it was if it was open: FrontBoard brings it forward.
+                    // Opened by work_launches, in order, without holding up what comes next.
                     let bundle = command.get("bundle").and_then(Value::as_str).unwrap_or("").to_string();
-                    match apps.as_mut() {
-                        Some(apps) => match apps.launch_application(bundle.clone(), &[], false, false, None, None, None).await {
-                            Ok(_) => say(json!({"event": "launch", "ok": true, "bundle": bundle})),
-                            Err(why) => say(json!({"event": "launch", "ok": false, "bundle": bundle, "message": why.to_string()})),
-                        },
-                        None => say(json!({"event": "launch", "ok": false, "bundle": bundle,
-                                           "message": "The iPhone didn't let Handset open apps."})),
-                    }
+                    let front = command.get("front").and_then(Value::as_bool).unwrap_or(false);
+                    let _ = launches.send((bundle, front)).await;
                 }
                 _ => {}
             }
@@ -867,6 +862,49 @@ async fn went_behind<R: idevice::ReadWrite>(
         }
     }
     (opened_in_front || !heard.is_empty()).then_some(None)
+}
+
+/// Apps opened on the phone, in front, as they're asked for, said back as {"event":"launch","ok"}
+/// (in front as it was if it was open: FrontBoard brings it forward). With `front`, also "home":
+/// whether the home screen was in front before (true) or an app (false), as the phone says (not
+/// said when it doesn't).
+async fn work_launches(
+    mut apps: Option<AppServiceClient<Box<dyn idevice::ReadWrite>>>,
+    mut instruments: Option<RemoteServerClient<Box<dyn idevice::ReadWrite>>>,
+    mut launches: mpsc::Receiver<(String, bool)>,
+) {
+    while let Some((bundle, front)) = launches.recv().await {
+        let Some(apps) = apps.as_mut() else {
+            say(json!({"event": "launch", "ok": false, "bundle": bundle, "message": "The iPhone didn't let Handset open apps."}));
+            continue;
+        };
+        let mut states = match (front, instruments.as_mut()) {
+            (true, Some(instruments)) => tokio::time::timeout(WATCH_FOR, async {
+                let mut states = NotificationsClient::new(instruments).await.ok()?;
+                states.start_notifications().await.ok()?;
+                Some(states)
+            })
+            .await
+            .ok()
+            .flatten(),
+            _ => None,
+        };
+        match apps.launch_application(bundle.clone(), &[], false, false, None, None, None).await {
+            Ok(launched) => {
+                let mut answer = json!({"event": "launch", "ok": true, "bundle": bundle});
+                if let Some(states) = states.as_mut() {
+                    match went_behind(states, Some(launched.pid)).await {
+                        Some(None) => answer["home"] = json!(true),
+                        Some(Some(_)) => answer["home"] = json!(false),
+                        None => {}
+                    }
+                    let _ = states.stop_notifications().await;
+                }
+                say(answer);
+            }
+            Err(why) => say(json!({"event": "launch", "ok": false, "bundle": bundle, "message": why.to_string()})),
+        }
+    }
 }
 
 /// An app's bundle id from a running process: its executable's place among the apps' (CoreDevice's
@@ -1325,7 +1363,15 @@ async fn stream_screen(
     ) {
         (Ok(touch), Ok(keys)) => {
             let apps = AppServiceClient::connect_rsd(&mut *adapter, &mut *handshake).await.ok();
-            tokio::spawn(work_input(touch, keys, apps, commands));
+            // What an app opened came in front of (the home screen, or an app): the phone's word on
+            // its apps, on a connection of its own, so opening an app never holds up a touch.
+            let instruments = tokio::time::timeout(WATCH_FOR, RemoteServerClient::connect_rsd(&mut *adapter, &mut *handshake))
+                .await
+                .ok()
+                .and_then(Result::ok);
+            let (launches, to_launch) = mpsc::channel::<(String, bool)>(16);
+            tokio::spawn(work_launches(apps, instruments, to_launch));
+            tokio::spawn(work_input(touch, keys, launches, commands));
             say(json!({"event": "input", "ready": true}));
         }
         (touch, keys) => {

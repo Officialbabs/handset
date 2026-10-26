@@ -11,7 +11,7 @@ talking to the phone; Handset runs it and speaks to it in lines:
   and y from 0 to 65535 across the screen, {"op":"up"}, {"op":"button","name":…} (home, lock,
   volume_up, volume_down), {"op":"key","name":…} (enter, delete, tab, escape, the arrows),
   {"op":"text","text":…} and {"op":"launch","bundle":…} (an app to the front, said back as
-  {"event":"launch","ok":…}).
+  {"event":"launch","ok":…}; with "front": true, also "home": whether the home screen was in front).
 
 `handset-ios apps` lists the phone's apps instead (list_apps here). An iPhone shows one app at
 a time on its one screen, so an iPhone app "in a window of its own" is the phone's screen with
@@ -256,8 +256,10 @@ class IPhone:
         # Whether someone else shares the phone's screen now (Ada working on it): if not, streams
         # left on the phone from before are stopped when this one starts.
         self.shared: Callable[[], bool] = lambda: False
-        self.launching: str | None = None  # an app to open once the phone takes input
+        self.launching: tuple[str, bool] | None = None  # an app to open once the phone takes input
         self.on_launched: Callable[[bool, str], None] | None = None  # (opened, why not)
+        # Whether the home screen was in front when an app was opened with `front` (as the phone says).
+        self.on_front: Callable[[bool], None] | None = None
 
     def fingers(self, points: list[tuple[int, int]]):
         """Several fingers at once, as the screen shows (a pinch); none: all up."""
@@ -268,12 +270,13 @@ class IPhone:
         """Command(+Shift)+letter: select all, copy, cut, paste, undo, redo."""
         self._send({"op": "shortcut", "key": letter, "shift": shift})
 
-    def launch(self, bundle: str):
-        """Opens an app on the phone, in front: now, or once the phone takes input."""
+    def launch(self, bundle: str, front: bool = False):
+        """Opens an app on the phone, in front: now, or once the phone takes input. With `front`,
+        on_front says whether the home screen was in front before (when the phone says)."""
         if self.live_touch:
-            self._send({"op": "launch", "bundle": bundle})
+            self._send({"op": "launch", "bundle": bundle, **({"front": True} if front else {})})
         else:
-            self.launching = bundle
+            self.launching = (bundle, front)
 
     def start(self):
         from .pairing import ddi_folder
@@ -458,11 +461,14 @@ class IPhone:
             self.live_touch = bool(event.get("ready"))
             self.on_touch(self.live_touch)
             if self.live_touch and self.launching:
-                self._send({"op": "launch", "bundle": self.launching})
-                self.launching = None
-        elif kind == "launch" and self.on_launched:
+                launching, self.launching = self.launching, None
+                self.launch(*launching)
+        elif kind == "launch":
             opened = bool(event.get("ok"))
-            self.on_launched(opened, "" if opened else launch_trouble(str(event.get("message") or "")))
+            if self.on_launched:
+                self.on_launched(opened, "" if opened else launch_trouble(str(event.get("message") or "")))
+            if opened and isinstance(event.get("home"), bool) and self.on_front:
+                self.on_front(event["home"])
         elif kind == "status" and self.on_status:
             self.on_status(str(event.get("text") or ""))
         elif kind == "error":

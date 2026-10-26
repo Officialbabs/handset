@@ -224,7 +224,12 @@ def main(args):
                 continue
             if command.get("op") == "launch":
                 opened = command.get("bundle") in [app[1] for app in APPS]
-                say(event="launch", ok=opened, bundle=command.get("bundle"),
+                # Asked what it came in front of: FAKEIOS_DIR/front says ("home", or an app's id).
+                front = {}
+                if opened and command.get("front") and os.path.exists(os.path.join(HERE, "front")):
+                    with open(os.path.join(HERE, "front")) as file:
+                        front = {"home": file.read().strip() == "home"}
+                say(event="launch", ok=opened, bundle=command.get("bundle"), **front,
                     **({} if opened else {"message": "FBSOpenApplicationErrorDomain error 7: not unlocked"}))
     video.terminate()
     video.wait()

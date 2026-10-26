@@ -235,6 +235,10 @@ class Window(Adw.ApplicationWindow):
         self.parted = task is not None
         self.display: tuple[str, int] | None = None  # (serial, id): an Android app's display on its phone
         self.gave_screen = False  # an iPhone's one screen went to another window (screen_to)
+        # An iPhone app's window: whether the iPhone was on its home screen when the app came in
+        # front (None: not said), and whether minimizing sent it back there.
+        self.home_before: bool | None = None
+        self.sent_home = False
         self.border = BORDER if phone_app else 0
         # libadwaita's windows are at least 360 wide: narrower than that is a phone's own shape.
         self.set_size_request(160, 240)
@@ -430,7 +434,7 @@ class Window(Adw.ApplicationWindow):
         starts.append(self.screen_off_button)
         top.set_start_widget(starts)
         ends = Gtk.Box()
-        ends.append(self._bezel_button("window-minimize-symbolic", "Minimize", "window.minimize"))
+        ends.append(self._bezel_button("window-minimize-symbolic", "Minimize", "win.minimize-window"))
         ends.append(self._bezel_button("window-close-symbolic", "Close", "window.close", "close"))
         top.set_end_widget(ends)
         self.bezel = Gtk.WindowHandle(child=top, height_request=BEZEL,
@@ -507,6 +511,7 @@ class Window(Adw.ApplicationWindow):
         self._action("unpin", lambda _a, _p: self._pin_this(False))
         self._action("whole-phone", lambda _a, _p: self.phone and self.get_application().open_window(self.phone.id))
         self._action("screenshot", lambda _a, _p: self.screenshot())
+        self._action("minimize-window", lambda _a, _p: self.minimize_window())
         self._action("fullscreen", lambda _a, _p: self.unfullscreen() if self.is_fullscreen() else self.fullscreen())
         for action, accels in SHORTCUTS:
             self.get_application().set_accels_for_action(action, accels)
@@ -893,7 +898,8 @@ class Window(Adw.ApplicationWindow):
             self._link_clipboard(lambda on_text, on_image: iphone.ClipboardLink(link, on_text, on_image))
             if self.phone_app:
                 self.device.on_launched = self._launched
-                self.device.launch(self.phone_app.app)
+                self.device.on_front = self._front_was
+                self.device.launch(self.phone_app.app, front=True)
             self._turned()
             self.device.start()
             self._show_at()
@@ -1124,6 +1130,7 @@ class Window(Adw.ApplicationWindow):
         device.on_frame, device.on_turned, device.on_touch = self._frame, self._turned, self._touch_changed
         device.on_ended, device.on_awake, device.on_status = self._video_ended, self._awake_changed, self._helper_status
         device.on_launched = self._launched
+        device.on_front = self._front_was
         device.looks_dark = self.picture.is_dark
         self.picture_tries = self.retries = 0
         self._turned()
@@ -1136,14 +1143,35 @@ class Window(Adw.ApplicationWindow):
             self._expect_picture(IPHONE_PICTURE_WAIT_MS)
         self.asleep.set_visible(not device.awake)
         if self.phone_app:
-            device.launch(self.phone_app.app)
+            device.launch(self.phone_app.app, front=True)
         debug("the iPhone's screen moved to", self.phone_app.name if self.phone_app else "its window")
 
     def _activated(self, *_args):
         """An iPhone's window coming forward shows the iPhone again (its app in front, for an
-        app's): the iPhone has one screen, and it goes to the window in use."""
+        app's): the iPhone has one screen, and it goes to the window in use. An app's window sent
+        home as it was minimized brings its app back."""
         if self.is_active() and self.gave_screen:
             self.take_screen()
+        elif self.is_active() and self.sent_home:
+            self.sent_home = False
+            if self.device and self.phone_app and getattr(self.device, "live_touch", False):
+                self.device.launch(self.phone_app.app, front=True)
+
+    def _front_was(self, home: bool):
+        """What this app's window's app came in front of, as the iPhone said: the home screen, or
+        an app (where minimizing the window leaves it)."""
+        self.home_before = home
+
+    def minimize_window(self):
+        """Minimize (the bezel's button): an iPhone app's window whose app was opened over the
+        home screen leaves the iPhone on its home screen again. Not a dark iPhone (Home would
+        light it), nor one the phone didn't say of."""
+        device = self.device
+        if (self.phone and self.phone.platform == "ios" and self.phone_app and self.home_before is True
+                and device is not None and getattr(device, "live_touch", False) and getattr(device, "awake", True)):
+            device.key("home")
+            self.sent_home = True
+        self.minimize()
 
     def _launched(self, opened: bool, why: str):
         """The iPhone opened this window's app (or didn't: locked, mostly)."""

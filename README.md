@@ -215,7 +215,8 @@ button on the right, and a thin frame round it.
   - To turn it off, set `"pop_out_apps": false` in `~/.config/handset/settings.json`.
 - **On an iPhone**, the phone has one screen, so the app opens in front on it and the window shows
   the phone with that app. Closing the window takes the iPhone back to its home screen (unless
-  it's gone dark, which Home would light). A locked iPhone doesn't open apps; unlock it first.
+  it's gone dark, which Home would light). So does minimizing it with its bezel's button, when the
+  app was opened over the home screen; coming back to the window brings the app back. A locked iPhone doesn't open apps; unlock it first.
 - **Icons** come from the phone. On Android they're read from each app's package and drawn the way
   the launcher draws them, with the app's first letter on a colour when an icon can't be read.
   iPhone icons come from the phone itself.

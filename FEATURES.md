@@ -264,6 +264,10 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
   that app open.
 - **Closing the window** takes the iPhone back to its home screen, through whichever window has its
   screen. A dark iPhone is left dark: Home would light it.
+- **Minimizing the window** (its bezel's button) takes the iPhone back to its home screen too, when
+  the app was opened over the home screen (as the iPhone says, from its own word on its apps); one
+  opened over another app leaves the iPhone as it is. Coming back to the window brings the app
+  back.
 - **A locked iPhone must be unlocked** before an app can be opened.
 
 ### Icons and synchronisation
@@ -639,7 +643,7 @@ Handset is developed and validated on the following configuration:
 | Android | Android 17 |
 | iOS | iOS 27 |
 
-**Automated tests:** 260 tests across 26 test files run against a simulated Android device, a
+**Automated tests:** 263 tests across 26 test files run against a simulated Android device, a
 simulated iPhone helper and a simulated phone service, with no hardware required:
 
 ```sh
