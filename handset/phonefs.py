@@ -710,10 +710,17 @@ ANSWERS = {
 
 def unmount(mountpoint: str):
     """A mount there taken away (one left by a Handset that stopped, whose folder can't even be
-    looked at any more, say); nothing if none."""
-    if os.path.lexists(mountpoint):
-        subprocess.run(["fusermount3", "-u", "-z", mountpoint], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=10)
+    looked at any more, say); nothing if none. A mount the kernel has cut off fails lstat
+    (ENOTCONN), which lexists would read as nothing there — and it's the one most in need of
+    going, or makedirs trips over it."""
+    try:
+        os.lstat(mountpoint)
+    except FileNotFoundError:
+        return
+    except OSError:
+        pass
+    subprocess.run(["fusermount3", "-u", "-z", mountpoint], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=10)
 
 
 def phones_folder() -> str:
