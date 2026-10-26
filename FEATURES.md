@@ -125,10 +125,21 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
 - **Moving:** drag the bezel, or drag with the middle mouse button.
 - **Full screen:** double-click the bezel or press F11.
 - **Resizing** from the window's edges keeps the phone's aspect ratio.
-- **Bezel buttons:** a screenshot button, Minimize and Close.
+- **Bezel buttons:** a screenshot button, Minimize and Close, and on an Android phone's window,
+  Phone Screen Off.
 - **Remembered sizes:** each phone's window reopens at its last size. App windows share one size:
   the last size given to any of them, starting at 90% of the screen's height.
 - **Click to wake:** clicking a sleeping phone's window wakes the phone.
+- **Phone screen off (Android):** the bezel's brightness button, Phone Screen Off in the bezel
+  menu, or **Ctrl+Shift+O** turns the phone's own display off while the window keeps showing and
+  controlling it, through scrcpy's server (Android's display control, the phone awake meanwhile).
+  - **Kept awake:** the phone's screen-off time is a day while it's off, and put back after.
+  - **One switch per phone,** shown alike in all its windows, app windows included.
+  - **Back on** when switched off, when the phone's last window closes, when the phone sleeps (its
+    power button) or disconnects, and when Handset quits. scrcpy's server's own clean-up turns it
+    back on, and puts the screen-off time back, even if Handset is stopped.
+  - **Not remembered,** so a phone is never dark by surprise. The phone must be unlocked.
+  - Verified on the test platform: display off, still awake and drawing, both put back after.
 
 ### Video pipeline
 
@@ -503,6 +514,7 @@ Settings are stored in `~/.config/handset/settings.json`.
 | Ctrl+Shift+F | Phone Files |
 | Ctrl+Shift+N | New window for another phone |
 | Ctrl+Shift+S, Print | Screenshot |
+| Ctrl+Shift+O | Phone screen off or on (Android) |
 | Ctrl+, | Phones and Settings |
 | Ctrl+W | Close the window |
 | Ctrl+F (in Phone Files) | Search |
@@ -625,7 +637,7 @@ Handset is developed and validated on the following configuration:
 | Android | Android 17 |
 | iOS | iOS 27 |
 
-**Automated tests:** 248 tests across 25 test files run against a simulated Android device, a
+**Automated tests:** 255 tests across 26 test files run against a simulated Android device, a
 simulated iPhone helper and a simulated phone service, with no hardware required:
 
 ```sh
@@ -642,6 +654,7 @@ graphics hardware haven't been tested yet.
 
 - **Typing:** Android accepts plain letters, digits and punctuation. iPhone typing follows a US
   keyboard layout.
+- **Phone screen off** is for Android only: an iPhone shares its screen only while it's lit.
 - **Notification replies:** notifications can't be answered from the desktop, and dismissing one on
   the desktop doesn't dismiss it on the phone.
 - **Protected content:** apps that block screen capture (banking, some video apps) show black, as

@@ -105,6 +105,8 @@ CSS = b"""
                         background: none; box-shadow: none; color: alpha(white, 0.55); -gtk-icon-size: 13px; }
 .handset-bezel-button:hover { background: alpha(white, 0.14); color: white; }
 .handset-bezel-button.close:hover { background: #e01b24; color: white; }
+.handset-bezel-button:checked { background: alpha(white, 0.22); color: white; }
+.handset-window:not(.on-screen) .handset-bezel-button:checked { opacity: 1; background: alpha(currentColor, 0.16); }
 .handset-window:not(.on-screen) .handset-bezel-button { color: inherit; opacity: 0.6; }
 .handset-window:not(.on-screen) .handset-bezel-button:hover { opacity: 1; background: alpha(currentColor, 0.1); }
 .handset-app-body { padding: 0 2px 2px 2px; }
@@ -122,6 +124,7 @@ SHORTCUTS = (
     ("win.phone-apps", ["<Control><Shift>a"]),
     ("win.phone-files", ["<Control><Shift>f"]),
     ("win.screenshot", ["<Control><Shift>s", "Print"]),
+    ("win.screen-off", ["<Control><Shift>o"]),
     ("win.fullscreen", ["F11"]),
     ("window.close", ["<Control>w"]),
     ("app.quit", ["<Control>q"]),
@@ -419,6 +422,12 @@ class Window(Adw.ApplicationWindow):
         if self.phone_app:
             starts.append(self._bezel_button("phone-symbolic", "Show the whole phone", "win.whole-phone"))
         starts.append(self._bezel_button("camera-photo-symbolic", "Screenshot (Ctrl+Shift+S)", "win.screenshot"))
+        # An Android phone's own screen off while it's shown here (screenoff.py): a switch.
+        self.screen_off_button = Gtk.ToggleButton(icon_name="display-brightness-symbolic", action_name="win.screen-off",
+                                                  tooltip_text="Phone screen off (Ctrl+Shift+O)", visible=False,
+                                                  valign=Gtk.Align.CENTER, can_focus=False, focus_on_click=False)
+        self.screen_off_button.add_css_class("handset-bezel-button")
+        starts.append(self.screen_off_button)
         top.set_start_widget(starts)
         ends = Gtk.Box()
         ends.append(self._bezel_button("window-minimize-symbolic", "Minimize", "window.minimize"))
@@ -489,6 +498,10 @@ class Window(Adw.ApplicationWindow):
         sound_here = Gio.SimpleAction.new_stateful("sound-here", None, GLib.Variant("b", False))
         sound_here.connect("change-state", self._sound_here)
         self.add_action(sound_here)
+        screen_off = Gio.SimpleAction.new_stateful("screen-off", None, GLib.Variant("b", False))
+        screen_off.connect("change-state", self._screen_off)
+        screen_off.set_enabled(False)  # an Android phone's, once it's shown
+        self.add_action(screen_off)
         self._action("pair-iphone", lambda _a, _p: self._pair_iphone())
         self._action("pin", lambda _a, _p: self._pin_this(True))
         self._action("unpin", lambda _a, _p: self._pin_this(False))
@@ -576,11 +589,15 @@ class Window(Adw.ApplicationWindow):
             menu.append("Phone Files…", "win.phone-files")
             menu.append("Take a Screenshot", "win.screenshot")
             menu.append("Play Sound Here", "win.sound-here")
+            if self.phone and self.phone.platform == "android":
+                menu.append("Phone Screen Off", "win.screen-off")
         else:
             menu.append("Phone Apps…", "win.phone-apps")
             menu.append("Phone Files…", "win.phone-files")
             menu.append("Take a Screenshot", "win.screenshot")
             menu.append("Play Sound Here", "win.sound-here")
+            if self.phone and self.phone.platform == "android":
+                menu.append("Phone Screen Off", "win.screen-off")
             menu.append("Pair an iPhone for Notifications…", "win.pair-iphone")
             menu.append("New Window", "app.new-window")
             menu.append("Phones and Settings…", "app.phones")
@@ -821,6 +838,8 @@ class Window(Adw.ApplicationWindow):
             app.clipboard.release(showing)
         if app.sound:
             app.sound.release(showing)
+        if app.screen_off:
+            app.screen_off.release(showing)
 
     def _show_ada(self, phone: Phone):
         # Ada works on the phone's own screen, not on an app's screen of its own.
@@ -881,6 +900,7 @@ class Window(Adw.ApplicationWindow):
             self._show_status("phone-symbolic", f"Connecting to {name}…", "")
             self._expect_picture(IPHONE_PICTURE_WAIT_MS)
             self._resume_sound()
+            self._screen_off_offered(False)
             return GLib.SOURCE_REMOVE
         # The phone's own size when the GPU decodes; otherwise as sharp as the monitor can show
         # it and no more, since decoding on the CPU grows with the size.
@@ -893,6 +913,7 @@ class Window(Adw.ApplicationWindow):
         debug("asking the phone for video", edge or "at its own size")
         self._link_clipboard(lambda on_text, _on_image: android.ClipboardLink(link.serial, on_text))
         GLib.idle_add(self._resume_sound)
+        self._screen_off_offered(True)
         if self.phone_app:
             self.device = android.AppScreen(link, self.phone_app.app, self._frame, self._turned,
                                             self._touch_changed, self._video_ended, self._awake_changed,
@@ -1018,6 +1039,31 @@ class Window(Adw.ApplicationWindow):
             self.say(f"{self.phone.name}'s sound plays here" if value.get_boolean()
                      else f"{self.phone.name}'s sound plays on the phone")
 
+    def _screen_off(self, action, value):
+        """Phone Screen Off, switched: the phone's own screen dark while it's shown here, or lit."""
+        screen = self.get_application().screen_off
+        if screen and self.phone:
+            screen.switch(self, value.get_boolean())
+            if value.get_boolean() and screen.is_on(self.phone.id):
+                self.say(f"{self.phone.name}'s screen is off, and it stays awake")
+            elif not value.get_boolean():
+                self.say(f"{self.phone.name}'s screen is on")
+
+    def screen_off_switched(self, on: bool):
+        """The switch shown as it is (switched in another of the phone's windows, or back on by
+        itself)."""
+        action = self.lookup_action("screen-off")
+        if action and action.get_state().get_boolean() != on:
+            action.set_state(GLib.Variant("b", on))
+
+    def _screen_off_offered(self, android: bool):
+        """Phone Screen Off, offered for an Android phone's window and shown as that phone's is."""
+        action = self.lookup_action("screen-off")
+        action.set_enabled(android)
+        self.screen_off_button.set_visible(android)
+        screen = self.get_application().screen_off
+        self.screen_off_switched(bool(android and screen and self.phone and screen.is_on(self.phone.id)))
+
     def sound_switched(self, on: bool):
         """The switch shown as it is (it went off by itself, say)."""
         action = self.lookup_action("sound-here")
@@ -1137,6 +1183,9 @@ class Window(Adw.ApplicationWindow):
 
     def _awake_changed(self, awake: bool):
         self.asleep.set_visible(not awake)
+        screen = self.get_application().screen_off
+        if not awake and screen and self.phone:
+            screen.asleep(self.phone.id)  # asleep: its screen is its own again
         if awake:
             self._expect_picture()
         if self.stack.get_visible_child_name() == "status" and self.device and self.phone:
@@ -1303,6 +1352,8 @@ class Window(Adw.ApplicationWindow):
             app.clipboard.release(others)
         if app.sound:
             app.sound.release(others)
+        if app.screen_off:
+            app.screen_off.release(others)
         self.watch.stop()
         self._close_phone()
         return False

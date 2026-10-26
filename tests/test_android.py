@@ -207,6 +207,47 @@ class FakeAdb(unittest.TestCase):
             return [json.loads(line) for line in file if line.strip()]
 
 
+class ScreenOffTest(FakeAdb):
+    """The phone's own screen off while it's shown, through the stand-in for scrcpy's server."""
+
+    def setUp(self):
+        super().setUp()
+        self.server = android.scrcpy_server
+        android.scrcpy_server = lambda: (__file__, "3.3.4")  # any file: the stand-in adb takes it
+
+    def tearDown(self):
+        android.scrcpy_server = self.server
+        super().tearDown()
+
+    def said(self, kind):
+        return [e for e in self.logged("control.jsonl") if e.get("type") == kind]
+
+    def test_off_kept_awake_and_on_again(self):
+        ended = []
+        screen = android.ScreenOff("FAKE7", ended.append)
+        screen.start()
+        spin(lambda: self.said("display_power"))
+        self.assertEqual(self.said("display_power"), [{"type": "display_power", "on": False}])
+        # Awake a day meanwhile, and the server's own clean-up left on, to put things back.
+        self.assertEqual(self.said("session"), [{"type": "session", "screen_off_timeout": str(android.AWAKE_MS),
+                                                 "cleanup": "true"}])
+        screen.stop()
+        spin(lambda: len(self.said("display_power")) == 2)
+        self.assertEqual(self.said("display_power")[-1], {"type": "display_power", "on": True})
+        self.assertEqual(ended, [])  # stopped: nothing to say
+
+    def test_the_link_going(self):
+        ended = []
+        screen = android.ScreenOff("FAKE7", ended.append)
+        screen.start()
+        spin(lambda: screen.control is not None)
+        open(os.path.join(self.tmp.name, "unplugged"), "w").close()  # the server's clean-up turns it on
+        spin(lambda: ended)
+        self.assertIn("back on", ended[0])
+        spin(lambda: self.said("cleanup"))
+        screen.stop()
+
+
 class FakePhone(FakeAdb):
     def test_finding_the_phone(self):
         self.assertEqual(find_serial("FAKE7"), "FAKE7")

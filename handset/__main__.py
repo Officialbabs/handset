@@ -60,6 +60,7 @@ class App(Adw.Application):
         self.connect("startup", self._started)
         self.clipboard = None  # the clipboard shared with the phones (clipboard.py), once started
         self.sound = None  # each phone's sound, here or on it (sound.py)
+        self.screen_off = None  # Android phones' own screens off while shown (screenoff.py)
         self.task_watches = {}  # adb serial → popout.TaskWatch, while its apps have windows
         self.connect("shutdown", self._shutdown)
 
@@ -69,6 +70,8 @@ class App(Adw.Application):
             self.clipboard.stop()
         if self.sound:
             self.sound.stop()
+        if self.screen_off:
+            self.screen_off.stop()  # every phone's own screen on again
         for watch in self.task_watches.values():
             watch.stop()
 
@@ -83,6 +86,9 @@ class App(Adw.Application):
         from .sound import SoundSwitch
 
         self.sound = SoundSwitch(self)
+        from .screenoff import ScreenSwitch
+
+        self.screen_off = ScreenSwitch(self)
         start_if_needed()  # the phones' apps among the desk's, whether or not it ran at sign-in
         action = Gio.SimpleAction.new("new-window", None)
         action.connect("activate", lambda *_a: self.open_window(new=True))

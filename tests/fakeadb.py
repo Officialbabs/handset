@@ -87,7 +87,7 @@ def scrcpy(command):
     with open(os.path.join(HERE, f"forward_{options['scid']}")) as file:
         port = int(file.read())
     if options.get("video") == "false":
-        return clipboard_server(port)
+        return clipboard_server(port, options)
     width, height = (int(n) for n in options.get("new_display", f"{NATURAL[0]}x{NATURAL[1]}").split("/")[0].split("x"))
     server = socket.create_server(("127.0.0.1", port))
     video, _ = server.accept()
@@ -278,18 +278,33 @@ def versions() -> dict[str, int]:
         return {}
 
 
-def clipboard_server(port):
-    """scrcpy's server for the clipboard alone: FAKEADB_DIR/phone_clipboard is the phone's, sent on
-    when it changes; what's set on it is written to control.jsonl (and becomes the phone's)."""
+def clipboard_server(port, options):
+    """scrcpy's server with no video: the clipboard (FAKEADB_DIR/phone_clipboard is the phone's,
+    sent on when it changes; what's set on it is written to control.jsonl, and becomes the
+    phone's), and the display's power (written down too, as is the clean-up that turns it back on
+    when the server ends, unless told not to clean up). FAKEADB_DIR/unplugged ends it, as a phone
+    unplugged would."""
     server = socket.create_server(("127.0.0.1", port))
     control, _ = server.accept()
     control.sendall(b"\0")
+    log = os.path.join(HERE, "control.jsonl")
+    if "screen_off_timeout" in options:
+        with open(log, "a") as file:
+            file.write(json.dumps({"type": "session", "screen_off_timeout": options["screen_off_timeout"],
+                                   "cleanup": options.get("cleanup", "true")}) + "\n")
+    display_off = [False]
     path = os.path.join(HERE, "phone_clipboard")
     said = [open(path).read() if os.path.exists(path) else None]  # what's there already isn't news
 
     def watch():
         while True:
             time.sleep(0.1)
+            if os.path.exists(os.path.join(HERE, "unplugged")):  # the link goes: the server ends
+                try:
+                    control.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
             text = open(path).read() if os.path.exists(path) else None
             if text is not None and text != said[0]:
                 said[0] = text
@@ -323,8 +338,16 @@ def clipboard_server(port):
                     file.write(json.dumps({"type": "set_clipboard", "text": text, "paste": paste}) + "\n")
                 if sequence:  # acknowledged, as scrcpy's server does when asked
                     control.sendall(bytes([1]) + struct.pack(">Q", sequence))
+            elif kind == 10:
+                on = take(1)[0] == 1
+                display_off[0] = not on
+                with open(log, "a") as file:
+                    file.write(json.dumps({"type": "display_power", "on": on}) + "\n")
     except (EOFError, OSError):
         pass
+    if display_off[0] and options.get("cleanup", "true") != "false":
+        with open(log, "a") as file:
+            file.write(json.dumps({"type": "cleanup", "display_power": True}) + "\n")
     return 0
 
 

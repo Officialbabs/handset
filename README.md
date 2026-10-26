@@ -152,6 +152,13 @@ Drag the bezel to move the window, or double-click it to fill the screen.
   at its native resolution to Pictures › Screenshots and copies it to the clipboard. The capture is
   taken on the phone itself; an app's window captures that app's screen. Minimize and Close are on
   the right of the bezel.
+- **Phone screen off (Android):** the brightness button on the bezel, Phone Screen Off in its menu,
+  or Ctrl+Shift+O turns the phone's own screen off while its window keeps showing and working it.
+  The phone stays awake meanwhile (its screen-off time is a day for the while, and put back after).
+  The screen comes back on when you switch it off again, close the phone's last window, press the
+  phone's power button, or the phone disconnects, and when Handset quits; scrcpy's server turns it
+  back on even if Handset is stopped. The phone must be unlocked: once it locks, apps show black.
+  An iPhone can't do this: it shares its screen only while it's lit.
 - **Editing keys go to the phone** in any app:
   - Ctrl+A select all
   - Ctrl+C copy, which also puts the copy on the computer's clipboard

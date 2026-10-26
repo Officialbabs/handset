@@ -1624,6 +1624,130 @@ class ClipboardLink:
             process.wait()
 
 
+# scrcpy's message turning the phone's display on or off, the phone awake either way.
+SET_DISPLAY_POWER = 10
+# While its own screen is off for Handset, the phone stays awake this long without a touch (its own
+# screen-off time for the while; scrcpy's server puts its own back after): a day.
+AWAKE_MS = 24 * 3600 * 1000
+
+
+def display_power_message(on: bool) -> bytes:
+    return bytes([SET_DISPLAY_POWER, 1 if on else 0])
+
+
+class ScreenOff:
+    """An Android phone's own screen dark while Handset shows and works it: scrcpy's server run
+    for that alone powers the phone's display down with the phone awake (Android's
+    DisplayControl), so its picture here, its touches and its apps' windows go on as before. Its
+    screen-off time is a day meanwhile, so it doesn't sleep under the person's hands. Stopped, it
+    turns the screen on; and if the link goes first (the phone unplugged, Handset killed),
+    the server's own clean-up does it, its screen-off time put back too. `on_ended(why)` on
+    GLib's main loop when it ends by itself."""
+
+    def __init__(self, serial: str, on_ended: Callable[[str], None] | None = None):
+        self.serial = serial
+        self.on_ended = on_ended
+        self.control: socket.socket | None = None
+        self.process: subprocess.Popen | None = None
+        self.port: int | None = None
+        self.stopped = False
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        """The phone's screen on again, and its screen-off time as it was (the server's clean-up,
+        as it ends)."""
+        self.stopped = True
+        control, self.control = self.control, None
+        if control:
+            try:
+                control.sendall(display_power_message(True))
+                control.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            control.close()
+        process, self.process = self.process, None
+        if process and process.poll() is None:
+            try:
+                process.wait(timeout=3)  # the server ends with its socket, cleaning up
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        if self.port:
+            try:
+                adb(self.serial, "forward", "--remove", f"tcp:{self.port}", timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    def _ended(self, why: str):
+        if not self.stopped and self.on_ended:
+            self.on_ended(why)
+        return GLib.SOURCE_REMOVE
+
+    def _run(self):
+        version = scrcpy_version()
+        if not version:
+            GLib.idle_add(self._ended,
+                          "Run Handset's install.sh (it fetches scrcpy's server) to turn the phone's screen off.")
+            return
+        scid = f"{secrets.randbits(31):08x}"
+        try:
+            push_scrcpy_server(self.serial)
+            self.port = int(adb(self.serial, "forward", "tcp:0", f"localabstract:scrcpy_{scid}").strip())
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            GLib.idle_add(self._ended, f"The phone's screen didn't turn off ({error}).")
+            return
+        # The server's clean-up stays on (cleanup is left as it is): it puts the screen and the
+        # screen-off time back however this ends.
+        options = (f"scid={scid} log_level=warn tunnel_forward=true video=false audio=false control=true "
+                   f"clipboard_autosync=false power_on=false screen_off_timeout={AWAKE_MS} "
+                   "send_device_meta=false send_dummy_byte=true")
+        command = adb_command(self.serial, "shell", f"CLASSPATH={PHONE_SERVER} app_process / "
+                                                    f"com.genymobile.scrcpy.Server {version} {options}")
+        try:
+            self.process = subprocess.Popen(command, stdout=TOOL_ERRORS, stderr=TOOL_ERRORS)
+        except OSError as error:
+            GLib.idle_add(self._ended, f"The phone's screen didn't turn off ({error}).")
+            return
+        control = None
+        for _ in range(60):  # the control socket: it sends the one byte
+            if self.stopped or self.process is None or self.process.poll() is not None:
+                break
+            try:
+                sock = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+                if sock.recv(1) == b"\0":
+                    control = sock
+                    break
+                sock.close()
+            except OSError:
+                pass
+            time.sleep(0.1)
+        if not control or self.stopped:
+            if control:
+                control.close()
+            if not self.stopped:
+                GLib.idle_add(self._ended, "The phone's screen didn't turn off: scrcpy's server didn't answer.")
+            return
+        control.settimeout(None)
+        try:
+            control.sendall(display_power_message(False))
+        except OSError:
+            control.close()
+            GLib.idle_add(self._ended, "The phone's screen didn't turn off.")
+            return
+        self.control = control
+        debug("the phone's own screen is off")
+        try:
+            while not self.stopped and control.recv(4096):  # nothing's asked of it: it only ends
+                pass
+        except OSError:
+            pass
+        if not self.stopped:
+            self.control = None
+            GLib.idle_add(self._ended, "The phone's screen is back on: its link went.")
+
+
 def screencap(serial: str, path: str) -> bool:
     """The phone's screen as a PNG at its own size, from the phone itself."""
     try:
@@ -1892,7 +2016,8 @@ class SoundLink:
 
         version = scrcpy_version()
         if not version:
-            GLib.idle_add(self._ended, "Run Handset's install.sh (it fetches scrcpy's server) to play the phone's sound here.")
+            GLib.idle_add(self._ended,
+                          "Run Handset's install.sh (it fetches scrcpy's server) to play the phone's sound here.")
             return
         scid = f"{secrets.randbits(31):08x}"
         try:
