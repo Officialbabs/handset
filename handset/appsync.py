@@ -1,6 +1,8 @@
 """Keeps the apps of connected phones among the desk's apps (apps.py): an entry for each, in search
-and in the apps list, made when a phone connects and gone when it goes, but for the ones pinned to
-the dock. It runs on its own, `handset --sync`, from sign-in (an autostart entry), one at a time;
+and in the apps list, made when a phone connects and kept for a day after it last was, but for the
+ones pinned to the dock, which stay for good: a phone asleep, between Wi-Fi naps, or away for the
+afternoon keeps its entries, so the desk isn't re-reading a couple of hundred of them out and back
+in and dragging its search while it does. It runs on its own, `handset --sync`, from sign-in (an autostart entry), one at a time;
 Handset starts it too when it isn't running. It needs no window and loads no GTK.
 
 An Android phone lists its apps through scrcpy's server; their icons follow, read out of their
@@ -40,6 +42,24 @@ ICON_BATCH = 12
 # An iPhone not connected (by cable or Wi-Fi) this long: its notifications stop until it is again.
 AWAY_FOR_S = 60
 ICON_SIZE = 192
+ENTRY_RETENTION_S = 24 * 3600  # a gone phone's menu entries linger this long before they go
+
+
+def last_seen_path() -> str:
+    """When each phone was last connected, kept so a restart (or a phone dozing off Wi-Fi)
+    doesn't take ~200 entries out of the desk's search and put them back minutes later —
+    the desk re-reads every entry each time, and search drags while it does."""
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(cache, "handset", "last_seen.json")
+
+
+def load_last_seen() -> dict[str, float]:
+    try:
+        with open(last_seen_path()) as file:
+            kept = json.load(file)
+        return {k: float(v) for k, v in kept.items()} if isinstance(kept, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
 
 
 def lock_path() -> str:
@@ -143,6 +163,8 @@ class AppSync:
         self.phones_now: list[Phone] = []
         self.phone_names: dict[str, str] = {}
         self.online: dict[str, Phone] = {}
+        self.last_seen = load_last_seen()  # phone id → when it was last connected
+        self._seen_saved = 0.0
         self.listed: dict[str, float] = {}  # phone id → when its apps were last listed
         self.packages: dict[str, dict[str, str]] = {}  # an Android phone's id → its packages when it was
         self.busy: set[str] = set()
@@ -369,6 +391,16 @@ class AppSync:
         came = set(online) - set(self.online)
         first, self.seen = not self.seen, True
         self.online = online
+        now = time.time()
+        for phone_id in online:
+            self.last_seen[phone_id] = now
+        if gone or came or now - self._seen_saved > 15 * 60:
+            self._seen_saved = now
+            try:
+                os.makedirs(os.path.dirname(last_seen_path()), exist_ok=True)
+                GLib.file_set_contents(last_seen_path(), json.dumps(self.last_seen).encode())
+            except (GLib.Error, OSError):
+                pass
         if gone or came or first:
             debug("phones connected:", sorted(p.name for p in online.values()))
             self._drop_unconnected()
@@ -493,13 +525,21 @@ class AppSync:
         return GLib.SOURCE_CONTINUE
 
     def _drop_unconnected(self):
-        """The entries of phones that aren't connected go, but for the ones in the dock."""
+        """The entries of phones that have been away a while go, but for the ones in the dock.
+        A phone merely off for a bit — asleep, between Wi-Fi naps, or across a restart of
+        Handset — keeps its entries: taking ~200 of them out and putting them back has the
+        desk re-read the lot each way, and its search drags while it does (26 Oct)."""
+        now = time.time()
         with self.lock:
             docked = set(apps.docked())
             for app in apps.entries():
-                if app.phone_id not in self.online and f"{app.id}.desktop" not in docked:
-                    debug("away with", app.title)
-                    apps.remove_entry(app.phone_id, app.app)
+                if app.phone_id in self.online or f"{app.id}.desktop" in docked:
+                    continue
+                last = self.last_seen.setdefault(app.phone_id, now)  # unknown: as of now, and counting
+                if now - last < ENTRY_RETENTION_S:
+                    continue
+                debug("away with", app.title)
+                apps.remove_entry(app.phone_id, app.app)
 
     # ---- One phone's apps (off the main loop) ------------------------------------------------
 

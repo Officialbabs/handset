@@ -86,9 +86,13 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(chat.title, "Fake Chat (Pixel 7)")
         apps.pin(chat, None)
         spin(lambda: not sync.busy)
-        # The phone goes: its apps go too, but for the one in the dock.
+        # The phone goes: its apps stay for now — away a night, not gone.
         self.service.push([phone(id="FAKE7", name="Pixel 7", usb=False, status="offline")])
-        spin(lambda: len(apps.entries()) == 1)
+        spin(lambda: not sync.online)
+        self.assertEqual(len(apps.entries()), 3)
+        # Gone for good a day later: its apps go too, but for the one in the dock.
+        sync.last_seen["FAKE7"] -= appsync.ENTRY_RETENTION_S
+        sync._drop_unconnected()
         self.assertEqual(self.names(), ["Fake Chat"])
         # And back.
         self.service.push([phone(id="FAKE7", name="Pixel 7", usb=True, status="connected")])
@@ -99,10 +103,16 @@ class SyncTest(unittest.TestCase):
 
     def test_entries_left_from_before_go_when_their_phone_isnt_here(self):
         apps.write_entry(apps.PhoneApp("GONE1", "Old phone", "android", "org.example.old", "Old"))
+        apps.write_entry(apps.PhoneApp("GONE2", "Away phone", "android", "org.example.away", "Away"))
+        folder = os.path.join(os.environ["XDG_CACHE_HOME"], "handset")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "last_seen.json"), "w") as file:
+            file.write('{"GONE1": 1}')  # long gone; GONE2 it never saw, so that one counts from now
         sync = appsync.AppSync()
         sync.start()
-        spin(lambda: len(apps.entries()) == 3)
+        spin(lambda: len(apps.entries()) == 4 and not sync.busy)
         self.assertNotIn("Old", self.names())
+        self.assertIn("Away", self.names())
         spin(lambda: not sync.busy)  # nothing of this test's left running into the next
         sync.watch.stop()
         sync.stop()
@@ -122,11 +132,13 @@ class SyncTest(unittest.TestCase):
         chat = apps.find("FAKE7", "org.example.chat")
         icon = os.path.basename(apps.icon_files("FAKE7", "org.example.chat")[0])
         self.assertTrue(icon.startswith(chat.id + "-"))  # its own icon now, not the letter
-        # Back after a while, with Fake Chat updated: only its icon is read again.
+        # Back after a while, with Fake Chat updated: only its icon is read again, and the
+        # entries never left while the phone was away.
         with open(os.path.join(os.environ["FAKEADB_DIR"], "versions.json"), "w") as file:
             file.write('{"org.example.chat": 2}')
         self.service.push([phone(id="FAKE7", name="Pixel 7", usb=False, status="offline")])
-        spin(lambda: apps.entries() == [])
+        spin(lambda: not sync.online)
+        self.assertEqual(len(apps.entries()), 3)
         self.service.push([phone(id="FAKE7", name="Pixel 7", usb=True, status="connected")])
         spin(lambda: len(self.asked()) == 2 and not sync.busy)
         self.assertEqual(self.asked()[1], ["org.example.chat"])
