@@ -121,7 +121,7 @@ def scrcpy(command):
         encoders[-1].kill()
         return 0
     threading.Thread(target=send, args=(encode(),), daemon=True).start()
-    sizes = {0: 14, 2: 32, 4: 2, 17: 1}
+    sizes = {0: 14, 2: 32, 3: 21, 4: 2, 17: 1}
 
     def take(count):
         data = b""
@@ -148,6 +148,10 @@ def scrcpy(command):
                 if kind == 2:
                     action, _pointer, x, y, w, h, _pressure, _b1, _b2 = struct.unpack(">BqiiHHHii", rest)
                     entry = {"type": "touch", "action": action, "x": x, "y": y, "size": [w, h]}
+                elif kind == 3:
+                    x, y, w, h, right, up, _buttons = struct.unpack(">iiHHhhi", rest)
+                    entry = {"type": "scroll", "x": x, "y": y, "size": [w, h],
+                             "right": right / 32768 * 16, "down": -up / 32768 * 16}
                 elif kind == 0:
                     action, code, _repeat, _meta = struct.unpack(">Biii", rest)
                     entry = {"type": "key", "action": action, "code": code}
@@ -527,8 +531,10 @@ def main(args):
             if os.path.exists(os.path.join(HERE, "wifi")):
                 with open(os.path.join(HERE, "wifi")) as file:
                     print(file.read(), end="")
-        elif command == "wm size":
+        elif command in ("wm size", "wm size; wm density"):
             print(f"Physical size: {NATURAL[0]}x{NATURAL[1]}")
+            if "density" in command:
+                print("Physical density: 420\nOverride density: 425")
         elif command.startswith("cd /sdcard && find ."):
             # The phone's whole storage, as phonesearch.ANDROID_FIND lists it.
             top = storage("/sdcard")

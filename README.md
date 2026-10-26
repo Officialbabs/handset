@@ -143,8 +143,12 @@ The window shows the phone's screen edge to edge under a slim bezel, with no tit
 Drag the bezel to move the window, or double-click it to fill the screen.
 
 - **Mouse:** the pointer works as a finger. Press, drag and release as on the glass, and hold for a
-  long press. The scroll wheel scrolls as a finger would: held on the phone, moved a step per
-  notch, and lifted once the wheel stops.
+  long press.
+- **Scrolling:** on Android the wheel and the touchpad scroll as a mouse does on the phone (scroll
+  events through scrcpy's server), whatever is under the pointer: nothing is pressed, so nothing
+  is tapped, held or highlighted by mistake, and the page never stalls at the screen's edge. Each
+  notch glides, the touchpad follows your fingers, and a flick throws the page on. On an iPhone
+  they scroll as a finger would.
 - **Pinch:** pinch on the touchpad, or hold Ctrl and use the scroll wheel, to zoom with two fingers
   on the phone.
 - **Other buttons:** right-click goes back, middle-click goes home, and dragging with the middle

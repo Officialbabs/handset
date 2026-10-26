@@ -13,6 +13,7 @@ the app's own id, so the dock counts it as that app.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -63,6 +64,13 @@ PINCH_REST_MS = 350
 # A touchpad's scroll lifts its finger off the phone when no movement has come for this long
 # (in case the touchpad never says it stopped).
 LIFT_AFTER_MS = 160
+# Where the phone scrolls as a mouse wheel does (Android: scroll()), no finger: a wheel's notches
+# glide the page, each frame taking this share of the way left; a touchpad moves it as the fingers
+# do, and a flick throws it on, slowing as a thrown page does (its speed falling by e every this
+# long) until it's slower than this (the window's pixels a second).
+WHEEL_EASE = 0.3
+GLIDE_FADE_S = 0.32
+GLIDE_STOP = 25.0
 # After the phone's video ends with the phone still there, try again after this long, and
 # twice as long each time after (an iPhone asleep, say) up to the most.
 RETRY_MS = 3000
@@ -272,6 +280,12 @@ class Window(Adw.ApplicationWindow):
         self.scroll_timer = 0
         self.scroll_finger: tuple[float, float] | None = None  # the touchpad's finger on the phone
         self.lift_timer = 0
+        self.wheel_left = [0.0, 0.0]  # the wheel's notches still to scroll, in the phone's pixels
+        self.wheel_glide = 0
+        self.thrown: list[float] | None = None  # a flick's speed, the phone's pixels a second
+        self.thrown_at = 0.0
+        self.throw_timer = 0
+        self.pad_scrolled = False  # the touchpad's last scroll went as a wheel's: a flick throws it
         self.pointer = (0.0, 0.0)
         self.finger: tuple[float, float] | None = None
         self.press_started = 0.0
@@ -482,9 +496,11 @@ class Window(Adw.ApplicationWindow):
         zoom.connect("end", lambda *_a: self._pinch_end())
         zoom.connect("cancel", lambda *_a: self._pinch_end())
         self.screen.add_controller(zoom)
-        wheel = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.BOTH_AXES)
+        wheel = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.BOTH_AXES
+                                          | Gtk.EventControllerScrollFlags.KINETIC)
         wheel.connect("scroll", self._wheel)
         wheel.connect("scroll-end", lambda _c: self._lift_scroll())
+        wheel.connect("decelerate", self._flicked)
         self.screen.add_controller(wheel)
         # Files dropped on the window go to the phone (its Download folder).
         drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
@@ -1291,6 +1307,7 @@ class Window(Adw.ApplicationWindow):
             GLib.source_remove(self.wheel_timer)
             self.wheel_timer = 0
         self.wheel_at = None  # its finger goes with the phone's screen
+        self._stop_gliding()
         if self.pinch_timer:
             GLib.source_remove(self.pinch_timer)
             self.pinch_timer = 0
@@ -1424,6 +1441,7 @@ class Window(Adw.ApplicationWindow):
         return Fit((self.screen.get_width(), self.screen.get_height()), self.device.shown)
 
     def _drag_begin(self, gesture, x, y):
+        self._stop_gliding()  # a press stops the page, as a finger on the glass does
         if self.wheel_timer:  # a click while the wheel's finger is down: that finger goes first
             GLib.source_remove(self.wheel_timer)
         self._wheel_lift()
@@ -1548,6 +1566,12 @@ class Window(Adw.ApplicationWindow):
         # A mouse wheel turned with Shift held scrolls sideways, as everywhere else.
         if unit == Gdk.ScrollUnit.WHEEL and dx == 0 and controller.get_current_event_state() & Gdk.ModifierType.SHIFT_MASK:
             dx, dy = dy, 0.0
+        self._stop_throw()  # fingers on the touchpad again stop a thrown page, as on glass
+        if unit == Gdk.ScrollUnit.WHEEL and self._wheel_glide(dx, dy):
+            return True
+        self.pad_scrolled = unit == Gdk.ScrollUnit.SURFACE and self._scroll_by(dx, dy)
+        if self.pad_scrolled:
+            return True
         if unit == Gdk.ScrollUnit.SURFACE and self.device.live_touch:
             self._finger_scroll(dx, dy)
             return True
@@ -1561,6 +1585,88 @@ class Window(Adw.ApplicationWindow):
         if not self.scroll_timer:
             self.scroll_timer = GLib.timeout_add(SCROLL_AFTER_MS, self._scroll_now)
         return True
+
+    # ---- Scrolling as a mouse wheel does (Android, through scrcpy's server) ---------------------
+
+    def _scroll_point(self, fit: Fit) -> tuple[int, int]:
+        """The phone's pixel under the pointer, or the nearest (the pointer on the bezel)."""
+        (ox, oy), scale = fit.origin, fit.scale or 1.0
+        (sw, sh), (x, y) = fit.screen, self.pointer
+        return min(max(int((x - ox) / scale), 0), sw - 1), min(max(int((y - oy) / scale), 0), sh - 1)
+
+    def _scroll_by(self, right: float, down: float, pixels_of_window: bool = True) -> bool:
+        """What's under the pointer scrolled by the window's pixels (or the phone's), with no
+        finger on the glass; False when the phone can't be scrolled so (an iPhone, say)."""
+        fit = self._fit()
+        scroll = getattr(self.device, "scroll", None)
+        if not fit or not scroll:
+            return False
+        scale = (fit.scale or 1.0) if pixels_of_window else 1.0
+        return scroll(*self._scroll_point(fit), right / scale, down / scale)
+
+    def _wheel_glide(self, right: float, down: float) -> bool:
+        """A mouse wheel's notches, as far as SCROLL_PER_NOTCH takes them, glided a frame at a time."""
+        if not self._scroll_by(0, 0):
+            return False
+        sw, sh = self.device.shown
+        self.wheel_left[0] += right * SCROLL_PER_NOTCH * sh
+        self.wheel_left[1] += down * SCROLL_PER_NOTCH * sh
+        if not self.wheel_glide:
+            self.wheel_glide = GLib.timeout_add(WHEEL_FRAME_MS, self._wheel_glide_step)
+        return True
+
+    def _wheel_glide_step(self):
+        steps = [left if abs(left) < 2 else left * WHEEL_EASE for left in self.wheel_left]
+        self.wheel_left = [left - step for left, step in zip(self.wheel_left, steps)]
+        if not any(steps) or not self._scroll_by(*steps, pixels_of_window=False):
+            self.wheel_glide = 0
+            self.wheel_left = [0.0, 0.0]
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def _flicked(self, _controller, speed_x: float, speed_y: float):
+        """The touchpad's fingers lifted moving (its speed in pixels a millisecond): the page,
+        scrolled as a wheel does, is thrown on (with a finger, the phone throws it itself)."""
+        fit = self._fit()
+        if not self.pad_scrolled or not fit or not self.device:
+            return
+        self.pad_scrolled = False
+        scale = fit.scale or 1.0
+        self.thrown = [speed_x * 1000 / scale, speed_y * 1000 / scale]
+        self.thrown_at = time.monotonic()
+        if not self.throw_timer:
+            self.throw_timer = GLib.timeout_add(WHEEL_FRAME_MS, self._throw_step)
+
+    def _throw_step(self):
+        fit = self._fit()
+        now = time.monotonic()
+        elapsed, self.thrown_at = now - self.thrown_at, now
+        if self.thrown is None or not fit:
+            self.throw_timer = 0
+            return GLib.SOURCE_REMOVE
+        fade = math.exp(-elapsed / GLIDE_FADE_S)
+        # The way gone this frame, as the speed fell over it.
+        way = [speed * GLIDE_FADE_S * (1 - fade) for speed in self.thrown]
+        self.thrown = [speed * fade for speed in self.thrown]
+        slow = math.hypot(*self.thrown) * (fit.scale or 1.0) < GLIDE_STOP
+        if not self._scroll_by(*way, pixels_of_window=False) or slow:
+            self.thrown = None
+            self.throw_timer = 0
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def _stop_throw(self):
+        self.thrown = None
+        if self.throw_timer:
+            GLib.source_remove(self.throw_timer)
+            self.throw_timer = 0
+
+    def _stop_gliding(self):
+        self._stop_throw()
+        if self.wheel_glide:
+            GLib.source_remove(self.wheel_glide)
+            self.wheel_glide = 0
+        self.wheel_left = [0.0, 0.0]
 
     def _scroll_now(self):
         self.scroll_timer = 0

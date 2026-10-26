@@ -305,6 +305,26 @@ def _find_serial(phone_id: str, address: str | None, port: int | None) -> str | 
         pool.shutdown(wait=False, cancel_futures=True)
 
 
+def parse_density(text: str) -> int | None:
+    """The screen's density from `wm density`: the one set over it, if one is."""
+    found = re.search(r"Override density:\s*(\d+)", text) or re.search(r"Physical density:\s*(\d+)", text)
+    return int(found[1]) if found else None
+
+
+def scrcpy_size(screen: tuple[int, int], edge: int) -> tuple[int, int]:
+    """The size of scrcpy's video of a screen this big, its longest edge at most `edge` (0: as it
+    is): its other edge in proportion, then both to multiples of 8 as scrcpy's server rounds them
+    (Size.limit, then round8). The server takes positions only in its video's size."""
+    width, height = screen
+    portrait = height > width
+    major, minor = (height, width) if portrait else (width, height)
+    if edge and major > edge:
+        major, minor = edge, edge * minor // major
+    if major % 8 or minor % 8:
+        major, minor = major & ~7, min((minor + 4) & ~7, major & ~7)
+    return (minor, major) if portrait else (major, minor)
+
+
 def parse_wm_size(text: str) -> tuple[int, int] | None:
     """The screen's upright size from `wm size` ("Physical size: 1080x2400")."""
     match = re.search(r"Physical size:\s*(\d+)\s*x\s*(\d+)", text)
@@ -689,6 +709,8 @@ class Video:
         self.decoder = _decoder("h264", on_frame, self._decoder_broken)
         self.process: subprocess.Popen | None = None
         self.sock: socket.socket | None = None
+        self.control: socket.socket | None = None  # scrcpy's control socket: scrolling goes through it
+        self.scroller = Scroller(420)
         self.forward_port: int | None = None
         self.edge = MAX_EDGE  # the video's longest edge (0: the screen's own size)
         self.fps = FRAME_RATE
@@ -733,9 +755,10 @@ class Video:
         process, self.process = self.process, None
         if process and process.poll() is None:
             process.kill()
-        sock, self.sock = self.sock, None
-        if sock:
-            sock.close()
+        for sock in (self.sock, self.control):
+            if sock:
+                sock.close()
+        self.sock = self.control = None
         port, self.forward_port = self.forward_port, None
         if port:
             try:
@@ -786,8 +809,9 @@ class Video:
             GLib.idle_add(self._fall_back, session, str(error))
             return
         self.forward_port = port
-        options = (f"scid={scid} log_level=warn tunnel_forward=true audio=false control=false "
-                   "cleanup=false send_device_meta=false send_frame_meta=false send_dummy_byte=true "
+        options = (f"scid={scid} log_level=warn tunnel_forward=true audio=false control=true power_on=false "
+                   "clipboard_autosync=false cleanup=false send_device_meta=false send_frame_meta=false "
+                   "send_dummy_byte=true "
                    f"send_codec_meta=true video_codec=h264 max_size={self.edge} "
                    f"video_bit_rate={bit_rate(self.serial)} max_fps={self.fps}")
         command = adb_command(self.serial, "shell",
@@ -820,6 +844,15 @@ class Video:
             return
         self.sock = sock
         try:
+            # Its control socket next (the server sends no picture before it's there); only
+            # scrolls go through it, touches having the virtual touchscreen.
+            self.control = socket.create_connection(("127.0.0.1", port), timeout=5)
+        except OSError as error:
+            sock.close()
+            if session == self.session:
+                GLib.idle_add(self._fall_back, session, f"scrcpy's control didn't connect ({error})")
+            return
+        try:
             sock.settimeout(None)
             codec, width, height = struct.unpack(">III", read_exactly(sock, 12))
             debug("scrcpy video", hex(codec), width, height)
@@ -834,6 +867,23 @@ class Video:
             pass
         if session == self.session:
             GLib.idle_add(self._ended, session, "The phone's video stopped.")
+
+    def scroll(self, x: int, y: int, right: float, down: float) -> bool:
+        """What's under (x, y) of the screen as it shows scrolled by `right` and `down` of its
+        pixels, as a mouse wheel does; False with no control socket (screenrecord's video)."""
+        control = self.control
+        if control is None:
+            return False
+        screen = shown_size(self.natural, self.rotation)
+        size = scrcpy_size(screen, self.edge)
+        at = (min(int(x * size[0] / screen[0]), size[0] - 1), min(int(y * size[1] / screen[1]), size[1] - 1))
+        message = self.scroller.message(*at, size, right, down)
+        try:
+            if message:
+                control.sendall(message)
+        except OSError:
+            return False
+        return True
 
     def _again(self, session: int):
         if session == self.session and not self.stopped:
@@ -866,6 +916,7 @@ class Link:
     natural: tuple[int, int]
     rotation: int
     awake: bool = True
+    density: int = 420  # dots per inch, as Android lays out by
 
 
 def open_link(phone_id: str, address: str | None, port: int | None) -> Link | str:
@@ -877,14 +928,15 @@ def open_link(phone_id: str, address: str | None, port: int | None) -> Link | st
     if not serial:
         return "Plug it in, or connect it over Wi-Fi (Settings › Phones)."
     try:
-        natural = parse_wm_size(shell(serial, "wm size", timeout=8)) or (1080, 2400)
+        sizes = shell(serial, "wm size; wm density", timeout=8)
         state = shell(serial, SCREEN_STATE, timeout=8)
     except (OSError, subprocess.SubprocessError) as error:
         return f"The phone didn't answer: {error}"
+    natural = parse_wm_size(sizes) or (1080, 2400)
     rotation = parse_rotation(state) or 0
     awake = parse_awake(state) is not False
     debug("phone", serial, "screen", natural, "rotation", rotation, "on" if awake else "off")
-    return Link(serial, natural, rotation, awake)
+    return Link(serial, natural, rotation, awake, parse_density(sizes) or 420)
 
 
 class Android:
@@ -906,6 +958,7 @@ class Android:
         self.on_frame = on_frame
         self.turn_seen = 0.0
         self.video = Video(link.serial, link.natural, link.rotation, self._frame, on_ended)
+        self.video.scroller = Scroller(link.density)
         self.video.edge = MAX_EDGE if edge is None else edge
         self.video.fps = fps
         self.touch = Touch(link.serial, link.natural, self._touch_ready, self._touch_failed)
@@ -946,6 +999,12 @@ class Android:
     def show_at(self, width: int, height: int):
         """The screen shows this big in the window (the monitor's pixels)."""
         self.video.decoder.show_at(width, height)
+
+    def scroll(self, x: int, y: int, right: float, down: float) -> bool:
+        """What's under (x, y) scrolled by `right` and `down` of the screen's pixels, as a mouse
+        wheel scrolls it: no finger on the glass, so nothing pressed, held or flung. False when
+        it can't be (screenrecord's video), and a finger has to."""
+        return self.video.scroll(x, y, right, down)
 
     def stop(self):
         self.stopped = True
@@ -1152,6 +1211,40 @@ KEYCODES = {
 MOST_TEXT = 300  # bytes of text in one message
 
 
+INJECT_SCROLL = 3
+NOTCH_DP = 64  # how far Android scrolls a view for a mouse wheel's notch (ViewConfiguration's)
+
+
+def scroll_message(x: int, y: int, size: tuple[int, int], right: float, down: float) -> bytes:
+    """A mouse wheel turned at (x, y) of a video `size` big, `right` and `down` in its notches (16
+    at most, as scrcpy's 16-bit fixed point carries them; up is positive to Android): Android
+    scrolls whatever is under (x, y), as for a mouse."""
+    def fixed(notches: float) -> int:
+        return max(-32768, min(32767, round(notches / 16 * 32768)))
+
+    width, height = size
+    return struct.pack(">BiiHHhhi", INJECT_SCROLL, x, y, width, height, fixed(right), fixed(-down), 0)
+
+
+class Scroller:
+    """A scroll by the screen's pixels as a mouse wheel's notches (scroll_message): whole pixels
+    at a time, a hair over (Android's views round what they're given, RecyclerView cuts it), what's
+    left kept for the next."""
+
+    def __init__(self, density: int):
+        self.notch = NOTCH_DP * density / 160  # the screen's pixels a notch scrolls
+        self.rest = [0.0, 0.0]
+
+    def message(self, x: int, y: int, size: tuple[int, int], right: float, down: float) -> bytes | None:
+        notches = []
+        for axis, pixels in enumerate((right, down)):
+            total = self.rest[axis] + pixels
+            whole = int(total)
+            self.rest[axis] = total - whole
+            notches.append((whole + (0.1 if whole > 0 else -0.1)) / self.notch if whole else 0.0)
+        return scroll_message(x, y, size, *notches) if any(notches) else None
+
+
 def touch_message(action: int, x: int, y: int, size: tuple[int, int], pointer: int = FINGER) -> bytes:
     """A finger down, moving or up at (x, y) of a video `size` big: the server drops one whose
     size isn't the video's as it is now. Several at once each have a pointer of their own."""
@@ -1247,6 +1340,7 @@ class AppScreen:
         self.control: socket.socket | None = None
         self.forward_port: int | None = None
         self.lock = threading.Lock()  # one control message at a time
+        self.scroller = Scroller(link.density)
         self.on_awake = on_awake
         self.awake = link.awake
         self.woken_at = 0.0
@@ -1517,6 +1611,16 @@ class AppScreen:
     def _at(self, x: int, y: int) -> tuple[int, int]:
         width, height = self.shown
         return min(max(int(x), 0), width - 1), min(max(int(y), 0), height - 1)
+
+    def scroll(self, x: int, y: int, right: float, down: float) -> bool:
+        """What's under (x, y) scrolled by `right` and `down` of the screen's pixels, as
+        Android.scroll does."""
+        if self.control is None:
+            return False
+        message = self.scroller.message(*self._at(x, y), self.shown, right, down)
+        if message:
+            self._send(message)
+        return True
 
     def press(self, x: int, y: int):
         if self.live_touch:

@@ -198,7 +198,8 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
 |---|---|
 | Left button press, drag, release | Touch, drag, lift |
 | Left button held | Long press |
-| Scroll wheel | Scroll, as a finger drag: held, moved one step per notch, and lifted once the wheel stops |
+| Scroll wheel | Android: scroll events, as from a mouse, glided over a few frames per notch. iPhone: a finger drag, held, moved one step per notch, and lifted once the wheel stops |
+| Touchpad scroll | Android: scroll events following the fingers, and a flick thrown on, slowing as a page does. iPhone: a finger that follows the touchpad and flings the page when lifted |
 | Touchpad pinch, or Ctrl + scroll wheel | Two-finger pinch to zoom |
 | Right click | Back |
 | Middle click | Home |

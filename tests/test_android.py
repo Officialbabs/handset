@@ -252,12 +252,38 @@ class ScreenOffTest(FakeAdb):
         screen.stop()
 
 
+class ScrollTest(unittest.TestCase):
+    def test_scrcpys_video_size(self):
+        # As the server answered on the test platform's phone (1080x2400), at each longest edge.
+        for edge, size in ((1536, (688, 1536)), (1600, (720, 1600)), (1000, (448, 1000)), (0, (1080, 2400))):
+            self.assertEqual(android.scrcpy_size((1080, 2400), edge), size, edge)
+        self.assertEqual(android.scrcpy_size((2400, 1080), 1536), (1536, 688))  # turned
+
+    def test_whole_pixels_and_the_rest_kept(self):
+        scroller = android.Scroller(160)  # a notch: 64 pixels
+        message = scroller.message(10, 20, (100, 200), 0, 7.5)
+        self.assertEqual(len(message), 21)
+        kind, x, y, w, h, right, up, buttons = struct.unpack(">BiiHHhhi", message)
+        self.assertEqual((kind, x, y, w, h, right, buttons), (3, 10, 20, 100, 200, 0, 0))
+        self.assertAlmostEqual(-up / 32768 * 16 * 64, 7.1, places=1)  # 7 pixels, a hair over; up is positive
+        self.assertIsNone(scroller.message(10, 20, (100, 200), 0, 0.4))  # under a pixel: kept
+        message = scroller.message(10, 20, (100, 200), -2.0, 0.2)  # 0.5 + 0.4 + 0.2: one more
+        _k, _x, _y, _w, _h, right, up, _b = struct.unpack(">BiiHHhhi", message)
+        self.assertAlmostEqual(-up / 32768 * 16 * 64, 1.1, places=1)
+        self.assertAlmostEqual(right / 32768 * 16 * 64, -2.1, places=1)
+
+    def test_density(self):
+        self.assertEqual(android.parse_density("Physical density: 420\nOverride density: 425"), 425)
+        self.assertEqual(android.parse_density("Physical density: 420"), 420)
+        self.assertIsNone(android.parse_density(""))
+
+
 class FakePhone(FakeAdb):
     def test_finding_the_phone(self):
         self.assertEqual(find_serial("FAKE7"), "FAKE7")
         self.assertIsNone(find_serial("SOMEONE-ELSE"))
         link = android.open_link("FAKE7", None, None)
-        self.assertEqual(link, Link("FAKE7", (1080, 2400), 0, True))
+        self.assertEqual(link, Link("FAKE7", (1080, 2400), 0, True, 425))  # the density set over its own
         with open(os.path.join(self.tmp.name, "wakefulness"), "w") as file:
             file.write("Dozing")
         self.assertFalse(android.open_link("FAKE7", None, None).awake)
@@ -454,6 +480,25 @@ class AppScreenTest(FakeAdb):
     def test_listing_the_apps(self):
         self.assertEqual(list_apps("FAKE7"), [("A Very Long Application Name Indeed", "org.example.long"),
                                               ("Fake Chat", "org.example.chat"), ("Settings", "com.android.settings")])
+
+    def control_said(self, kind):
+        return [e for e in self.logged("control.jsonl") if e.get("type") == kind]
+
+    def test_the_phones_screen_scrolled_as_by_a_mouse_wheel(self):
+        phone = Android(Link("FAKE7", (1080, 2400), 0, True, 425), lambda t: None, lambda: None,
+                        lambda live: None, lambda why: None, edge=1536)
+        try:
+            phone.start()
+            spin(lambda: phone.video.control is not None)
+            self.assertTrue(phone.scroll(540, 1200, 0, 300.4))
+            spin(lambda: self.control_said("scroll"))
+        finally:
+            phone.stop()
+        said = self.control_said("scroll")[0]
+        # Where, in the video's own size (the server drops any other); how far, in notches of 64 dp.
+        self.assertEqual((said["x"], said["y"], said["size"]), (344, 768, [688, 1536]))
+        self.assertAlmostEqual(said["down"], 300.1 / (64 * 425 / 160), places=3)
+        self.assertEqual(said["right"], 0)
 
     def test_an_app_on_its_own_screen(self):
         frames, touch, ended = [], [], []
