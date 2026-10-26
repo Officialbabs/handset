@@ -299,18 +299,13 @@ class FileSystem:
     def stop(self):
         # Unmounted first, while it still answers: looking at its own folder now would ask it.
         if self.fd is not None:
-            subprocess.run(["fusermount3", "-u", "-z", self.mountpoint], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=10)
-        self.stopped = True
-        if self.channel:
-            self.channel.close()
-            self.channel = None
-        if self.fd is not None:
             try:
-                os.close(self.fd)
-            except OSError:
-                pass
-            self.fd = None
+                subprocess.run(["fusermount3", "-u", "-z", self.mountpoint], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=10)
+            except (subprocess.TimeoutExpired, OSError):
+                pass  # severing below takes the mount away the hard way
+        self.stopped = True
+        self._sever()
         self.pool.shutdown(wait=False, cancel_futures=True)
         self.phone.stop()
         if self.helper:
@@ -325,25 +320,52 @@ class FileSystem:
 
     # ---- The kernel's requests ----------------------------------------------------------------
 
-    def _serve(self):
-        while not self.stopped and self.fd is not None:
+    def _sever(self):
+        """The kernel connection, cut. Closing /dev/fuse wakes everything waiting on this mount
+        with an error instead of leaving it asleep for good, and closing the channel has
+        fusermount3 (auto_unmount) take the mountpoint away. Safe to call twice."""
+        fd, self.fd = self.fd, None
+        if fd is not None:
             try:
-                request = os.read(self.fd, MAX_WRITE + 4096)
-            except OSError as error:
-                if error.errno in (errno.EINTR, errno.EAGAIN, errno.ENOENT):
-                    continue  # interrupted, or a request the kernel took back
-                break  # ENODEV: unmounted
-            if len(request) < IN_HEADER.size:
-                continue
-            length, opcode, unique, node, _uid, _gid, _pid, _ext, _pad = IN_HEADER.unpack_from(request)
-            body = request[IN_HEADER.size:length]
-            if opcode == INIT:
-                self._init(unique, body)
-            elif opcode == DESTROY:
-                self._reply(unique, 0)
-                break
-            elif opcode not in NO_REPLY:
-                self.pool.submit(self._answer, opcode, unique, node, body)
+                os.close(fd)
+            except OSError:
+                pass
+        channel, self.channel = self.channel, None
+        if channel:
+            channel.close()
+
+    def _serve(self):
+        try:
+            while not self.stopped and self.fd is not None:
+                try:
+                    request = os.read(self.fd, MAX_WRITE + 4096)
+                except OSError as error:
+                    if error.errno in (errno.EINTR, errno.EAGAIN, errno.ENOENT):
+                        continue  # interrupted, or a request the kernel took back
+                    break  # ENODEV: unmounted
+                except TypeError:
+                    break  # self.fd became None under us: stopping
+                if len(request) < IN_HEADER.size:
+                    continue
+                length, opcode, unique, node, _uid, _gid, _pid, _ext, _pad = IN_HEADER.unpack_from(request)
+                body = request[IN_HEADER.size:length]
+                if opcode == INIT:
+                    self._init(unique, body)
+                elif opcode == DESTROY:
+                    self._reply(unique, 0)
+                    break
+                elif opcode not in NO_REPLY:
+                    try:
+                        self.pool.submit(self._answer, opcode, unique, node, body)
+                    except RuntimeError:
+                        break  # the pool is shut: stop() raced this one request
+        finally:
+            # However this loop ends — unmounted, stopping, or a fault — the mount dies with
+            # it. A served folder whose server is gone leaves every later look at it waiting
+            # forever, in a sleep nothing can interrupt; a lid close then can't put the
+            # computer to sleep (seen 26 Oct, phonefs's pool shut while a request was in
+            # hand). Severing wakes the waiters and has the helper unmount.
+            self._sever()
         debug("the phone's folder is unmounted:", self.mountpoint)
 
     def _reply(self, unique: int, error: int, data: bytes = b""):
