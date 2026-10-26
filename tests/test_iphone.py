@@ -100,6 +100,20 @@ class LinkTest(unittest.TestCase):
         self.assertEqual(link, Link("UDID-1", os.path.join(self.tmp.name, "UDID-1.rppairing"),
                                     "192.168.18.10", FAKE_HELPER, "iPhone 12"))
 
+    def test_the_newest_wifi_pairing(self):
+        os.environ["HANDSET_IOS_HELPER"] = FAKE_HELPER
+        service, own = os.path.join(self.tmp.name, "service"), os.path.join(self.tmp.name, "own")
+        iphone.PAIRINGS = (service, own)
+        for folder in (service, own):
+            os.makedirs(folder)
+        with open(os.path.join(service, "UDID-1.rppairing"), "w") as file:
+            file.write("<plist/>")
+        self.assertEqual(iphone.pairing_file("UDID-1"), os.path.join(service, "UDID-1.rppairing"))
+        with open(os.path.join(own, "UDID-1.rppairing"), "w") as file:  # paired again for Wi-Fi, in Handset
+            file.write("<plist/>")
+        os.utime(os.path.join(service, "UDID-1.rppairing"), (1, 1))
+        self.assertEqual(iphone.pairing_file("UDID-1"), os.path.join(own, "UDID-1.rppairing"))
+
     def test_an_address_from_another_network_isnt_kept_to(self):
         os.environ["HANDSET_IOS_HELPER"] = FAKE_HELPER
         with open(os.path.join(self.tmp.name, "UDID-1.rppairing"), "w") as file:

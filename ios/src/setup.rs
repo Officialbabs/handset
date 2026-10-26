@@ -28,6 +28,8 @@ use crate::{Fallible, Missed, by_cable, say};
 
 /// How long the person has for each thing asked of them on the phone.
 const TRUST_FOR: Duration = Duration::from_secs(180);
+/// Remote pairing's code by cable: the same for every iPhone.
+const CABLE_CODE: &str = "000000";
 const DEVELOPER_MODE_FOR: Duration = Duration::from_secs(600);
 const PLUG_IN_FOR: Duration = Duration::from_secs(120);
 const LOOK_AGAIN: Duration = Duration::from_secs(2);
@@ -218,7 +220,9 @@ async fn wifi(udid: &str, out: &str) -> Fallible<()> {
     let mut remote = service.into_client(&host_name())?;
     let mut pairing = RpPairingFile::generate(&format!("Handset {}", machine_id()));
     tell("waiting", "If the iPhone asks, allow this computer");
-    tokio::time::timeout(TRUST_FOR, remote.connect(&mut pairing, || async { String::new() }))
+    // Over the cable the pairing's code is Apple's fixed one: the iPhone shows none. (Asked for
+    // when the iPhone already trusts this computer and puts up no prompt; an empty code isn't one.)
+    tokio::time::timeout(TRUST_FOR, remote.connect(&mut pairing, || async { CABLE_CODE.to_string() }))
         .await
         .map_err(|_| "The iPhone didn't pair for Wi-Fi in time.")?
         .map_err(|e| format!("The iPhone didn't pair for Wi-Fi ({e})."))?;

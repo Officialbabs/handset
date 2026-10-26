@@ -639,7 +639,7 @@ Handset is developed and validated on the following configuration:
 | Android | Android 17 |
 | iOS | iOS 27 |
 
-**Automated tests:** 259 tests across 26 test files run against a simulated Android device, a
+**Automated tests:** 260 tests across 26 test files run against a simulated Android device, a
 simulated iPhone helper and a simulated phone service, with no hardware required:
 
 ```sh

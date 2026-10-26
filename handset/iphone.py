@@ -127,12 +127,12 @@ def helper_binary() -> str | None:
 
 
 def pairing_file(udid: str) -> str | None:
-    """The iPhone's Wi-Fi pairing, if it has one (without, it's reached by its cable only)."""
-    for folder in PAIRINGS:
-        path = os.path.join(folder, f"{udid}.rppairing")
-        if os.path.isfile(path):
-            return path
-    return None
+    """The iPhone's Wi-Fi pairing, if it has one (without, it's reached by its cable only): the
+    newest, when the phone service and Handset have each made one (one made again for Wi-Fi in
+    Handset's setup is the one the phone takes now)."""
+    found = [path for path in (os.path.join(folder, f"{udid}.rppairing") for folder in PAIRINGS)
+             if os.path.isfile(path)]
+    return max(found, key=os.path.getmtime) if found else None
 
 
 def normalized(x: float, y: float, shown: tuple[int, int]) -> tuple[int, int]:
