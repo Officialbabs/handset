@@ -73,12 +73,16 @@ class CropTest(unittest.TestCase):
 
 class LinkTest(unittest.TestCase):
     def setUp(self):
+        import ipaddress
+
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved = (iphone.PAIRINGS, os.environ.get("HANDSET_IOS_HELPER"))
+        self.saved = (iphone.PAIRINGS, os.environ.get("HANDSET_IOS_HELPER"), iphone.local_networks)
         iphone.PAIRINGS = (self.tmp.name,)
+        iphone.local_networks = lambda: [ipaddress.ip_network("192.168.18.0/24")]  # this computer's, as if
 
     def tearDown(self):
         iphone.PAIRINGS = self.saved[0]
+        iphone.local_networks = self.saved[2]
         if self.saved[1] is None:
             os.environ.pop("HANDSET_IOS_HELPER", None)
         else:
@@ -95,6 +99,17 @@ class LinkTest(unittest.TestCase):
         link = iphone.open_link("UDID-1", "192.168.18.10", "iPhone 12")
         self.assertEqual(link, Link("UDID-1", os.path.join(self.tmp.name, "UDID-1.rppairing"),
                                     "192.168.18.10", FAKE_HELPER, "iPhone 12"))
+
+    def test_an_address_from_another_network_isnt_kept_to(self):
+        os.environ["HANDSET_IOS_HELPER"] = FAKE_HELPER
+        with open(os.path.join(self.tmp.name, "UDID-1.rppairing"), "w") as file:
+            file.write("<plist/>")
+        # Last seen on the Wi-Fi at home; this computer is on another: the helper looks for it.
+        self.assertIsNone(iphone.open_link("UDID-1", "192.168.0.114").address)
+        self.assertEqual(iphone.open_link("UDID-1", "192.168.18.9").address, "192.168.18.9")
+        self.assertTrue(iphone.on_this_network("fe80::1"))  # can't tell: kept
+        iphone.local_networks = lambda: []
+        self.assertTrue(iphone.on_this_network("192.168.0.114"))  # nothing to tell by: kept
 
 
 class FakeHelper(unittest.TestCase):

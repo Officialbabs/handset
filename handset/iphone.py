@@ -185,7 +185,42 @@ def open_link(udid: str, address: str | None, model: str = "") -> Link | str:
 
     if udid in choices()[1]:
         return Link(udid, None, None, helper, model)  # kept to its cable in Handset: no Wi-Fi
+    # The helper takes the phone only at the address it's given: one from another network (the
+    # Wi-Fi it was last seen on) would turn it away here, so the helper looks for it unhelped.
+    if address and not on_this_network(address):
+        debug("the iPhone's last address isn't on this computer's networks:", address)
+        address = None
     return Link(udid, pairing_file(udid), address, helper, model)
+
+
+def local_networks() -> list:
+    """This computer's IPv4 networks now (192.168.18.0/24, say), from `ip`."""
+    import ipaddress
+
+    try:
+        listed = subprocess.run(["ip", "-o", "-4", "addr", "show", "scope", "global"], capture_output=True,
+                                text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    networks = []
+    for found in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", listed):
+        networks.append(ipaddress.ip_interface(found.group(1)).network)
+    return networks
+
+
+def on_this_network(address: str) -> bool:
+    """Whether an address is on one of this computer's networks; yes when that can't be told (an
+    IPv6 address, no `ip`)."""
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return True
+    networks = local_networks()
+    if ip.version != 4 or not networks:
+        return True
+    return any(ip in network for network in networks)
 
 
 class IPhone:
