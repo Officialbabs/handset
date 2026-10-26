@@ -11,8 +11,12 @@ JDK="$(ls -d "$TOOLS"/jdk-*/ 2>/dev/null | head -1)"
 [ -f "$TOOLS/r8.jar" ] || { echo "No r8.jar in $TOOLS." >&2; exit 1; }
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-"$JDK/bin/javac" --release 11 -d "$WORK/classes" "$HERE/HandsetMedia.java" "$HERE/HandsetClip.java"
+# Android's own classes it extends (Binder) are stood in for while building only: stubs/, left out
+# of the jar, so the phone's are the ones it runs with.
+"$JDK/bin/javac" --release 11 -d "$WORK/stubs" $(find "$HERE/stubs" -name '*.java')
+"$JDK/bin/jar" cf "$WORK/stubs.jar" -C "$WORK/stubs" .
+"$JDK/bin/javac" --release 11 -cp "$WORK/stubs" -d "$WORK/classes" "$HERE/HandsetMedia.java" "$HERE/HandsetClip.java"
 "$JDK/bin/java" -cp "$TOOLS/r8.jar" com.android.tools.r8.D8 --release --min-api 26 --lib "$JDK" \
-    --output "$WORK/handset-media.jar" $(find "$WORK/classes" -name '*.class')
+    --classpath "$WORK/stubs.jar" --output "$WORK/handset-media.jar" $(find "$WORK/classes" -name '*.class')
 cp "$WORK/handset-media.jar" "$HERE/../data/handset-media.jar"
 echo "Built data/handset-media.jar"

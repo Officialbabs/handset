@@ -73,9 +73,15 @@ explains what to do on the phone and moves on as soon as the phone is ready.
   phone.
 - **Android over Wi-Fi**, in either of two ways:
   - **Use Over Wi-Fi Too**, while the phone is connected by cable. This lasts until the phone
-    restarts, and Handset reconnects automatically when it comes back. It finds the phone's Wi-Fi
-    on whichever interface it's on (a Pixel 7 on Android 17 uses `wlan1`, not `wlan0`). On Ada
-    it's offered for a phone the system's phone service has no Wi-Fi for.
+    restarts. It finds the phone's Wi-Fi on whichever interface it's on (a Pixel 7 on Android 17
+    uses `wlan1`, not `wlan0`). On Ada it's offered for a phone the system's phone service has no
+    Wi-Fi for.
+  - **Connected when wanted.** Handset remembers where it found each phone on Wi-Fi. When adb has
+    lost it, opening its window or one of its apps, or searching its files, connects it there at
+    once, as the iPhone's helper does. The background sync also connects it as soon as the phone
+    announces its adb on the network, and otherwise tries every five minutes.
+  - **adb's server outlives Handset.** Handset starts it in a systemd scope of its own, so closing
+    or restarting Handset never drops a phone's Wi-Fi link.
   - **Wireless debugging with a pairing code** (Android 11 and later). Pairing-ready phones are
     found on the local network through Avahi (mDNS), and Handset reconnects whenever the phone is
     back on the network.
@@ -93,6 +99,13 @@ explains what to do on the phone and moves on as soon as the phone is ready.
   fallback, and carries on over Wi-Fi when the cable is unplugged.
 - **Automatic reconnection.** A phone that sleeps or drops off the network reconnects when it
   becomes reachable again.
+- **Light on the phone.** Handset waits for a phone to say what changed instead of asking it over
+  and over, so a phone left alone can sleep:
+  - a window follows the phone's own event log for its screen turning, sleeping and locking, and
+    looks at the screen only then (and now and then besides)
+  - the media helper is called back by the phone's media service, and reads a cover once a track
+  - files are indexed when they're searched, apps listed again only when the phone's packages
+    change
 - **Per-phone Connected switch.** Turning it off suspends everything for that phone (window,
   notifications, clipboard and sound) until it's turned back on.
 
@@ -134,12 +147,15 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
 - **Click to wake:** clicking a sleeping phone's window wakes the phone.
 - **Phone screen off (Android):** the bezel's brightness button, Phone Screen Off in the bezel
   menu, or **Ctrl+Shift+O** turns the phone's own display off while the window keeps showing and
-  controlling it, through scrcpy's server (Android's display control, the phone awake meanwhile).
-  - **Kept awake:** the phone's screen-off time is a day while it's off, and put back after.
+  controlling it, through scrcpy's server (Android's display control).
+  - **Sleeps as ever:** the phone keeps its own screen-off time. Using it from the window counts as
+    using the phone; left alone, it goes to sleep and its screen stays dark.
   - **One switch per phone,** shown alike in all its windows, app windows included.
-  - **Back on** when switched off, when the phone's last window closes, when the phone sleeps (its
-    power button) or disconnects, and when Handset quits. scrcpy's server's own clean-up turns it
-    back on, and puts the screen-off time back, even if Handset is stopped.
+  - **Back on** when switched off, when the phone's last window closes, when the phone
+    disconnects, and when Handset quits. scrcpy's server's own clean-up turns it back on even if
+    Handset is stopped.
+  - **The phone's own once it sleeps** (its power button, or its screen-off time): the switch goes
+    off, and the screen stays dark until the phone wakes.
   - **Not remembered,** so a phone is never dark by surprise. The phone must be unlocked.
   - Verified on the test platform: display off, still awake and drawing, both put back after.
 
@@ -276,6 +292,8 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
   launcher draws them. When an icon can't be read, a tile with the app's initial is used instead.
 - **iPhone icons** come from the device.
 - **Caching:** icons are cached, and an app's icon is read again only when the app updates.
+- **Relisting (Android):** every 30 minutes a quick list of the phone's packages and their
+  versions; its apps are listed again only when that changed.
 - **Background sync:** a lightweight service (`handset --sync`), started at sign-in, keeps the
   launcher entries in step with the phones.
 - **Removal:** `handset --forget-apps` removes every app entry, and uninstalling does the same.
@@ -375,7 +393,9 @@ Notifications can be switched off in Phones and Settings.
 - **Searching:** files and folders on connected phones appear in the desktop's search results by
   name, each showing its phone and folder. Picking one opens it in its default app.
 - **Indexing:** searches never wait for a phone, because results come from an index Handset keeps.
-  The index is built when the phone connects and refreshed every 30 minutes.
+  The index is built when the phone connects (unless the one kept from before is under 30
+  minutes old), and made again when a search finds it older than that: the phone is left alone
+  meanwhile.
   - **Android:** one `find` over the phone's storage, which took under a second on the test
     platform.
   - **iPhone:** walked by the helper.
@@ -423,7 +443,8 @@ activity pill; on other desktops, the shell's media controls.
 - **Controls:** play and pause, next and previous, seeking (Android), and opening the playing app's
   window.
 - **Android:** a small helper runs temporarily on the phone as the adb shell user, with nothing
-  installed. It provides the app's own cover, the track length and seeking. Without it, Handset
+  installed. It provides the app's own cover, the track length and seeking. The phone's media
+  service calls it back when anything changes, so it does nothing in between. Without it, Handset
   reads the phone's media sessions as text, with no cover and no seeking.
 - **iPhone:** delivered over Bluetooth through Apple Media Service, the protocol car systems use.
   That protocol carries no artwork, so covers are looked up in Apple's public music catalogue by

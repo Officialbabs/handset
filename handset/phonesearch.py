@@ -3,7 +3,8 @@ desktop's launcher asks apps for results with): each connected phone's files and
 
 A search never waits on a phone: it looks through an index of names kept here, made by asking a
 phone for its whole storage at once (an Android phone's `find`, the iPhone helper's walk) when its
-folder comes (phonefs.py), and again every so often while it's there. A result opens from that
+folder first comes (phonefs.py), and again only when it's searched and its index has grown old:
+the phone is left alone meanwhile. A result opens from that
 folder, in the app that opens its kind of file (the file fetched as it's opened).
 
 The sync serves it, under a bus name of its own (install.sh tells the desktop which).
@@ -28,7 +29,7 @@ from .log import debug
 BUS_NAME = APP_ID + ".Sync"
 PATH = "/io/github/Officialbabs/Handset/SearchProvider"
 LIMIT = 10
-INDEX_EVERY_S = 30 * 60
+INDEX_EVERY_S = 30 * 60  # an index this old is made again, when the phones are searched
 IPHONE_MOST = 100_000  # names asked of an iPhone, at most, for each place
 
 XML = """
@@ -228,19 +229,19 @@ class PhoneSearch:
     phone whose folder is here: its id → (its name, its folder here, how to list it all: a
     function answering [Found] or None when the phone didn't)."""
 
-    def __init__(self, phones: Callable[[], dict[str, tuple[str, str, Callable[[], list[Found] | None]]]]):
+    def __init__(self, phones: Callable[[], dict[str, tuple[str, str, Callable[[], list[Found] | None]]]],
+                 wanted: Callable[[], None] | None = None):
         self.phones = phones
+        self.wanted = wanted  # a search came: phones not connected now are wanted (adbwifi)
         self.indexes: dict[str, Index] = {}
         self.indexing: set[str] = set()
         self.bus: Gio.DBusConnection | None = None
         self.registered = 0
         self.owner = 0
-        self.timer = 0
 
     def start(self):
         self.owner = Gio.bus_own_name(Gio.BusType.SESSION, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
                                       self._on_bus, None, None)
-        self.timer = GLib.timeout_add_seconds(INDEX_EVERY_S, self._again)
 
     def stop(self):
         if self.bus and self.registered:
@@ -249,9 +250,6 @@ class PhoneSearch:
         if self.owner:
             Gio.bus_unown_name(self.owner)
         self.owner = 0
-        if self.timer:
-            GLib.source_remove(self.timer)
-        self.timer = 0
 
     def _on_bus(self, bus: Gio.DBusConnection, _name: str):
         self.bus = bus
@@ -261,12 +259,18 @@ class PhoneSearch:
     # -- the index
 
     def phone_here(self, phone_id: str):
-        """A phone's folder came: its index from before, at once, and a fresh one made."""
+        """A phone's folder came: its index from before, at once; one made if there's none, or
+        it's old."""
         if phone_id not in self.indexes:
             found, made = load_index(phone_id)
             if found:
                 self.indexes[phone_id] = Index(found, made)
-        self.index(phone_id)
+        self.freshen(phone_id)
+
+    def freshen(self, phone_id: str):
+        index = self.indexes.get(phone_id)
+        if not index or time.time() - index.made >= INDEX_EVERY_S:
+            self.index(phone_id)
 
     def index(self, phone_id: str):
         listing = self.phones().get(phone_id)
@@ -293,19 +297,17 @@ class PhoneSearch:
             self.indexes[phone_id] = Index(found, time.time())
         return GLib.SOURCE_REMOVE
 
-    def _again(self):
-        for phone_id in self.phones():
-            self.index(phone_id)
-        return GLib.SOURCE_CONTINUE
-
     # -- searching
 
     def search(self, terms: list[str]) -> list[str]:
         terms = [t.casefold() for t in terms if t.strip()]
         if not terms:
             return []
+        if self.wanted:
+            self.wanted()  # one away answers the next searches, once it's back
         hits = []
         for phone_id in self.phones():
+            self.freshen(phone_id)  # for the next search: this one answers from the index as it is
             index = self.indexes.get(phone_id)
             if index:
                 hits += [(points, found, phone_id) for points, found in index.search(terms)]

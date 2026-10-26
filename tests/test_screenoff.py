@@ -25,8 +25,9 @@ class FakeScreenOff:
     def start(self):
         self.started = True
 
-    def stop(self):
+    def stop(self, light=True):
         self.stopped = True
+        self.lit = light
 
 
 class FakeWindow:
@@ -94,6 +95,8 @@ class SwitchTest(unittest.TestCase):
                     self.switch.stop()
                 self.assertTrue(spin(lambda: FakeScreenOff.made[0].stopped))
                 self.assertFalse(self.switch.is_on("PIXEL"))
+                # A phone gone to sleep isn't lit again: its screen stays dark.
+                self.assertEqual(FakeScreenOff.made[0].lit, case != "it fell asleep")
         self.switch.switch(self.pixel, True)
         self.switch.release({"PIXEL"})  # still shown: stays off
         self.assertTrue(self.switch.is_on("PIXEL"))

@@ -138,11 +138,13 @@ class AppSync:
         self.away_timer = 0  # the iPhones went: their notifications stop when it's done
         self.mounts: dict[str, object] = {}  # a phone's id → its folder here (phonefs.FileSystem)
         self.search = None  # the phones' files in the desktop's search (phonesearch.PhoneSearch)
+        self.reconnect = None  # Android phones connected again over Wi-Fi (adbwifi.WifiReconnect)
         self.mounting: set[str] = set()
         self.phones_now: list[Phone] = []
         self.phone_names: dict[str, str] = {}
         self.online: dict[str, Phone] = {}
         self.listed: dict[str, float] = {}  # phone id → when its apps were last listed
+        self.packages: dict[str, dict[str, str]] = {}  # an Android phone's id → its packages when it was
         self.busy: set[str] = set()
         self.seen = False  # a first state from the service: entries left from before are checked
         self.lock = threading.Lock()  # entries are written by one at a time
@@ -162,6 +164,8 @@ class AppSync:
         self.mounts = {}
         if self.search:
             self.search.stop()
+        if self.reconnect:
+            self.reconnect.stop()
 
     def start(self):
         self.watch.start()
@@ -342,6 +346,8 @@ class AppSync:
         online = {p.id: p for p in phones if p.online}
         self.phone_names = {p.id: p.name for p in phones}
         self.phones_now = phones
+        if self.reconnect:
+            self.reconnect.check()
         self._phone_entries(phones)
         self._mount_phones(phones)
         iphones = [p.id for p in phones if p.platform == "ios"]
@@ -368,6 +374,7 @@ class AppSync:
             self._drop_unconnected()
         for phone_id in gone:
             self.listed.pop(phone_id, None)  # listed afresh when it's back
+            self.packages.pop(phone_id, None)
             notifier = self.notifiers.pop(phone_id, None)
             if notifier:
                 notifier.stop()
@@ -428,6 +435,14 @@ class AppSync:
             if self.search:
                 self.search.phone_here(phone_id)
         return GLib.SOURCE_REMOVE
+
+    def to_reconnect(self) -> set[str]:
+        """The Android phones Handset uses that aren't connected now (by their serial): not the
+        ones switched off in Handset, nor those kept to their cable."""
+        from .service import CABLE_ONLY, DISCONNECTED
+
+        return {p.id for p in self.phones_now
+                if p.platform == "android" and not p.online and p.problem not in (DISCONNECTED, CABLE_ONLY)}
 
     def searchable(self) -> dict:
         """The phones whose folders are here, for the desktop's search: each one's id → its
@@ -511,6 +526,11 @@ class AppSync:
         if not serial:
             return False
         GLib.idle_add(self._follow, phone.id, serial)
+        # Listing its apps costs the phone a while (scrcpy's server, every app's name): only when
+        # its packages changed since (a quick list of them, with their versions).
+        versions = android.app_versions(serial)
+        if versions and versions == self.packages.get(phone.id):
+            return True
         listed = android.list_apps(serial)
         if isinstance(listed, str):
             debug(phone.name, "didn't list its apps:", listed)
@@ -519,7 +539,7 @@ class AppSync:
         os.makedirs(folder, exist_ok=True)
         found = [PhoneApp(phone.id, phone.name, "android", package, name) for name, package in listed]
         self._write(phone.id, [(app, read_file(apps.cached_icon(folder, app.app))) for app in found], whole=True)
-        versions = android.app_versions(serial)
+        self.packages[phone.id] = versions
         kept = load_versions(folder)
         missing = {}
         for app in found:
@@ -658,8 +678,12 @@ def main() -> int:
     sync.start()
     from .phonesearch import PhoneSearch
 
-    sync.search = PhoneSearch(sync.searchable)
+    sync.search = PhoneSearch(sync.searchable, lambda: sync.reconnect and sync.reconnect.now())
     sync.search.start()
+    from .adbwifi import WifiReconnect
+
+    sync.reconnect = WifiReconnect(sync.to_reconnect)
+    sync.reconnect.start()
     loop.run()
     sync.stop()
     held.close()

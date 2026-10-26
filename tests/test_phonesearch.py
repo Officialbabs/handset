@@ -152,6 +152,17 @@ class SearchTest(Phones):
         self.assertTrue(spin(lambda: not again.indexing))
         self.assertEqual(again.search(["pxl"]), ["pixel\n/DCIM/Camera/PXL_1.jpg"])
 
+    def test_the_phone_asked_again_only_when_searched_and_old(self):
+        asked = []
+        again = PhoneSearch(lambda: {"pixel": ("Pixel 7", "/x", lambda: asked.append(1) or self.listed["pixel"])})
+        again.phone_here("pixel")  # its index from a moment ago: the phone is left alone
+        self.assertTrue(spin(lambda: not again.indexing))
+        self.assertEqual(asked, [])
+        again.indexes["pixel"].made -= phonesearch.INDEX_EVERY_S  # old now
+        self.assertEqual(again.search(["pxl"]), ["pixel\n/DCIM/Camera/PXL_1.jpg"])  # answered at once
+        self.assertTrue(spin(lambda: asked and not again.indexing))
+        self.assertEqual(asked, [1])
+
     def test_asked_over_the_bus(self):
         answered = []
 

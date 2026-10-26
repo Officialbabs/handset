@@ -6,6 +6,11 @@
  * cover). Lines on its input work that session: {"op":"play"|"pause"|"next"|"previous"} and
  * {"op":"seek","position":ms}.
  *
+ * It looks only when there's news: the service calls it back (a binder of its own, News) when a
+ * session comes or goes and when one's state or what it plays changes, as an app's own media
+ * controller is told; so it sleeps meanwhile, and the phone with it. A cover is read and encoded
+ * once per track. Where the service won't call it back, it looks every POLL_MS instead.
+ *
  * It reaches Android through reflection only, so it builds with nothing but a JDK and d8
  * (android/build.sh); the shell user it runs as may read and work media sessions
  * (MEDIA_CONTENT_CONTROL).
@@ -24,7 +29,9 @@ import java.util.Objects;
 
 public final class HandsetMedia {
     private static final String CALLER = "com.android.shell";
-    private static final int LOOK_MS = 500;
+    private static final int POLL_MS = 2000;  // when the service doesn't say what changes
+    private static final int QUIET_MS = 30_000;  // a look anyway, this long after the last news
+    private static final int SETTLE_MS = 150;  // news comes in bursts: one look after it
     private static final int COVER_EDGE = 600;
     private static final PrintStream OUT = System.out;
 
@@ -40,6 +47,12 @@ public final class HandsetMedia {
     private static float saidSpeed;
     private static final long JUMP_MS = 1500;
     private static int user = 0;
+    private static final java.util.concurrent.Semaphore NEWS = new java.util.concurrent.Semaphore(0);
+    private static final Object TOLD = new News();  // the binder the service calls with news
+    private static boolean listening;  // told when sessions come and go
+    private static java.util.Set<Object> heard = new java.util.HashSet<>();  // sessions telling it what changes
+    private static String coverKey = "";  // the track the cover read last was for
+    private static String coverRead = "";
 
     public static void main(String[] args) throws Exception {
         verbose = args.length > 0 && args[0].equals("--verbose");
@@ -65,14 +78,77 @@ public final class HandsetMedia {
         Thread commands = new Thread(HandsetMedia::readCommands);
         commands.setDaemon(true);
         commands.start();
+        // Sessions coming and going (Android 17 lists the shell none: the one media keys go to,
+        // changing, instead).
+        listening = listen(sessions, "addOnMediaKeyEventSessionChangedListener") | listen(sessions, "addSessionsListener");
+        if (verbose) {
+            System.err.println("told when sessions change: " + listening);
+        }
         while (true) {
             try {
                 look();
             } catch (Throwable error) {
                 say("{\"event\":\"error\",\"message\":" + quote(String.valueOf(error)) + "}");
             }
-            Thread.sleep(LOOK_MS);
+            // Told of what changes: of sessions coming and going, and by the one shown, if any.
+            boolean told = listening && (current == null || !heard.isEmpty());
+            if (NEWS.tryAcquire(told ? QUIET_MS : POLL_MS, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                Thread.sleep(SETTLE_MS);
+                NEWS.drainPermits();
+            }
         }
+    }
+
+    /** Any call from the service is news: what plays is looked at again. */
+    private static final class News extends android.os.Binder {
+        @Override
+        protected boolean onTransact(int code, android.os.Parcel data, android.os.Parcel reply, int flags) {
+            if (code >= 1 && code <= 0x00ffffff) {  // FIRST_CALL_TRANSACTION to LAST_CALL_TRANSACTION
+                if (verbose) {
+                    System.err.println("news " + code + " at " + System.currentTimeMillis());
+                }
+                NEWS.release();
+                return true;
+            }
+            return super.onTransact(code, data, reply, flags);
+        }
+    }
+
+    /**
+     * Calls `name` on the service (or a session) to be told of changes: the listener it takes is
+     * News, as that interface (its Stub's proxy around it); the caller's package, the user, and
+     * nothing for the rest. False when there's no such call or it's refused.
+     */
+    private static boolean listen(Object target, String name) {
+        for (Method method : target.getClass().getMethods()) {
+            if (!method.getName().equals(name)) {
+                continue;
+            }
+            try {
+                Class<?>[] types = method.getParameterTypes();
+                Object[] args = new Object[types.length];
+                for (int i = 0; i < types.length; i++) {
+                    Class<?> type = types[i];
+                    if (type == String.class) {
+                        args[i] = CALLER;
+                    } else if (type == int.class) {
+                        args[i] = user;
+                    } else if (type.getName().equals("android.os.UserHandle")) {
+                        args[i] = Class.forName("android.os.UserHandle").getMethod("of", int.class).invoke(null, user);
+                    } else if (type.isInterface() && type.getName().startsWith("android.media.")) {
+                        args[i] = Class.forName(type.getName() + "$Stub")
+                                .getMethod("asInterface", Class.forName("android.os.IBinder")).invoke(null, TOLD);
+                    }
+                }
+                method.invoke(target, args);
+                return true;
+            } catch (Throwable error) {
+                if (verbose) {
+                    System.err.println(name + " refused: " + error + " " + error.getCause());
+                }
+            }
+        }
+        return false;
     }
 
     // ---- What plays ----------------------------------------------------------------------------
@@ -109,10 +185,11 @@ public final class HandsetMedia {
             field(line, "album", text(metadata, "android.media.metadata.ALBUM"));
             line.append(",\"duration\":").append(number(metadata, "android.media.metadata.DURATION"));
         }
+        String track = line.toString();  // what plays (how it plays follows)
         line.append(",\"state\":").append(call(chosenState, "getState"));
         line.append(",\"speed\":").append(call(chosenState, "getPlaybackSpeed"));
         line.append(",\"actions\":").append(call(chosenState, "getActions"));
-        String cover = metadata == null ? "" : cover(metadata);
+        String cover = metadata == null ? "" : coverOnce(metadata, track);
         String coverId = cover.isEmpty() ? "" : Integer.toHexString(cover.hashCode());
         line.append(",\"cover_id\":").append(quote(coverId));
         String withoutCover = line.toString();
@@ -175,6 +252,7 @@ public final class HandsetMedia {
                 System.err.println("media key session: " + token);
             }
         }
+        java.util.Set<Object> telling = new java.util.HashSet<>();
         for (Object token : tokens) {
             Object controller = token;
             if (token.getClass().getName().endsWith("MediaSession$Token")) {
@@ -182,8 +260,24 @@ public final class HandsetMedia {
             }
             if (controller != null) {
                 controllers.add(controller);
+                // Asked once to say what changes (a session already asked is kept as it is).
+                Object binder = call(controller, "asBinder");
+                if (heard.contains(binder) || listen(controller, "registerCallback")
+                        || listen(controller, "registerCallbackListener")) {
+                    telling.add(binder);
+                } else if (verbose) {
+                    for (Method method : controller.getClass().getMethods()) {
+                        if (method.getName().toLowerCase().contains("callback")) {
+                            System.err.println("no callback through " + method);
+                        }
+                    }
+                }
             }
         }
+        if (verbose && telling.size() != heard.size()) {
+            System.err.println("sessions telling what changes: " + telling.size() + " of " + controllers.size());
+        }
+        heard = telling;
         return controllers;
     }
 
@@ -201,16 +295,36 @@ public final class HandsetMedia {
         return (Long) metadata.getClass().getMethod("getLong", String.class).invoke(metadata, key);
     }
 
-    /** The session's cover as a JPEG in base64, its longest edge at most COVER_EDGE; or "". */
-    private static String cover(Object metadata) throws Exception {
-        Object bitmap = null;
+    /** The cover, read only when the track isn't the one read last. */
+    private static String coverOnce(Object metadata, String track) throws Exception {
+        String key = track + bitmapSize(metadata);
+        if (!key.equals(coverKey)) {
+            coverRead = cover(metadata);
+            coverKey = key;
+        }
+        return coverRead;
+    }
+
+    /** The cover's size ("WxH"), "" when there's none: art that comes late is a new cover. */
+    private static String bitmapSize(Object metadata) throws Exception {
+        Object bitmap = bitmap(metadata);
+        return bitmap == null ? "" : call(bitmap, "getWidth") + "x" + call(bitmap, "getHeight");
+    }
+
+    private static Object bitmap(Object metadata) throws Exception {
         for (String key : new String[] {"android.media.metadata.ALBUM_ART", "android.media.metadata.ART",
                 "android.media.metadata.DISPLAY_ICON"}) {
-            bitmap = metadata.getClass().getMethod("getBitmap", String.class).invoke(metadata, key);
+            Object bitmap = metadata.getClass().getMethod("getBitmap", String.class).invoke(metadata, key);
             if (bitmap != null) {
-                break;
+                return bitmap;
             }
         }
+        return null;
+    }
+
+    /** The session's cover as a JPEG in base64, its longest edge at most COVER_EDGE; or "". */
+    private static String cover(Object metadata) throws Exception {
+        Object bitmap = bitmap(metadata);
         if (bitmap == null) {
             return "";
         }

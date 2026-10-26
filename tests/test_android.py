@@ -199,6 +199,11 @@ class FakeAdb(unittest.TestCase):
                 os.environ[key] = value
         self.tmp.cleanup()
 
+    def event(self, text):
+        """A line in the phone's event log, as `logcat -b events -v epoch` says it."""
+        with open(os.path.join(self.tmp.name, "events"), "a") as file:
+            file.write(f"{time.time():.3f}  1583  1583 I {text}\n")
+
     def logged(self, name):
         path = os.path.join(self.tmp.name, name)
         if not os.path.exists(path):
@@ -228,9 +233,8 @@ class ScreenOffTest(FakeAdb):
         screen.start()
         spin(lambda: self.said("display_power"))
         self.assertEqual(self.said("display_power"), [{"type": "display_power", "on": False}])
-        # Awake a day meanwhile, and the server's own clean-up left on, to put things back.
-        self.assertEqual(self.said("session"), [{"type": "session", "screen_off_timeout": str(android.AWAKE_MS),
-                                                 "cleanup": "true"}])
+        # The phone's own screen-off time kept (it sleeps when it isn't used).
+        self.assertEqual(self.said("session"), [])
         screen.stop()
         spin(lambda: len(self.said("display_power")) == 2)
         self.assertEqual(self.said("display_power")[-1], {"type": "display_power", "on": True})
@@ -326,22 +330,36 @@ class FakePhone(FakeAdb):
         frames, turned = [], []
         phone = Android(Link("FAKE7", (1080, 2400), 0), frames.append, lambda: turned.append(1),
                         lambda live: None, lambda why: None)
-        android.ROTATION_POLL_S = 0.2
         try:
             phone.start()
             spin(lambda: phone.live_touch)
             with open(os.path.join(self.tmp.name, "rotation"), "w") as file:
                 file.write("90")
+            self.event("configuration_changed: 1152")  # as the phone says a turn
             spin(lambda: turned)
             self.assertEqual(phone.shown, (2400, 1080))
             phone.press(0, 0)
             phone.release()
             spin(lambda: len(self.logged("uinput.jsonl")) >= 4)
         finally:
-            android.ROTATION_POLL_S = 1.5
             phone.stop()
         down = self.logged("uinput.jsonl")[2]["events"]
         self.assertEqual(down[6:12], ["EV_ABS", "ABS_MT_POSITION_X", 1079, "EV_ABS", "ABS_MT_POSITION_Y", 0])
+
+    def test_one_event_reader_for_all_its_windows(self):
+        def readers():
+            return [c for c in self.logged("log.jsonl") if "screen_toggled" in " ".join(c)]
+
+        first, second = android.ScreenNews.join("FAKE7"), android.ScreenNews.join("FAKE7")
+        try:
+            spin(readers)
+            self.event("screen_toggled: 1")
+            spin(lambda: first.is_set() and second.is_set())
+            self.assertEqual(len(readers()), 1)
+        finally:
+            android.ScreenNews.leave("FAKE7", first)
+            android.ScreenNews.leave("FAKE7", second)
+        self.assertNotIn("FAKE7", android.ScreenNews.readers)
 
     def test_a_sleeping_phone_is_woken_and_said_so(self):
         with open(os.path.join(self.tmp.name, "wakefulness"), "w") as file:
@@ -349,7 +367,6 @@ class FakePhone(FakeAdb):
         changes = []
         phone = Android(Link("FAKE7", (1080, 2400), 0, False), lambda t: None, lambda: None,
                         lambda live: None, lambda why: None, changes.append)
-        android.ROTATION_POLL_S = 0.2
         try:
             phone.start()
             spin(lambda: changes == [True])  # woken by Handset, and counted on at once
@@ -357,9 +374,10 @@ class FakePhone(FakeAdb):
             spin(lambda: ["shell", "input keyevent KEYCODE_WAKEUP"] in self.logged("log.jsonl"))
             with open(os.path.join(self.tmp.name, "wakefulness"), "w") as file:
                 file.write("Asleep")
+            time.sleep(android.WAKING_S)  # (a reading that it's off is believed only then)
+            self.event("screen_toggled: 0")
             spin(lambda: changes == [True, False])
         finally:
-            android.ROTATION_POLL_S = 1.5
             phone.stop()
         self.assertFalse(phone.awake)
         self.assertIn(["shell", "input keyevent KEYCODE_WAKEUP"], self.logged("log.jsonl"))

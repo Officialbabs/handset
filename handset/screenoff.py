@@ -1,10 +1,12 @@
-"""Phone Screen Off: an Android phone's own screen dark while Handset shows and works it, the phone
-kept awake meanwhile (android.ScreenOff), switched from its windows (the bezel's button and menu,
-Ctrl+Shift+O). One switch per phone, shown alike in all its windows.
+"""Phone Screen Off: an Android phone's own screen dark while Handset shows and works it
+(android.ScreenOff), switched from its windows (the bezel's button and menu, Ctrl+Shift+O). The
+phone keeps its own screen-off time: worked from here it stays awake, left alone it sleeps. One
+switch per phone, shown alike in all its windows.
 
 It isn't remembered: the screen comes back on when it's switched off, when no window shows the
-phone any more, when the phone sleeps (its power button) or its link goes, and when Handset quits;
-scrcpy's server puts it back too if Handset itself is stopped. A phone is never left dark.
+phone any more, when its link goes, and when Handset quits; scrcpy's server puts it back too if
+Handset itself is stopped. A phone that sleeps (its power button, its screen-off time) has its
+screen its own again, dark until it wakes. A phone is never left dark while it's awake.
 """
 
 from __future__ import annotations
@@ -60,20 +62,21 @@ class ScreenSwitch:
         if window:
             window.say(why)
 
-    def _stop(self, phone_id: str, wait: bool = False):
+    def _stop(self, phone_id: str, wait: bool = False, light: bool = True):
         link = self.links.pop(phone_id, None)
         if link is None:
             return
         self._shown(phone_id, False)
-        debug(phone_id, "'s own screen goes on again")
+        debug(phone_id, "'s own screen goes on again" if light else "is asleep: its screen is its own again")
         if wait:
-            link.stop()
+            link.stop(light)
         else:
-            threading.Thread(target=link.stop, daemon=True).start()  # it waits on the phone a moment
+            threading.Thread(target=link.stop, args=(light,), daemon=True).start()  # it waits on the phone a moment
 
     def asleep(self, phone_id: str):
-        """The phone went to sleep (its power button, say): its screen is its own again."""
-        self._stop(phone_id)
+        """The phone went to sleep (its power button, or its own screen-off time): its screen is its
+        own again, and stays dark."""
+        self._stop(phone_id, light=False)
 
     def release(self, showing: set[str]):
         """The phones no window shows any more: their screens on again."""

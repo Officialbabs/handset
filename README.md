@@ -118,9 +118,13 @@ button in Phones and Settings adds one:
   computer on the phone. A phone adb can't open ("no permissions") needs the Android udev rules.
 - **An Android phone over Wi-Fi**, in either of two ways:
   - **Use Over Wi-Fi Too** on the phone's page while it's plugged in. adb stays on Wi-Fi until the
-    phone restarts, and Handset reconnects when it's back. It finds the phone's Wi-Fi on whichever
-    interface it uses (a Pixel 7 on Android 17 has it on `wlan1`). On Ada it's offered for a phone
-    the system's phone service has no Wi-Fi for.
+    phone restarts. It finds the phone's Wi-Fi on whichever interface it uses (a Pixel 7 on Android
+    17 has it on `wlan1`). On Ada it's offered for a phone the system's phone service has no Wi-Fi
+    for.
+  - If adb loses it, Handset connects it again where it was last: at once when you open its window
+    or one of its apps or search its files, and in the background when the phone announces itself
+    (or every five minutes). Handset starts adb's server in a scope of its own, so closing Handset
+    doesn't drop the link.
   - **Wireless debugging's pairing code** (Android 11 and later). Handset finds the phone on the
     network through Avahi, and reconnects whenever it's back on the Wi-Fi.
 - **An iPhone by cable**, one step at a time, each saying what to do on the phone:
@@ -156,10 +160,12 @@ Drag the bezel to move the window, or double-click it to fill the screen.
   the right of the bezel.
 - **Phone screen off (Android):** the brightness button on the bezel, Phone Screen Off in its menu,
   or Ctrl+Shift+O turns the phone's own screen off while its window keeps showing and working it.
-  The phone stays awake meanwhile (its screen-off time is a day for the while, and put back after).
-  The screen comes back on when you switch it off again, close the phone's last window, press the
-  phone's power button, or the phone disconnects, and when Handset quits; scrcpy's server turns it
-  back on even if Handset is stopped. The phone must be unlocked: once it locks, apps show black.
+  The phone keeps its own screen-off time: using it from the window keeps it awake, and left alone
+  it goes to sleep.
+  The screen comes back on when you switch it off again, close the phone's last window, or the
+  phone disconnects, and when Handset quits; scrcpy's server turns it back on even if Handset is
+  stopped. Once the phone sleeps (its power button, or its screen-off time) the screen is its own
+  again, and stays dark until it wakes. The phone must be unlocked: once it locks, apps show black.
   An iPhone can't do this: it shares its screen only while it's lit.
 - **Editing keys go to the phone** in any app:
   - Ctrl+A select all
@@ -301,8 +307,9 @@ To turn notifications off, use the Notifications switch in Phones and Settings, 
   folders from connected phones, under Handset, each with its phone and folder. Choosing one opens
   it in its default app, from the phone's folder.
   - Searches never wait on a phone: Handset keeps an index of each phone's file names, built when
-    its folder appears and again every half hour. An Android phone's storage takes one `find`,
-    under a second; an iPhone's is walked by the helper.
+    its folder appears, and again when you search and it's over half an hour old (the phone is
+    left alone in between). An Android phone's storage takes one `find`, under a second; an
+    iPhone's is walked by the helper.
   - Hidden files and Android apps' private data are left out.
   - The background service answers through GNOME's search provider interface while it runs.
 - **Phone Files…** (in the bezel's menu, or Ctrl+Shift+F) browses a phone's files. From there you

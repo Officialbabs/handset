@@ -134,6 +134,27 @@ class SyncTest(unittest.TestCase):
         sync.watch.stop()
         sync.stop()
 
+    def test_listed_again_only_when_its_packages_changed(self):
+        def listings():
+            path = os.path.join(os.environ["FAKEADB_DIR"], "log.jsonl")
+            with open(path) as file:
+                return [line for line in file if "list_apps=true" in line]
+
+        sync = appsync.AppSync()
+        sync.start()
+        spin(lambda: len(apps.entries()) == 3 and not sync.busy)
+        self.assertEqual(len(listings()), 1)
+        for change in (None, '{"org.example.chat": 2}'):  # due again: the same packages, then one updated
+            if change:
+                with open(os.path.join(os.environ["FAKEADB_DIR"], "versions.json"), "w") as file:
+                    file.write(change)
+            sync.listed["FAKE7"] -= appsync.RELIST_S
+            sync._relist()
+            spin(lambda: not sync.busy)
+        self.assertEqual(len(listings()), 2)
+        sync.watch.stop()
+        sync.stop()
+
     def test_one_sync_at_a_time(self):
         held = appsync.take_lock()
         self.assertIsNotNone(held)

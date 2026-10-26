@@ -78,14 +78,118 @@ def stream_edge(monitor_pixels: int, natural: tuple[int, int]) -> int:
     multiple of 8, as encoders like. 0: the screen's own size."""
     edge = monitor_pixels * 2 // 8 * 8
     return 0 if edge <= 0 or edge >= max(natural) else edge
-# How often the screen's rotation, and whether it's on, are checked while it shows.
-ROTATION_POLL_S = 0.75
+# What may change how the screen shows, as the phone's event log says it (ScreenNews): on or
+# off, the lock screen shown or gone, its configuration changed (a turn).
+SCREEN_EVENTS = "screen_toggled wm_set_keyguard_shown wm_set_keyguard_occluded configuration_changed"
+# Between them, the screen is looked at anyway this often: locked (its unlocking says little in the
+# event log), awake, asleep.
+CHECK_LOCKED_S = 2.0
+CHECK_AWAKE_S = 15.0
+CHECK_ASLEEP_S = 120.0
+# After news, it's looked at once more this much later: a turn takes a moment to finish.
+SETTLE_S = 1.0
 # After Handset wakes the phone, a reading that it's still off is believed only this much later:
 # waking takes a moment, and meanwhile the person's next press must reach the phone.
 WAKING_S = 2.0
-# One look at the screen in one adb call: its rotation, and whether it's on.
+# One look at the screen in one adb call: its rotation, and whether it's on. Costly to the phone
+# (three of its services written out whole): only when ScreenNews says so.
 SCREEN_STATE = ("dumpsys input | grep -m1 'Viewport INTERNAL'; dumpsys power | grep -m1 'mWakefulness='; "
                 "dumpsys window | grep -m1 'isKeyguardShowing='")
+
+
+class ScreenNews:
+    """The phone's event log followed for SCREEN_EVENTS, by one reader per phone that every window
+    showing it shares: each window's `nudged` (a threading.Event) is set at each, and its screen
+    looked at then (follow_screen), not every moment: looking costs the phone, and warms it."""
+
+    readers: dict[str, "ScreenNews"] = {}
+    lock = threading.Lock()
+
+    def __init__(self, serial: str):
+        self.serial = serial
+        self.waiting: set[threading.Event] = set()
+        self.process: subprocess.Popen | None = None
+
+    @classmethod
+    def join(cls, serial: str) -> threading.Event:
+        nudged = threading.Event()
+        with cls.lock:
+            reader = cls.readers.get(serial)
+            if reader is None:
+                reader = cls.readers[serial] = ScreenNews(serial)
+                threading.Thread(target=reader._read, daemon=True).start()
+            reader.waiting.add(nudged)
+        return nudged
+
+    @classmethod
+    def leave(cls, serial: str, nudged: threading.Event):
+        with cls.lock:
+            reader = cls.readers.get(serial)
+            if reader is None:
+                return
+            reader.waiting.discard(nudged)
+            if reader.waiting:
+                return
+            del cls.readers[serial]
+            process, reader.process = reader.process, None
+        if process and process.poll() is None:
+            process.kill()
+
+    @classmethod
+    def nudge(cls, serial: str):
+        """Every window showing the phone looks at its screen now."""
+        with cls.lock:
+            reader = cls.readers.get(serial)
+            for nudged in reader.waiting if reader else ():
+                nudged.set()
+
+    def _read(self):
+        while True:
+            with ScreenNews.lock:
+                if ScreenNews.readers.get(self.serial) is not self:
+                    return
+                try:
+                    self.process = subprocess.Popen(
+                        adb_command(self.serial, "shell", f"logcat -b events -v epoch -T 1 -s {SCREEN_EVENTS}"),
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                except OSError:
+                    return
+                process = self.process
+            for _line in process.stdout:
+                ScreenNews.nudge(self.serial)
+            process.wait()
+            time.sleep(3)  # the link dropped: read again once it's back
+
+
+def follow_screen(device, take: Callable[[str], bool]):
+    """Looks at the phone's screen (SCREEN_STATE) for `device` (Android, AppScreen) until it stops:
+    when ScreenNews says it may have changed, and once more a moment after; then now and then
+    besides (CHECK_*_S). take(state) gets each look, and asks for another soon by saying True."""
+    serial = device.link.serial
+    nudged = ScreenNews.join(serial)
+    soon = True  # a first look: whether it's locked
+    try:
+        while not device.stopped:
+            if soon:
+                wait = SETTLE_S
+            elif not device.awake:
+                wait = CHECK_ASLEEP_S
+            else:
+                wait = CHECK_LOCKED_S if device.locked else CHECK_AWAKE_S
+            news = nudged.wait(wait)
+            nudged.clear()
+            if device.stopped:
+                return
+            try:
+                state = shell(serial, SCREEN_STATE, timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                soon = False
+                continue
+            if device.stopped:
+                return
+            soon = take(state) or news
+    finally:
+        ScreenNews.leave(serial, nudged)
 
 
 def adb_binary() -> str | None:
@@ -93,10 +197,45 @@ def adb_binary() -> str | None:
     return os.environ.get("HANDSET_ADB") or shutil.which("adb")
 
 
+SERVER_CHECK_S = 10.0  # whether adb's server is there, asked at most this often
+_server_checked = -SERVER_CHECK_S
+
+
+def keep_server(binary: str):
+    """adb's server, kept in a systemd scope of its own. Any adb call starts one when there's none,
+    but as a process of whoever called, and systemd ends an app's processes with it: the sync
+    restarted, or Handset closed, would take the server along, and every phone's Wi-Fi link with it
+    (a new server doesn't dial them again). Not for a stand-in adb (HANDSET_ADB)."""
+    global _server_checked
+    now = time.monotonic()
+    if os.environ.get("HANDSET_ADB") or now - _server_checked < SERVER_CHECK_S:
+        return
+    _server_checked = now
+    try:
+        port = int(os.environ.get("ANDROID_ADB_SERVER_PORT") or 5037)
+    except ValueError:
+        port = 5037
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+        return  # there already
+    except OSError:
+        pass
+    runner = shutil.which("systemd-run")
+    if not runner:
+        return  # the next adb call starts it, as ever
+    try:
+        subprocess.run([runner, "--user", "--scope", "--quiet", "--collect",
+                        "--description=adb's server (started by Handset)", binary, "start-server"],
+                       capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as error:
+        debug("adb's server wasn't started in a scope of its own:", error)
+
+
 def adb_command(serial: str | None, *args: str) -> list[str]:
     binary = adb_binary()
     if not binary:
         raise FileNotFoundError("adb isn't installed")
+    keep_server(binary)
     return [binary] + (["-s", serial] if serial else []) + list(args)
 
 
@@ -126,7 +265,18 @@ def find_serial(phone_id: str, address: str | None = None, port: int | None = No
     """The adb serial of the phone Ada's service calls `phone_id`, by cable or over Wi-Fi, from
     one look at everything adb has. By cable the serial is the id, and it's taken first; over
     Wi-Fi adb lists the phone by address, or by the name wireless debugging gives it (which
-    holds the id). Failing those, every other phone is asked its serial number, all at once."""
+    holds the id). Failing those, every other phone is asked its serial number, all at once.
+    Where it's found on Wi-Fi is remembered (adbwifi), to connect it again there."""
+    serial = _find_serial(phone_id, address, port)
+    at = re.fullmatch(r"(\d+\.\d+\.\d+\.\d+):(\d+)", serial or "")
+    if at:
+        from . import adbwifi
+
+        adbwifi.remember(phone_id, at[1], int(at[2]))
+    return serial
+
+
+def _find_serial(phone_id: str, address: str | None, port: int | None) -> str | None:
     try:
         serials = parse_devices(adb(None, "devices", timeout=5))
     except (OSError, subprocess.SubprocessError):
@@ -753,7 +903,9 @@ class Android:
         self.awake = link.awake
         self.woken_at = 0.0
         self.locked = False  # the lock screen shows (its PIN pad is hidden from screen sharing)
-        self.video = Video(link.serial, link.natural, link.rotation, on_frame, on_ended)
+        self.on_frame = on_frame
+        self.turn_seen = 0.0
+        self.video = Video(link.serial, link.natural, link.rotation, self._frame, on_ended)
         self.video.edge = MAX_EDGE if edge is None else edge
         self.video.fps = fps
         self.touch = Touch(link.serial, link.natural, self._touch_ready, self._touch_failed)
@@ -778,8 +930,18 @@ class Android:
         """Wakes the screen, and counts it awake straight away, so the next press is a touch."""
         self.commands.run("input keyevent KEYCODE_WAKEUP")
         self.woken_at = time.monotonic()
+        ScreenNews.nudge(self.link.serial)  # whether it did is looked at
         if not self.awake:
             self._awake_changed(True)
+
+    def _frame(self, texture):
+        """A picture the other way round from the screen as it was: it turned, so it's looked at."""
+        width, height = self.shown
+        if ((texture.get_width() > texture.get_height()) != (width > height)
+                and time.monotonic() - self.turn_seen > SETTLE_S):
+            self.turn_seen = time.monotonic()
+            ScreenNews.nudge(self.link.serial)
+        self.on_frame(texture)
 
     def show_at(self, width: int, height: int):
         """The screen shows this big in the window (the monitor's pixels)."""
@@ -861,24 +1023,20 @@ class Android:
         self.on_touch(False)
 
     def _watch_screen(self):
-        while not self.stopped:
-            time.sleep(ROTATION_POLL_S)
-            try:
-                state = shell(self.link.serial, SCREEN_STATE, timeout=5)
-            except (OSError, subprocess.SubprocessError):
-                continue
-            if self.stopped:
-                return
-            rotation, awake = parse_rotation(state), parse_awake(state)
-            locked = parse_locked(state)
-            if locked is not None:
-                self.locked = locked
-            if rotation is not None and rotation != self.rotation:
-                GLib.idle_add(self._turned, rotation)
-            if awake is False and time.monotonic() - self.woken_at < WAKING_S:
-                continue  # still waking
-            if awake is not None and awake != self.awake:
-                GLib.idle_add(self._awake_changed, awake)
+        follow_screen(self, self._looked)
+
+    def _looked(self, state: str) -> bool:
+        rotation, awake = parse_rotation(state), parse_awake(state)
+        locked = parse_locked(state)
+        if locked is not None:
+            self.locked = locked
+        if rotation is not None and rotation != self.rotation:
+            GLib.idle_add(self._turned, rotation)
+        if awake is False and time.monotonic() - self.woken_at < WAKING_S:
+            return True  # still waking: looked at again soon
+        if awake is not None and awake != self.awake:
+            GLib.idle_add(self._awake_changed, awake)
+        return False
 
     def _awake_changed(self, awake: bool):
         if awake != self.awake and not self.stopped:
@@ -1153,6 +1311,7 @@ class AppScreen:
 
         threading.Thread(target=press, daemon=True).start()
         self.woken_at = time.monotonic()
+        ScreenNews.nudge(self.link.serial)
         if not self.awake:
             self._awake_changed(True)
 
@@ -1161,21 +1320,17 @@ class AppScreen:
 
     def _watch_screen(self):
         """Whether the phone is awake and locked, as Android._watch_screen watches it."""
-        while not self.stopped:
-            time.sleep(ROTATION_POLL_S)
-            try:
-                state = shell(self.link.serial, SCREEN_STATE, timeout=5)
-            except (OSError, subprocess.SubprocessError):
-                continue
-            if self.stopped:
-                return
-            awake, locked = parse_awake(state), parse_locked(state)
-            if locked is not None:
-                self.locked = locked
-            if awake is False and time.monotonic() - self.woken_at < WAKING_S:
-                continue  # still waking
-            if awake is not None and awake != self.awake:
-                GLib.idle_add(self._awake_changed, awake)
+        follow_screen(self, self._looked)
+
+    def _looked(self, state: str) -> bool:
+        awake, locked = parse_awake(state), parse_locked(state)
+        if locked is not None:
+            self.locked = locked
+        if awake is False and time.monotonic() - self.woken_at < WAKING_S:
+            return True  # still waking
+        if awake is not None and awake != self.awake:
+            GLib.idle_add(self._awake_changed, awake)
+        return False
 
     def _awake_changed(self, awake: bool):
         if awake != self.awake and not self.stopped:
@@ -1626,9 +1781,6 @@ class ClipboardLink:
 
 # scrcpy's message turning the phone's display on or off, the phone awake either way.
 SET_DISPLAY_POWER = 10
-# While its own screen is off for Handset, the phone stays awake this long without a touch (its own
-# screen-off time for the while; scrcpy's server puts its own back after): a day.
-AWAKE_MS = 24 * 3600 * 1000
 
 
 def display_power_message(on: bool) -> bytes:
@@ -1638,11 +1790,11 @@ def display_power_message(on: bool) -> bytes:
 class ScreenOff:
     """An Android phone's own screen dark while Handset shows and works it: scrcpy's server run
     for that alone powers the phone's display down with the phone awake (Android's
-    DisplayControl), so its picture here, its touches and its apps' windows go on as before. Its
-    screen-off time is a day meanwhile, so it doesn't sleep under the person's hands. Stopped, it
-    turns the screen on; and if the link goes first (the phone unplugged, Handset killed),
-    the server's own clean-up does it, its screen-off time put back too. `on_ended(why)` on
-    GLib's main loop when it ends by itself."""
+    DisplayControl), so its picture here, its touches and its apps' windows go on as before. It
+    keeps its own screen-off time: touches from here are use, so it stays awake while it's worked
+    from here, and goes to sleep as ever when it isn't. Stopped, it turns the screen on (but not
+    on a phone gone to sleep); and if the link goes first (the phone unplugged, Handset killed),
+    the server's own clean-up does it. `on_ended(why)` on GLib's main loop when it ends by itself."""
 
     def __init__(self, serial: str, on_ended: Callable[[str], None] | None = None):
         self.serial = serial
@@ -1655,14 +1807,14 @@ class ScreenOff:
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
 
-    def stop(self):
-        """The phone's screen on again, and its screen-off time as it was (the server's clean-up,
-        as it ends)."""
+    def stop(self, light: bool = True):
+        """The phone's screen on again (`light`: not for a phone gone to sleep, which keeps it dark)."""
         self.stopped = True
         control, self.control = self.control, None
         if control:
             try:
-                control.sendall(display_power_message(True))
+                if light:
+                    control.sendall(display_power_message(True))
                 control.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
@@ -1701,7 +1853,7 @@ class ScreenOff:
         # The server's clean-up stays on (cleanup is left as it is): it puts the screen and the
         # screen-off time back however this ends.
         options = (f"scid={scid} log_level=warn tunnel_forward=true video=false audio=false control=true "
-                   f"clipboard_autosync=false power_on=false screen_off_timeout={AWAKE_MS} "
+                   "clipboard_autosync=false power_on=false "
                    "send_device_meta=false send_dummy_byte=true")
         command = adb_command(self.serial, "shell", f"CLASSPATH={PHONE_SERVER} app_process / "
                                                     f"com.genymobile.scrcpy.Server {version} {options}")

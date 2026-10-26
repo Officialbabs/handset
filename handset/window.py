@@ -250,6 +250,8 @@ class Window(Adw.ApplicationWindow):
         self.device = None
         self.opening = False
         self.filling = False
+        self.dialling: str | None = None  # an Android phone being connected over Wi-Fi for this window
+        self.dialled_at = -60.0
         self.retry = 0
         self.retries = 0
         self.typed = ""
@@ -828,10 +830,38 @@ class Window(Adw.ApplicationWindow):
                 self._open()
         elif not phone.online:
             self._close_phone()
-            self._show_status("phone-symbolic", f"{phone.name} isn't connected",
-                              "Plug it in, or keep it on the same Wi-Fi as this computer.")
+            if phone.platform == "android" and self._dial(phone):
+                self._show_status("phone-symbolic", f"Connecting to {phone.name}…", "Over Wi-Fi, where it was last.")
+            else:
+                self._show_status("phone-symbolic", f"{phone.name} isn't connected",
+                                  "Plug it in, or keep it on the same Wi-Fi as this computer.")
         elif changed or not was_online:
             self._open()
+
+    def _dial(self, phone: Phone) -> bool:
+        """An Android phone wanted here but not connected: connected where it was last on Wi-Fi,
+        as an iPhone's helper reaches its phone when it's wanted (it opens here once the phone's
+        service sees it). Whether it's being connected."""
+        from . import adbwifi
+
+        if self.dialling == phone.id:
+            return True
+        if time.monotonic() - self.dialled_at < adbwifi.AGAIN_S or not adbwifi.remembered(phone.id):
+            return False
+        self.dialling, self.dialled_at = phone.id, time.monotonic()
+
+        def dial():
+            GLib.idle_add(self._dialled, phone.id, adbwifi.connect_now(phone.id))
+
+        threading.Thread(target=dial, daemon=True).start()
+        return True
+
+    def _dialled(self, phone_id: str, connected: bool):
+        self.dialling = None
+        if not connected and self.phone and self.phone.id == phone_id and not self.phone.online:
+            self._show_status("phone-symbolic", f"{self.phone.name} isn't connected",
+                              "Plug it in, or keep it on the same Wi-Fi as this computer.")
+        return GLib.SOURCE_REMOVE
 
     def _let_go(self):
         """The phone's screen closed, and its clipboard and sound let go (unless another window
@@ -1051,7 +1081,7 @@ class Window(Adw.ApplicationWindow):
         if screen and self.phone:
             screen.switch(self, value.get_boolean())
             if value.get_boolean() and screen.is_on(self.phone.id):
-                self.say(f"{self.phone.name}'s screen is off, and it stays awake")
+                self.say(f"{self.phone.name}'s screen is off")
             elif not value.get_boolean():
                 self.say(f"{self.phone.name}'s screen is on")
 
