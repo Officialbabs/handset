@@ -6,6 +6,8 @@ phone joins the rest of the desktop: its apps in the launcher and dock, and its 
 clipboard, files, sound and media. Nothing is installed on the phone. Handset works through adb on
 Android, Apple's device services on the iPhone, and standard Bluetooth profiles.
 
+![Phone apps from an Android phone and an iPhone, each in its own window on the desktop, with their icons in the dock and the music playing on a phone in the media controls](docs/screenshot.webp)
+
 **[Feature reference](FEATURES.md)**: every feature in detail, with the settings, shortcuts,
 command line, requirements and known limitations.
 
@@ -369,12 +371,19 @@ shares the adb connection the system's phone service maintains.
 - **Screen:** live H.264 video through scrcpy's server, which gives the smoothest picture and
   follows the phone as it turns. Handset sends the phone its own copy, the version it's made for
   (3.3.4, fetched by `install.sh` and checked against the scrcpy project's published checksum).
-  Without it, Handset uses Android's own screen recorder. Frames go to GTK as they come from the decoder (YUV), and the GPU turns them
-  into colour.
+  Without it, Handset uses Android's own screen recorder. Frames go to GTK as they come from the
+  decoder (YUV), and the GPU turns them into colour.
 - **Touch:** through a virtual touchscreen Handset adds to the phone with Android's own `uinput`
   tool (nothing installed). The phone treats its touches as a finger's. Where a phone doesn't allow
   that, Handset falls back to sending each gesture whole.
 - **Keys and text** go in as key presses.
+- **Handset's own phone-side helper** (`data/handset-media.jar`) reads the phone's media sessions
+  and sets images on its clipboard. It's 13 KB of Android bytecode (one `classes.dex`), built from
+  `android/HandsetMedia.java` and `android/HandsetClip.java` by `android/build.sh` (javac, then
+  Android's D8). It runs through `app_process` as adb's shell user while the phone is connected,
+  and nothing is installed. It's kept in the repository so installing needs no Java. Rebuilding it
+  with JDK 21.0.13 and D8 9.5.28 gives the very same file, SHA-256
+  `b062fabcdad0ff6944ac50a1678cd94be886bee6acdff5ee37d170fd090742ea`.
 - **Ada's activity** (on Ada) comes from the system's phone service, which Handset only listens to.
 
 ### iPhone
