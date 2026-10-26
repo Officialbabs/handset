@@ -223,7 +223,9 @@ fn browse(address: Option<IpAddr>, verbose: bool) -> Fallible<(IpAddr, u16)> {
     let daemon = mdns_sd::ServiceDaemon::new()?;
     let events = daemon.browse("_remotepairing._tcp.local.")?;
     let until = Instant::now() + BROWSE_FOR;
-    let mut found: Vec<(IpAddr, u16)> = Vec::new();
+    // Each phone by its name: it answers on each of its addresses (IPv4, and IPv6's link-local),
+    // and those are one phone, reached by its IPv4 address where it has one.
+    let mut phones: std::collections::BTreeMap<String, (IpAddr, u16)> = std::collections::BTreeMap::new();
     while let Some(left) = until.checked_duration_since(Instant::now()) {
         let Ok(event) = events.recv_timeout(left) else { break };
         if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
@@ -234,19 +236,25 @@ fn browse(address: Option<IpAddr>, verbose: bool) -> Fallible<(IpAddr, u16)> {
                     eprintln!("found {} at {ip}:{port}", info.get_fullname());
                 }
                 if address.is_none_or(|wanted| wanted == ip) {
-                    found.push((ip, port));
+                    phones
+                        .entry(info.get_fullname().to_string())
+                        .and_modify(|kept| {
+                            if kept.0.is_ipv6() && ip.is_ipv4() {
+                                *kept = (ip, port);
+                            }
+                        })
+                        .or_insert((ip, port));
                 }
             }
             // The phone Ada knows by its address: that's it. Without one, take a moment for
             // others to answer, so two phones are never mixed up.
-            if address.is_some() && !found.is_empty() {
+            if address.is_some() && !phones.is_empty() {
                 break;
             }
         }
     }
     let _ = daemon.shutdown();
-    found.sort();
-    found.dedup();
+    let found: Vec<(IpAddr, u16)> = phones.into_values().collect();
     match found.as_slice() {
         [one] => Ok(*one),
         [] => Err("The iPhone isn't plugged in or on this Wi-Fi: plug it in, or unlock it and keep it near.".into()),
