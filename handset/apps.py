@@ -188,6 +188,12 @@ def write_entry(app: PhoneApp, icon: bytes | None = None, replace: bool = True) 
     entry.set_string(ENTRY, "X-Handset-Platform", app.platform)
     entry.set_string(ENTRY, "X-Handset-App", app.app)
     entry.set_string(ENTRY, "X-Handset-App-Name", app.name)
+    # The desk reads these: an entry naming a device and app it also lists shows once, not
+    # twice, and entries with a device gather under that phone rather than among the
+    # computer's own apps.
+    entry.set_string(ENTRY, "X-Ada-Device", app.phone_id)
+    entry.set_string(ENTRY, "X-Ada-Device-App", app.app)
+    entry.set_string(ENTRY, "X-Ada-Device-Name", app.phone_name)
     data, _length = entry.to_data()
     path = entry_path(app.phone_id, app.app)
     try:
