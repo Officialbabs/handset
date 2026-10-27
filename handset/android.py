@@ -1008,6 +1008,7 @@ class Android:
 
     def stop(self):
         self.stopped = True
+        ScreenNews.nudge(self.link.serial)  # its look at the screen ends now, not at its next
         if self.pressed:
             self.release()
         self.video.stop()
@@ -1367,6 +1368,7 @@ class AppScreen:
 
     def stop(self):
         self.stopped = True
+        ScreenNews.nudge(self.link.serial)
         if self.pressed:
             self.release()
         for sock in (self.control, self.video):

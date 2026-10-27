@@ -84,7 +84,7 @@ Android and iOS versions, and graphics hardware haven't been tested yet. The
 
 ## Phones and settings
 
-Launching Handset opens **Phones and Settings**. It also opens from the bezel's menu, with Ctrl+,
+Launching Handset opens **Phones and Settings**. It also opens from the phone's menu, with Ctrl+,
 or with `handset --phones`. It shows:
 
 - **A card for each known phone:** how it's connected, its battery, a Bluetooth mark when it's
@@ -139,8 +139,18 @@ button in Phones and Settings adds one:
 
 ## Using the phone window
 
-The window shows the phone's screen edge to edge under a slim bezel, with no title bar or buttons.
-Drag the bezel to move the window, or double-click it to fill the screen.
+The window is the phone's screen as the phone has it: its rounded corners, and its notch, punch
+hole or Dynamic Island where it has one (an Android phone says its shape; an iPhone's comes from its
+model), in a hairline of light glass. There's no title bar: the small pill above the phone is
+the window's. Drag it to move the window; click it and it opens into a row of its options (a
+screenshot, Phone Screen Off on Android, the phone's menu, Full Screen, Minimize and Close), or,
+when the window is too narrow for the row, into a list over the phone. Right-clicking round it
+opens the phone's menu too. Drag any of the phone's corners to resize the window. Everything on
+the phone's screen is the phone's: drags, double taps and long presses go to it.
+
+**Full screen** (F11, or the pill's button): the phone on black, as large as the screen allows,
+with no rim; the pill comes in at the top while the pointer is near it. F11 again, or the pill's
+button, leaves it. A maximized window is on black too.
 
 - **Mouse:** the pointer works as a finger. Press, drag and release as on the glass, and hold for a
   long press.
@@ -152,17 +162,17 @@ Drag the bezel to move the window, or double-click it to fill the screen.
 - **Pinch:** pinch on the touchpad, or hold Ctrl and use the scroll wheel, to zoom with two fingers
   on the phone.
 - **Other buttons:** right-click goes back, middle-click goes home, and dragging with the middle
-  button moves the window. Resizing from the edges keeps the phone's shape.
+  button moves the window. Resizing from a corner keeps the phone's shape: let go, and the
+  window comes back round the phone.
 - **Keyboard:** typing goes to the phone. Enter, Backspace, Tab, the arrow keys, Home and End work
   as they do on the phone, and Escape goes back. Android accepts plain letters, digits and
   punctuation only.
 - **Shortcuts:** Ctrl+B back, Ctrl+H home, Ctrl+R recent apps, Ctrl+N notifications, F11 full
   screen, Ctrl+P next phone, Ctrl+Shift+A the phone's apps, Ctrl+W close.
-- **Screenshots:** the camera button on the bezel, Ctrl+Shift+S or Print saves the phone's screen
-  at its native resolution to Pictures › Screenshots and copies it to the clipboard. The capture is
-  taken on the phone itself; an app's window captures that app's screen. Minimize and Close are on
-  the right of the bezel.
-- **Phone screen off (Android):** the brightness button on the bezel, Phone Screen Off in its menu,
+- **Screenshots:** the camera button in the options pill, Ctrl+Shift+S or Print saves the phone's
+  screen at its native resolution to Pictures › Screenshots and copies it to the clipboard. The
+  capture is taken on the phone itself; an app's window captures that app's screen.
+- **Phone screen off (Android):** the brightness button in the options pill, Phone Screen Off in its menu,
   or Ctrl+Shift+O turns the phone's own screen off while its window keeps showing and working it.
   The phone keeps its own screen-off time: using it from the window keeps it awake, and left alone
   it goes to sleep.
@@ -202,9 +212,9 @@ computer's apps, with its own icon and a name such as "WhatsApp (‹phone name�
   and by Handset). It reads each icon once, keeps it in `~/.cache/handset/apps`, and reads it again
   only when the app updates.
 
-**Phone Apps…** in the bezel's menu (or Ctrl+Shift+A) lists the phone's apps, to open or pin one.
-An app's window has the phone button on the left of its bezel (it opens the whole phone), the close
-button on the right, and a thin frame round it.
+**Phone Apps…** in the phone's menu (or Ctrl+Shift+A) lists the phone's apps, to open or pin one.
+An app's window is its phone too (an Android app's screen of its own, without the phone's cutout),
+with the phone button first among its options (it opens the whole phone).
 
 - **On Android**, each app gets a virtual screen of its own on the phone, as big as the phone's,
   showing only that app.
@@ -225,7 +235,7 @@ button on the right, and a thin frame round it.
   - To turn it off, set `"pop_out_apps": false` in `~/.config/handset/settings.json`.
 - **On an iPhone**, the phone has one screen, so the app opens in front on it and the window shows
   the phone with that app. Closing the window takes the iPhone back to its home screen (unless
-  it's gone dark, which Home would light). So does minimizing it with its bezel's button, when the
+  it's gone dark, which Home would light). So does minimizing it with its Minimize button, when the
   app was opened over the home screen; coming back to the window brings the app back. A locked iPhone doesn't open apps; unlock it first.
 - **Icons** come from the phone. On Android they're read from each app's package and drawn the way
   the launcher draws them, with the app's first letter on a colour when an icon can't be read.
@@ -252,7 +262,7 @@ How each phone sends them:
   `dumpsys notification`. Nothing is installed on the phone.
 - **An iPhone** sends them over Bluetooth, the way it does to a watch (Apple Notification Center
   Service).
-  - **Pair it once:** choose **Pair an iPhone for Notifications…** in the bezel's menu (or run
+  - **Pair it once:** choose **Pair an iPhone for Notifications…** in the phone's menu (or run
     `handset --pair-iphone`). Then, on the iPhone, open Settings › Bluetooth, pick this computer and
     allow its notifications.
   - **Discoverability:** the computer is discoverable for a few minutes while pairing. Afterwards
@@ -316,7 +326,7 @@ To turn notifications off, use the Notifications switch in Phones and Settings, 
     iPhone's is walked by the helper.
   - Hidden files and Android apps' private data are left out.
   - The background service answers through GNOME's search provider interface while it runs.
-- **Phone Files…** (in the bezel's menu, or Ctrl+Shift+F) browses a phone's files. From there you
+- **Phone Files…** (in the phone's menu, or Ctrl+Shift+F) browses a phone's files. From there you
   can save a file to Downloads, open one with the computer's apps, or send files into the folder
   being viewed.
   - **Search** (Ctrl+F, or just type) filters the folder at once, then searches its subfolders.
@@ -326,7 +336,7 @@ To turn notifications off, use the Notifications switch in Phones and Settings, 
 
 ## Phone audio on the computer
 
-**Play Sound Here** (in a phone window's bezel menu) plays the phone's audio on the computer
+**Play Sound Here** (in a phone window's menu) plays the phone's audio on the computer
 instead of the phone, until it's switched off. The choice is remembered and comes back with the
 phone's window. If the audio can't come through at the moment (the phone is out of reach, say),
 Handset keeps trying until it can.

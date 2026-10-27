@@ -376,6 +376,7 @@ class FakePhone(FakeAdb):
         def readers():
             return [c for c in self.logged("log.jsonl") if "screen_toggled" in " ".join(c)]
 
+        spin(lambda: "FAKE7" not in android.ScreenNews.readers)  # windows stopped before have let go
         first, second = android.ScreenNews.join("FAKE7"), android.ScreenNews.join("FAKE7")
         try:
             spin(readers)
@@ -386,6 +387,14 @@ class FakePhone(FakeAdb):
             android.ScreenNews.leave("FAKE7", first)
             android.ScreenNews.leave("FAKE7", second)
         self.assertNotIn("FAKE7", android.ScreenNews.readers)
+
+    def test_a_window_stopped_lets_go_at_once(self):
+        phone = Android(Link("FAKE7", (1080, 2400), 0), lambda t: None, lambda: None, lambda live: None,
+                        lambda why: None)
+        phone.start()
+        spin(lambda: "FAKE7" in android.ScreenNews.readers)
+        phone.stop()
+        spin(lambda: "FAKE7" not in android.ScreenNews.readers, seconds=3)  # not at its next look, 15 s on
 
     def test_a_sleeping_phone_is_woken_and_said_so(self):
         with open(os.path.join(self.tmp.name, "wakefulness"), "w") as file:

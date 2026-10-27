@@ -33,9 +33,11 @@ except (ImportError, ValueError):
     GdkWayland = None
 
 from . import NAME  # noqa: E402
+from . import body as bodies  # noqa: E402
 from .apps import PhoneApp  # noqa: E402
 from .gestures import SCROLL_PER_NOTCH, Fit, Gesture, classify, inside, safe_box, scroll, to_edge  # noqa: E402
 from .log import debug  # noqa: E402
+from .phonebody import PhoneBody  # noqa: E402
 from .screen import Screen  # noqa: E402
 from .service import Phone, ada_line, set_up_where, status_line, watch  # noqa: E402
 
@@ -65,10 +67,13 @@ PINCH_REST_MS = 350
 # (in case the touchpad never says it stopped).
 LIFT_AFTER_MS = 160
 # Where the phone scrolls as a mouse wheel does (Android: scroll()), no finger: a wheel's notches
-# glide the page, each frame taking this share of the way left; a touchpad moves it as the fingers
-# do, and a flick throws it on, slowing as a thrown page does (its speed falling by e every this
-# long) until it's slower than this (the window's pixels a second).
-WHEEL_EASE = 0.3
+# glide the page, the way left falling by e every WHEEL_GLIDE_S; a touchpad moves it as the fingers
+# do, and a flick throws it on at their speed (measured over their last FLICK_MS, at most
+# THROW_FASTEST, the window's pixels a second), slowing as a thrown page does (its speed falling by
+# e every GLIDE_FADE_S) until it's slower than GLIDE_STOP. Both step with the display's frames.
+WHEEL_GLIDE_S = 0.05
+FLICK_MS = 120
+THROW_FASTEST = 6000.0
 GLIDE_FADE_S = 0.32
 GLIDE_STOP = 25.0
 # After the phone's video ends with the phone still there, try again after this long, and
@@ -90,36 +95,42 @@ SCREEN_SHARE = 0.9
 APPS_SIZE = "apps"
 # Sizes kept from this on are the person's own (before, the default was smaller): settings.
 SIZES_SINCE = 2
-# The bezel above the screen, held to move the window (there's no title bar).
-BEZEL = 22
-FRAME = BEZEL  # what the window has besides the screen
-BORDER = 2  # an app's window: a thin frame round its sides and bottom, in the bezel's colour
-# The phone's shape until the phone says (a Pixel 7's, upright).
-FIRST_RATIO = 1080 / 2400
+# Above the phone, the room its options pill sits in; the pill opens in a row where the window
+# is wider than the row by this much, and closes this long after the pointer leaves the window.
+# Full screen, it floats over the screen's top instead, shown while the pointer is this near it.
+CONTROLS = 30
+FLOAT_REACH = 56
+OPTIONS_ROOM = 16
+OPTIONS_CLOSE_MS = 1500
 
 CSS = b"""
-.handset-window.on-screen { background: black; }
+window.handset-window { background: none; border-radius: 0; outline: none;
+                        box-shadow: 0 0 0 10px transparent; }
+window.handset-window.maximized, window.handset-window.fullscreen { box-shadow: none; }
+.handset-screen-area { background: black; color: white; }
+.handset-screen-area statuspage > scrolledwindow > viewport > box { margin: 0 12px; }
+.handset-screen-area .dim-label, .handset-screen-area statuspage .description { color: alpha(white, 0.62); }
+.handset-screen-area button.pill { background: alpha(white, 0.14); color: white; box-shadow: none; }
+.handset-screen-area button.pill:hover { background: alpha(white, 0.22); }
+.handset-screen-area button.pill.suggested-action { background: alpha(white, 0.24); font-weight: 700; }
+.handset-screen-area dropdown > button { background: alpha(white, 0.14); color: white; }
 .handset-ada { border-radius: 999px; padding: 6px 14px; margin-top: 10px; font-weight: 600; }
-.handset-ring { border: 3px solid var(--accent-bg-color); }
 .handset-asleep { background: alpha(black, 0.6); color: white; }
 .handset-asleep .title { font-weight: 700; font-size: 1.15em; }
 .handset-away .title { font-weight: 700; }
 .handset-hidden { color: alpha(white, 0.85); font-weight: 600; }
-.handset-bezel { background: #101012; }
-.handset-grip { background: alpha(white, 0.32); border-radius: 3px; min-width: 44px; min-height: 5px; }
-.handset-window:not(.on-screen) .handset-bezel { background: none; }
-.handset-window:not(.on-screen) .handset-grip { background: alpha(currentColor, 0.2); }
-.handset-bezel-button { min-width: 20px; min-height: 20px; padding: 0; margin: 0 2px; border-radius: 999px;
-                        background: none; box-shadow: none; color: alpha(white, 0.55); -gtk-icon-size: 13px; }
-.handset-bezel-button:hover { background: alpha(white, 0.14); color: white; }
-.handset-bezel-button.close:hover { background: #e01b24; color: white; }
-.handset-bezel-button:checked { background: alpha(white, 0.22); color: white; }
-.handset-window:not(.on-screen) .handset-bezel-button:checked { opacity: 1; background: alpha(currentColor, 0.16); }
-.handset-window:not(.on-screen) .handset-bezel-button { color: inherit; opacity: 0.6; }
-.handset-window:not(.on-screen) .handset-bezel-button:hover { opacity: 1; background: alpha(currentColor, 0.1); }
-.handset-app-body { padding: 0 2px 2px 2px; }
-.handset-window.on-screen .handset-app-body { background: #101012; }
-.handset-window.maximized .handset-app-body, .handset-window.fullscreen .handset-app-body { padding: 0; }
+window.handset-window.maximized, window.handset-window.fullscreen { background: black; }
+.handset-controls { background: alpha(#1c1c20, 0.88); color: white; border-radius: 999px; padding: 2px 3px;
+                    box-shadow: 0 2px 6px alpha(black, 0.35), inset 0 0 0 1px alpha(white, 0.09);
+                    transition: opacity 160ms ease-out; }
+.handset-controls.resting { opacity: 0.6; }
+.handset-controls separator { background: alpha(white, 0.14); margin: 6px 3px; min-width: 1px; }
+.handset-control { min-width: 24px; min-height: 22px; padding: 0; margin: 0 1px; border-radius: 999px;
+                   background: none; box-shadow: none; color: alpha(white, 0.72); -gtk-icon-size: 14px; }
+.handset-pill { min-width: 34px; min-height: 16px; -gtk-icon-size: 14px; }
+.handset-control:hover { background: alpha(white, 0.14); color: white; }
+.handset-control.close:hover { background: #e01b24; color: white; }
+.handset-control:checked { background: alpha(white, 0.24); color: white; }
 """
 
 # The phone's buttons and the window's own, as shortcuts: (action, accelerators).
@@ -193,23 +204,46 @@ def migrated(settings: dict) -> dict:
     return settings
 
 
-def fitted(ratio: float, screen: tuple[int, int], longer: float | None = None) -> tuple[int, int]:
-    """The window's size for a phone screen of `ratio` (width ÷ height): its longer side `longer`
-    (as large as fits when not given), never more than SCREEN_SHARE of the monitor either way."""
-    sw, sh = screen
-    if longer is None:
-        longer = max(sw, sh)
-    w, h = (longer * ratio, longer) if ratio < 1 else (longer, longer / ratio)
-    scale = min(1.0, sw * SCREEN_SHARE / w, sh * SCREEN_SHARE / h)
-    return max(1, int(w * scale)), max(1, int(h * scale))  # down, so it always fits
+def window_size(shape: bodies.Body, rotation: int, monitor: tuple[int, int],
+                longer: float | None = None) -> tuple[int, int]:
+    """The window's size: the phone (body.py), its screen's longer side `longer` (as large as fits
+    when not given), never more than SCREEN_SHARE of the monitor either way; and under it, the
+    room for its controls."""
+    scale = bodies.fit_scale(shape, rotation, (monitor[0] * SCREEN_SHARE, monitor[1] * SCREEN_SHARE - CONTROLS))
+    if longer:
+        scale = min(scale, longer / max(bodies.turned(shape, rotation)))
+    width, height = bodies.outer_size(shape, rotation, scale)
+    return max(1, int(width)), max(1, int(height)) + CONTROLS
 
 
-def window_size(ratio: float, screen: tuple[int, int], longer: float | None = None,
-                border: int = 0) -> tuple[int, int]:
-    """The window's size: the phone's screen as fitted() makes it, with the bezel above it (and
-    an app's window, its frame round the rest)."""
-    width, height = fitted(ratio, (screen[0] - 2 * border, screen[1] - FRAME - border), longer)
-    return width + 2 * border, height + FRAME + border
+def pad_speed(history: list[tuple[int, float, float]], now: int) -> tuple[float, float] | None:
+    """A touchpad's scroll's speed as its fingers lifted, the window's pixels a second: what it
+    moved over its last FLICK_MS (as `history` has it: event times in milliseconds, and how far),
+    over the time that took. None when it had stopped by then."""
+    recent = [entry for entry in history if now - entry[0] <= FLICK_MS]
+    if len(recent) < 2 or recent[-1][0] <= recent[0][0]:
+        return None
+    took = recent[-1][0] - recent[0][0]
+    # Each event says how far since the one before: the first one's way came before the span.
+    return (sum(entry[1] for entry in recent[1:]) * 1000 / took,
+            sum(entry[2] for entry in recent[1:]) * 1000 / took)
+
+
+class Ring:
+    """Ada at work on the phone (or files coming to it): the accent's ring round its screen, drawn
+    by the body."""
+
+    def __init__(self, body: PhoneBody):
+        self.body = body
+        self.shown = False
+
+    def set_visible(self, shown: bool):
+        self.shown = shown
+        color = Adw.StyleManager.get_default().get_accent_color_rgba() if shown else None
+        self.body.set_ring(color)
+
+    def get_visible(self) -> bool:
+        return self.shown
 
 
 def choose(phones: list[Phone], wanted: str | None, taken=(), free_only: bool = False) -> Phone | None:
@@ -247,7 +281,6 @@ class Window(Adw.ApplicationWindow):
         # front (None: not said), and whether minimizing sent it back there.
         self.home_before: bool | None = None
         self.sent_home = False
-        self.border = BORDER if phone_app else 0
         # libadwaita's windows are at least 360 wide: narrower than that is a phone's own shape.
         self.set_size_request(160, 240)
         self.settings = app.settings  # shared by the app's windows
@@ -258,6 +291,7 @@ class Window(Adw.ApplicationWindow):
         self.device = None
         self.opening = False
         self.filling = False
+        self.android_shape: bodies.Body | None = None  # what the Android phone said of its shape
         self.dialling: str | None = None  # an Android phone being connected over Wi-Fi for this window
         self.dialled_at = -60.0
         self.retry = 0
@@ -281,11 +315,11 @@ class Window(Adw.ApplicationWindow):
         self.scroll_finger: tuple[float, float] | None = None  # the touchpad's finger on the phone
         self.lift_timer = 0
         self.wheel_left = [0.0, 0.0]  # the wheel's notches still to scroll, in the phone's pixels
-        self.wheel_glide = 0
         self.thrown: list[float] | None = None  # a flick's speed, the phone's pixels a second
-        self.thrown_at = 0.0
-        self.throw_timer = 0
+        self.motion_tick = 0  # the frames gliding or throwing the page
+        self.motion_at: float | None = None
         self.pad_scrolled = False  # the touchpad's last scroll went as a wheel's: a flick throws it
+        self.pad_history: list[tuple[int, float, float]] = []  # its last moves: (event time, dx, dy)
         self.pointer = (0.0, 0.0)
         self.finger: tuple[float, float] | None = None
         self.press_started = 0.0
@@ -295,7 +329,6 @@ class Window(Adw.ApplicationWindow):
         self.moving = False
         self.shown_at: tuple[int, int] | None = None
         self.resize_timer = 0
-        self._take_size(self.wanted)
         GLib.timeout_add(1000, self._check_hidden)
         self.connect_after("map", self._mapped)
 
@@ -304,8 +337,10 @@ class Window(Adw.ApplicationWindow):
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self._build()
+        self._take_size(self.wanted)
         self.connect("close-request", self._closing)
         self.connect("notify::is-active", self._activated)
+        self.connect("notify::fullscreened", lambda *_a: self._fullscreen_changed())
         for name in ("default-width", "default-height", "maximized"):
             self.connect(f"notify::{name}", self._resized)
         self.watch = watch(self._phones_changed, self._service_gone)
@@ -353,9 +388,8 @@ class Window(Adw.ApplicationWindow):
         self.picture = Screen(on_resize=self._screen_resized)
         self.dots = Gtk.DrawingArea(can_target=False)
         self.dots.set_draw_func(self._draw_finger)
-        # While Ada works on the phone: a ring round its screen, and what she's doing at the top.
-        self.ring = Gtk.Box(can_target=False, visible=False)
-        self.ring.add_css_class("handset-ring")
+        # While Ada works on the phone: a ring round its screen (Ring, drawn by the body below), and
+        # what she's doing at the top.
         self.ada = Gtk.Label()
         self.ada.add_css_class("osd")
         self.ada.add_css_class("handset-ada")
@@ -390,7 +424,7 @@ class Window(Adw.ApplicationWindow):
                                 visible=False, valign=Gtk.Align.CENTER, margin_start=16, margin_end=16)
         self.hidden.add_css_class("handset-hidden")
         self.screen = Gtk.Overlay(child=self.picture, focusable=True)
-        for overlay in (self.dots, self.asleep, self.away, self.hidden, self.ring, self.ada_shown):
+        for overlay in (self.dots, self.asleep, self.away, self.hidden, self.ada_shown):
             self.screen.add_overlay(overlay)
         self.frame = Gtk.AspectFrame(ratio=0.45, obey_child=False, child=self.screen)
 
@@ -431,45 +465,85 @@ class Window(Adw.ApplicationWindow):
         status = Gtk.WindowHandle(child=self.status)
 
         self.stack = Gtk.Stack(vexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stack.add_css_class("handset-screen-area")
         self.stack.add_named(status, "status")
         self.stack.add_named(self.frame, "screen")
-        grip = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
-        grip.add_css_class("handset-grip")
-        # On the left a screenshot (and an app's window, the whole phone), on the right minimizing
-        # and closing: quiet until hovered.
-        top = Gtk.CenterBox(center_widget=grip)
-        starts = Gtk.Box()
+        # The phone's screen in its rim (there's no title bar: the strip above it moves the window),
+        # its corners resizing the window, the rim right-clicked for more.
+        self.body = PhoneBody(self.stack)
+        self.body.set_vexpand(True)
+        self.ring = Ring(self.body)
+        self.bezel = self.body  # (not a window handle: drags and double taps are the phone's)
+        menu_click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        menu_click.connect("pressed", self._bezel_menu)
+        self.bezel.add_controller(menu_click)
+        # Above it, its options in a pill: clicked, it opens in a row where the window has the room,
+        # and as a list over the phone where it hasn't: a screenshot (an app's window: the whole
+        # phone first), the phone's own screen off, the phone's menu; then minimizing and closing.
+        self.options = Gtk.Box()
+        chosen = []
         if self.phone_app:
-            starts.append(self._bezel_button("phone-symbolic", "Show the whole phone", "win.whole-phone"))
-        starts.append(self._bezel_button("camera-photo-symbolic", "Screenshot (Ctrl+Shift+S)", "win.screenshot"))
+            chosen.append(self._control("phone-symbolic", "Show the whole phone", "win.whole-phone"))
+        chosen.append(self._control("camera-photo-symbolic", "Screenshot (Ctrl+Shift+S)", "win.screenshot"))
         # An Android phone's own screen off while it's shown here (screenoff.py): a switch.
         self.screen_off_button = Gtk.ToggleButton(icon_name="display-brightness-symbolic", action_name="win.screen-off",
                                                   tooltip_text="Phone screen off (Ctrl+Shift+O)", visible=False,
                                                   valign=Gtk.Align.CENTER, can_focus=False, focus_on_click=False)
-        self.screen_off_button.add_css_class("handset-bezel-button")
-        starts.append(self.screen_off_button)
-        top.set_start_widget(starts)
-        ends = Gtk.Box()
-        ends.append(self._bezel_button("window-minimize-symbolic", "Minimize", "win.minimize-window"))
-        ends.append(self._bezel_button("window-close-symbolic", "Close", "window.close", "close"))
-        top.set_end_widget(ends)
-        self.bezel = Gtk.WindowHandle(child=top, height_request=BEZEL,
-                                      tooltip_text="Drag to move · Right-click for more")
-        self.bezel.add_css_class("handset-bezel")
-        menu_click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
-        menu_click.connect("pressed", self._bezel_menu)
-        self.bezel.add_controller(menu_click)
+        self.screen_off_button.add_css_class("handset-control")
+        chosen.append(self.screen_off_button)
+        for button in chosen:
+            self.options.append(button)
+        more = self._control("open-menu-symbolic", "More", None)
+        more.connect("clicked", lambda button: self._menu_at(button, button.get_width() / 2, button.get_height()))
+        self.options.append(more)
+        self.options.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        self.fullscreen_button = self._control("view-fullscreen-symbolic", "Full screen (F11)", "win.fullscreen")
+        for button in (self.fullscreen_button,
+                       self._control("window-minimize-symbolic", "Minimize", "win.minimize-window"),
+                       self._control("window-close-symbolic", "Close", "window.close", "close")):
+            self.options.append(button)
+            chosen.append(button)
+        for button in chosen:  # an option taken, the pill closes again
+            button.connect("clicked", lambda _b: GLib.idle_add(self._close_options))
+        self.options_shown = Gtk.Revealer(child=self.options, transition_type=Gtk.RevealerTransitionType.SLIDE_RIGHT,
+                                          transition_duration=200)
+        self.pill = Gtk.ToggleButton(icon_name="view-more-horizontal-symbolic", tooltip_text="Options",
+                                     valign=Gtk.Align.CENTER, can_focus=False, focus_on_click=False)
+        self.pill.add_css_class("handset-control")
+        self.pill.add_css_class("handset-pill")
+        self.pill.connect("toggled", self._pill_toggled)
+        # Dragged, not clicked, the pill moves the window.
+        move = Gtk.GestureDrag(button=Gdk.BUTTON_PRIMARY)
+        move.connect("drag-update", self._pill_dragged)
+        self.pill.add_controller(move)
+        self.controls = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.END, margin_bottom=2)
+        self.controls.add_css_class("handset-controls")
+        self.controls.add_css_class("resting")
+        self.controls.append(self.pill)
+        self.controls.append(self.options_shown)
+        self.options_timer = 0
+        self.pointer_inside = False
+        # The strip it's in is held to move the window too, and right-clicked for the phone's menu.
+        self.above = Gtk.WindowHandle(child=self.controls, height_request=CONTROLS)
+        above_menu = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        above_menu.connect("pressed", lambda gesture, _n, x, y: (gesture.set_state(Gtk.EventSequenceState.CLAIMED),
+                                                                 self._menu_at(self.above, x, y)))
+        self.above.add_controller(above_menu)
+        # Full screen, the pill floats over the screen's top instead, while the pointer's near it.
+        self.floating = Gtk.Revealer(halign=Gtk.Align.CENTER, valign=Gtk.Align.START, margin_top=8,
+                                     transition_type=Gtk.RevealerTransitionType.CROSSFADE)
+        self.float_timer = 0
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", lambda *_a: self._controls_awake())
+        hover.connect("leave", lambda *_a: self._pointer_left())
+        hover.connect("motion", lambda _c, _x, y: self._hovering(y))
+        self.add_controller(hover)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content.append(self.above)
         content.append(self.bezel)
-        if self.phone_app:
-            body = Gtk.Box(vexpand=True)
-            body.add_css_class("handset-app-body")
-            self.stack.set_hexpand(True)
-            body.append(self.stack)
-            content.append(body)
-        else:
-            content.append(self.stack)
-        self.toasts = Adw.ToastOverlay(child=content)
+        layers = Gtk.Overlay(child=content)
+        layers.add_overlay(self.floating)
+        self.toasts = Adw.ToastOverlay(child=layers)
         self.set_content(self.toasts)
 
         # The mouse as a finger.
@@ -535,11 +609,11 @@ class Window(Adw.ApplicationWindow):
             self.get_application().set_accels_for_action(action, accels)
 
     @staticmethod
-    def _bezel_button(icon: str, tip: str, action: str, *classes: str) -> Gtk.Button:
-        """A small round button on the bezel, that never takes the keys from the phone."""
+    def _control(icon: str, tip: str, action: str | None, *classes: str) -> Gtk.Button:
+        """A small round button under the phone, that never takes the keys from the phone."""
         button = Gtk.Button(icon_name=icon, tooltip_text=tip, action_name=action, valign=Gtk.Align.CENTER,
                             can_focus=False, focus_on_click=False)
-        button.add_css_class("handset-bezel-button")
+        button.add_css_class("handset-control")
         for name in classes:
             button.add_css_class(name)
         return button
@@ -598,8 +672,113 @@ class Window(Adw.ApplicationWindow):
             Gio.File.new_for_path(os.path.dirname(path)).get_uri(), None))
         self.toasts.add_toast(toast)
 
+    def _controls_awake(self):
+        self.pointer_inside = True
+        self.controls.remove_css_class("resting")
+        if self.options_timer:
+            GLib.source_remove(self.options_timer)
+            self.options_timer = 0
+
+    def _pointer_left(self):
+        self.pointer_inside = False
+        self._controls_rest()
+
+    def _controls_rest(self):
+        """The pointer left: the pill dims, and a moment later closes, but not while its menu is open."""
+        if getattr(self, "menu_open", False):
+            return
+        self.controls.add_css_class("resting")
+        if not self.options_timer:
+            self.options_timer = GLib.timeout_add(OPTIONS_CLOSE_MS, self._close_options)
+
+    def _pill_toggled(self, pill: Gtk.ToggleButton):
+        """The options pill clicked: open in a row where the window has the room for one, else
+        its options as a list over the phone."""
+        if not pill.get_active():
+            self.options_shown.set_reveal_child(False)
+            return
+        row = self.options.measure(Gtk.Orientation.HORIZONTAL, -1)[1] + pill.get_width()
+        if self.get_width() >= row + OPTIONS_ROOM:
+            self.options_shown.set_reveal_child(True)
+        else:
+            pill.set_active(False)
+            self._menu_at(pill, pill.get_width() / 2, pill.get_height(), window=True)
+
+    def _pill_dragged(self, gesture: Gtk.GestureDrag, dx: float, dy: float):
+        """The pill dragged, not clicked: the window moves with it (the desktop moving it)."""
+        if math.hypot(dx, dy) < MOVE_SLOP:
+            return
+        native = self.get_native()
+        surface = native.get_surface() if native else None
+        started, x, y = gesture.get_start_point()
+        if not started or not isinstance(surface, Gdk.Toplevel):
+            return
+        found, point = self.pill.compute_point(native, Graphene.Point().init(x + dx, y + dy))
+        if not found:
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)  # no click: the pill stays as it was
+        sx, sy = native.get_surface_transform()
+        surface.begin_move(gesture.get_device(), gesture.get_current_button(), point.x + sx, point.y + sy,
+                           gesture.get_current_event_time())
+
+    def _fullscreen_changed(self):
+        """Full screen: the phone on black, as large as fits, no rim; its pill floating over the
+        screen's top while the pointer's near it. Back, the pill above it again."""
+        full = self.is_fullscreen()
+        self.body.set_bare(full)
+        self.fullscreen_button.set_icon_name("view-restore-symbolic" if full else "view-fullscreen-symbolic")
+        self.fullscreen_button.set_tooltip_text("Leave full screen (F11)" if full else "Full screen (F11)")
+        if full and self.controls.get_parent() is self.above:
+            self.above.set_child(None)
+            self.floating.set_child(self.controls)
+        elif not full and self.controls.get_parent() is self.floating:
+            self.floating.set_child(None)
+            self.above.set_child(self.controls)
+        self.above.set_visible(not full)
+        self.floating.set_reveal_child(full)
+        if full:
+            self._float_later()
+
+    def _hovering(self, y: float):
+        """Full screen, the pointer near the top shows the pill; away, it goes a moment later."""
+        if not self.is_fullscreen():
+            return
+        if y <= FLOAT_REACH:
+            self.floating.set_reveal_child(True)
+            if self.float_timer:
+                GLib.source_remove(self.float_timer)
+                self.float_timer = 0
+        else:
+            self._float_later()
+
+    def _float_later(self):
+        if not self.float_timer:
+            self.float_timer = GLib.timeout_add(OPTIONS_CLOSE_MS, self._float_away)
+
+    def _float_away(self):
+        self.float_timer = 0
+        if self.is_fullscreen() and not getattr(self, "menu_open", False) and not self.pill.get_active():
+            self.floating.set_reveal_child(False)
+        return GLib.SOURCE_REMOVE
+
+    def _close_options(self):
+        self.options_timer = 0
+        if self.pill.get_active():
+            self.pill.set_active(False)
+        return GLib.SOURCE_REMOVE
+
     def _bezel_menu(self, gesture, _n, x, y):
-        """Right-click on the bezel: the phone's apps (or, for an app's window, its pin)."""
+        """Right-click on the phone round its screen (on the screen, it's Back)."""
+        box = self.body.screen_box()
+        if box and self.stack.get_visible_child_name() == "screen" and \
+                box[0] <= x < box[0] + box[2] and box[1] <= y < box[1] + box[3]:
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self._menu_at(self.bezel, x, y)
+
+    def _menu_at(self, widget: Gtk.Widget, x: float, y: float, window: bool = False):
+        """The phone's menu: its apps and files, and more (an app's window: its pin); with
+        `window`, full screen, minimizing and closing too (the options pill's, with no room for its row)."""
         from . import apps
 
         sound = self.get_application().sound
@@ -624,14 +803,27 @@ class Window(Adw.ApplicationWindow):
             menu.append("Pair an iPhone for Notifications…", "win.pair-iphone")
             menu.append("New Window", "app.new-window")
             menu.append("Phones and Settings…", "app.phones")
-        popover = Gtk.PopoverMenu(menu_model=menu, has_arrow=False, halign=Gtk.Align.START)
-        popover.set_parent(self.bezel)
+        if window:
+            section = Gio.Menu()
+            section.append("Leave Full Screen" if self.is_fullscreen() else "Full Screen", "win.fullscreen")
+            section.append("Minimize", "win.minimize-window")
+            section.append("Close", "window.close")
+            menu.append_section(None, section)
+        popover = Gtk.PopoverMenu(menu_model=menu, has_arrow=False, halign=Gtk.Align.CENTER if window else Gtk.Align.START)
+        popover.set_parent(widget)
         point = Gdk.Rectangle()
         point.x, point.y, point.width, point.height = int(x), int(y), 1, 1
         popover.set_pointing_to(point)
-        popover.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        self.menu_open = True
+
+        def closed(menu_popover):
+            self.menu_open = False
+            if not self.pointer_inside:
+                self._controls_rest()
+            GLib.idle_add(menu_popover.unparent)
+
+        popover.connect("closed", closed)
         popover.popup()
-        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
 
     def _pair_iphone(self):
         """This computer, visible to iPhones for a few minutes: one paired from its Bluetooth
@@ -670,8 +862,8 @@ class Window(Adw.ApplicationWindow):
         saved = sizes.get(key) if key else None
         if not isinstance(saved, int) or saved <= 0:
             saved = None
-        ratio = (lambda w, h: w / h)(*self.device.shown) if self.device else FIRST_RATIO
-        self.set_default_size(*window_size(ratio, self._monitor(), saved, self.border))
+        shape, rotation = self._shape()
+        self.set_default_size(*window_size(shape, rotation, self._monitor(), saved))
         if key and maximized.get(key):
             self.maximize()
 
@@ -917,20 +1109,25 @@ class Window(Adw.ApplicationWindow):
         from . import android, iphone
 
         def work():
+            shape = None
             if phone.platform == "ios":
                 link = iphone.open_link(phone.id, phone.address, phone.model)
             else:
                 link = android.open_link(phone.id, phone.address, phone.port)
-            GLib.idle_add(self._opened, phone.id, link)
+                if isinstance(link, android.Link):
+                    shape = bodies.android_body(phone.id, link.serial, link.natural)
+            GLib.idle_add(self._opened, phone.id, link, shape)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _opened(self, phone_id: str, link):
+    def _opened(self, phone_id: str, link, shape: bodies.Body | None = None):
         from . import android, iphone
 
         self.opening = False
         if not self.phone or self.phone.id != phone_id:
             return GLib.SOURCE_REMOVE
+        if shape:
+            self.android_shape = shape
         if isinstance(link, str):
             self._show_status("phone-symbolic", f"Can't reach {self.phone.name}", link, again=True)
             return GLib.SOURCE_REMOVE
@@ -1363,13 +1560,13 @@ class Window(Adw.ApplicationWindow):
 
     def _turned(self):
         width, height = self.device.shown
-        ratio = width / height
-        self.frame.set_ratio(ratio)
+        self.frame.set_ratio(width / height)
         # The window takes the phone's shape and turns with it, keeping the size the person gave
         # it as far as the monitor allows, unless they made it fill the screen.
+        longer = self._screen_longer()
+        shape, rotation = self._shape()
         if not (self.is_maximized() or self.is_fullscreen()):
-            longer = max(self.get_width() - 2 * self.border, self.get_height() - FRAME - self.border) or None
-            self.set_default_size(*window_size(ratio, self._monitor(), longer, self.border))
+            self.set_default_size(*window_size(shape, rotation, self._monitor(), longer))
         GLib.timeout_add(300, self._sync_shown_size)  # once the window has turned
 
     def _touch_changed(self, live: bool):
@@ -1405,13 +1602,57 @@ class Window(Adw.ApplicationWindow):
         maximized = self.is_maximized()
         key = self.size_key(self.phone.id)
         if not (maximized or self.is_fullscreen()):
-            width, height = self.get_default_size()
-            longer = max(width - 2 * self.border, height - FRAME - self.border)
-            if longer > 0:
-                self.settings["sizes"][key] = longer
+            longer = self._screen_longer()
+            if longer:
+                self.settings["sizes"][key] = round(longer)
+            self._keep_shape()
         self.settings["maximized"][key] = maximized
         save_settings(self.settings)
         return GLib.SOURCE_REMOVE
+
+    def _screen_longer(self) -> float | None:
+        """The screen's longer side as the window draws it now."""
+        box = self.body.screen_box()
+        return max(box[2], box[3]) if box and max(box[2], box[3]) > 1 else None
+
+    def _keep_shape(self):
+        """Resized by hand, the window comes to the phone's shape: the phone as it fits now, and
+        no more round it."""
+        shape = self.body.shape
+        if not shape:
+            return
+        width, height = self.get_default_size()
+        wanted = max(1, round(shape.outer[2])), max(1, round(shape.outer[3])) + CONTROLS
+        if abs(wanted[0] - width) > 1 or abs(wanted[1] - height) > 1:
+            self.set_default_size(*wanted)
+
+    def _shape(self) -> tuple[bodies.Body, int]:
+        """The phone's own shape (body.py), turned as its screen shows, put round the screen."""
+        phone, device = self.phone, self.device
+        shown = tuple(device.shown) if device else None
+        rotation = 0
+        if phone and phone.platform == "ios":
+            from .iphone import SCREENS
+
+            natural = SCREENS.get((phone.model or "").strip()) or (tuple(sorted(shown)) if shown else (1170, 2532))
+            shape = bodies.iphone_body(phone.model or "", natural)
+            if shown and (shown[0] > shown[1]) != (natural[0] > natural[1]):
+                rotation = 90  # turned (which way, an iPhone doesn't say)
+        else:
+            natural = tuple(device.link.natural) if device else None
+            shape = ((self.android_shape if self.android_shape and natural and
+                      tuple(self.android_shape.screen) == natural else None)
+                     or (bodies.kept(phone.id) if phone else None)
+                     or bodies.fallback("android", natural or (1080, 2400)))
+            rotation = getattr(device, "rotation", 0) if device else 0
+        cutout = True
+        if self.own_screen() and shown:
+            # An app on a screen of its own: that screen's size, the phone's corners, no cutout.
+            grown = min(shown) / min(shape.screen)
+            shape = bodies.Body(shown, shape.corner * grown)
+            rotation, cutout = 0, False
+        self.body.set_body(shape, rotation, cutout)
+        return shape, rotation
 
     def _closing(self, _window):
         if self.size_timer:
@@ -1571,6 +1812,8 @@ class Window(Adw.ApplicationWindow):
             return True
         self.pad_scrolled = unit == Gdk.ScrollUnit.SURFACE and self._scroll_by(dx, dy)
         if self.pad_scrolled:
+            now = controller.get_current_event_time()
+            self.pad_history = [entry for entry in self.pad_history if now - entry[0] <= FLICK_MS] + [(now, dx, dy)]
             return True
         if unit == Gdk.ScrollUnit.SURFACE and self.device.live_touch:
             self._finger_scroll(dx, dy)
@@ -1605,67 +1848,85 @@ class Window(Adw.ApplicationWindow):
         return scroll(*self._scroll_point(fit), right / scale, down / scale)
 
     def _wheel_glide(self, right: float, down: float) -> bool:
-        """A mouse wheel's notches, as far as SCROLL_PER_NOTCH takes them, glided a frame at a time."""
+        """A mouse wheel's notches, as far as SCROLL_PER_NOTCH takes them, glided frame by frame."""
         if not self._scroll_by(0, 0):
             return False
         sw, sh = self.device.shown
         self.wheel_left[0] += right * SCROLL_PER_NOTCH * sh
         self.wheel_left[1] += down * SCROLL_PER_NOTCH * sh
-        if not self.wheel_glide:
-            self.wheel_glide = GLib.timeout_add(WHEEL_FRAME_MS, self._wheel_glide_step)
+        self._moving()
         return True
 
-    def _wheel_glide_step(self):
-        steps = [left if abs(left) < 2 else left * WHEEL_EASE for left in self.wheel_left]
-        self.wheel_left = [left - step for left, step in zip(self.wheel_left, steps)]
-        if not any(steps) or not self._scroll_by(*steps, pixels_of_window=False):
-            self.wheel_glide = 0
-            self.wheel_left = [0.0, 0.0]
+    def _moving(self):
+        """The page glides or is thrown: stepped with the display's own frames (the screen's frame
+        clock), each step as far as the time since the last, so it moves as evenly as they come."""
+        if not self.motion_tick:
+            self.motion_at = None
+            self.motion_tick = self.screen.add_tick_callback(self._motion_frame)
+
+    def _motion_frame(self, _widget, clock):
+        now = clock.get_frame_time() / 1e6
+        elapsed = min(now - self.motion_at, 0.1) if self.motion_at is not None else 1 / 60
+        self.motion_at = now
+        going = self._wheel_glide_step(elapsed)
+        going = self._throw_step(elapsed) or going
+        if not going:
+            self.motion_tick = 0
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
 
-    def _flicked(self, _controller, speed_x: float, speed_y: float):
-        """The touchpad's fingers lifted moving (its speed in pixels a millisecond): the page,
-        scrolled as a wheel does, is thrown on (with a finger, the phone throws it itself)."""
+    def _wheel_glide_step(self, elapsed: float) -> bool:
+        """A frame of a wheel's glide: its share of the way left (all of it under a pixel). Whether
+        there's more."""
+        if not any(self.wheel_left):
+            return False
+        share = 1 - math.exp(-elapsed / WHEEL_GLIDE_S)
+        steps = [left if abs(left) < 1 else left * share for left in self.wheel_left]
+        self.wheel_left = [left - step for left, step in zip(self.wheel_left, steps)]
+        if not self._scroll_by(*steps, pixels_of_window=False):
+            self.wheel_left = [0.0, 0.0]
+            return False
+        return any(self.wheel_left)
+
+    def _flicked(self, controller, _speed_x: float, _speed_y: float):
+        """The touchpad's fingers lifted moving: the page, scrolled as a wheel does, is thrown on
+        at the speed they had (with a finger, the phone throws it itself). That speed's measured
+        here, from their last moments, as GTK measures its own: what this signal says of it isn't
+        taken, its unit being in doubt (pixels a millisecond, its documents say)."""
         fit = self._fit()
         if not self.pad_scrolled or not fit or not self.device:
             return
         self.pad_scrolled = False
+        now = controller.get_current_event_time() if controller else (self.pad_history[-1][0] if self.pad_history else 0)
+        speed = pad_speed(self.pad_history, now)
+        self.pad_history = []
+        if not speed:
+            return
         scale = fit.scale or 1.0
-        self.thrown = [speed_x * 1000 / scale, speed_y * 1000 / scale]
-        self.thrown_at = time.monotonic()
-        if not self.throw_timer:
-            self.throw_timer = GLib.timeout_add(WHEEL_FRAME_MS, self._throw_step)
+        self.thrown = [min(max(each, -THROW_FASTEST), THROW_FASTEST) / scale for each in speed]
+        self._moving()
 
-    def _throw_step(self):
+    def _throw_step(self, elapsed: float) -> bool:
+        """A frame of a thrown page: the way gone as its speed fell over the frame. Whether it
+        goes on."""
         fit = self._fit()
-        now = time.monotonic()
-        elapsed, self.thrown_at = now - self.thrown_at, now
         if self.thrown is None or not fit:
-            self.throw_timer = 0
-            return GLib.SOURCE_REMOVE
+            self.thrown = None
+            return False
         fade = math.exp(-elapsed / GLIDE_FADE_S)
-        # The way gone this frame, as the speed fell over it.
         way = [speed * GLIDE_FADE_S * (1 - fade) for speed in self.thrown]
         self.thrown = [speed * fade for speed in self.thrown]
         slow = math.hypot(*self.thrown) * (fit.scale or 1.0) < GLIDE_STOP
         if not self._scroll_by(*way, pixels_of_window=False) or slow:
             self.thrown = None
-            self.throw_timer = 0
-            return GLib.SOURCE_REMOVE
-        return GLib.SOURCE_CONTINUE
+            return False
+        return True
 
     def _stop_throw(self):
-        self.thrown = None
-        if self.throw_timer:
-            GLib.source_remove(self.throw_timer)
-            self.throw_timer = 0
+        self.thrown = None  # its next frame ends it
 
     def _stop_gliding(self):
-        self._stop_throw()
-        if self.wheel_glide:
-            GLib.source_remove(self.wheel_glide)
-            self.wheel_glide = 0
+        self.thrown = None
         self.wheel_left = [0.0, 0.0]
 
     def _scroll_now(self):

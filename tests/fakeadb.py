@@ -531,6 +531,13 @@ def main(args):
             if os.path.exists(os.path.join(HERE, "wifi")):
                 with open(os.path.join(HERE, "wifi")) as file:
                     print(file.read(), end="")
+        elif command.startswith("dumpsys display"):
+            # Its screen's shape, as a Pixel 7 says it: rounded corners, a punch hole at the top.
+            print("  mBaseDisplayInfo=DisplayInfo{roundedCorners RoundedCorners{[RoundedCorner{position=TopLeft, "
+                  "radius=47, center=Point(47, 47)}]}, cutout DisplayCutout{insets=Rect(0, 136 - 0, 0) "
+                  "boundingRect={Bounds=[Rect(0, 0 - 0, 0), Rect(480, 0 - 625, 136)]} cutoutPathParserInfo="
+                  "{CutoutPathParserInfo{density={2.625} cutoutSpec={M 506,68 a 34,34 0 1 0 68,0 34,34 0 1 0 "
+                  "-68,0 Z @left}}}}")
         elif command in ("wm size", "wm size; wm density"):
             print(f"Physical size: {NATURAL[0]}x{NATURAL[1]}")
             if "density" in command:

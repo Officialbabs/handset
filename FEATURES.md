@@ -111,7 +111,7 @@ explains what to do on the phone and moves on as soon as the phone is ready.
 
 ### Phones and Settings window
 
-Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `handset --phones`.
+Opened by launching Handset, with **Ctrl+,**, from the phone's menu, or with `handset --phones`.
 
 - **A card for each known phone**, showing:
   - how it's connected (USB, Wi-Fi or Bluetooth)
@@ -136,17 +136,32 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
 
 ### Window
 
-- **The screen, edge to edge**, under a slim bezel. There's no title bar or toolbar.
-- **Moving:** drag the bezel, or drag with the middle mouse button.
-- **Full screen:** double-click the bezel or press F11.
-- **Resizing** from the window's edges keeps the phone's aspect ratio.
-- **Bezel buttons:** a screenshot button, Minimize and Close, and on an Android phone's window,
-  Phone Screen Off.
+- **The phone's screen as the phone has it:** edge to edge, with the phone's own rounded corners,
+  in a hairline of light glass (2 pixels). There's no bezel, title bar or toolbar.
+  - **Its shape, as it says it:** an Android phone's corner radius and cutout come from
+    `dumpsys display` (its punch hole's circle, or the box a notch keeps clear), read once and
+    kept. An iPhone's come from its model: the notch (iPhone X to 14), the Dynamic Island (14 Pro
+    on), or square corners (SE, 8).
+  - **The cutout drawn where it is,** turning with the screen; an Android app's own screen has none.
+- **Moving:** drag the options pill (or round it), or drag with the middle mouse button. The phone
+  itself never moves the window: drags and double taps on it are the phone's.
+- **Full screen:** F11 or the pill's Full Screen button. The phone sits on black, as large as the
+  screen allows, with no rim, and its pill floats over the top of the screen while the pointer is
+  near it (it fades a moment after the pointer leaves). A maximized window (a double-click round
+  the pill) is on black too.
+- **Resizing** from any of the phone's four corners (or the window's edges) keeps the phone's
+  shape; let go and the window comes back round the phone. The phone keeps to the window's top
+  left meanwhile, so it doesn't jump when the window does.
+- **Options pill** above the phone: clicked, it opens into a row of a screenshot button, Phone
+  Screen Off (Android), the phone's menu (also a right-click round the pill or on the rim), Full
+  Screen, Minimize and Close. A
+  window too narrow for the row gets them as a list over the phone instead. It dims while the
+  pointer is away, and closes once an option is taken or the pointer has been gone a moment.
 - **Remembered sizes:** each phone's window reopens at its last size. App windows share one size:
   the last size given to any of them, starting at 90% of the screen's height.
 - **Click to wake:** clicking a sleeping phone's window wakes the phone.
-- **Phone screen off (Android):** the bezel's brightness button, Phone Screen Off in the bezel
-  menu, or **Ctrl+Shift+O** turns the phone's own display off while the window keeps showing and
+- **Phone screen off (Android):** the brightness button in the options pill, Phone Screen Off in the
+  phone's menu, or **Ctrl+Shift+O** turns the phone's own display off while the window keeps showing and
   controlling it, through scrcpy's server (Android's display control).
   - **Sleeps as ever:** the phone keeps its own screen-off time. Using it from the window counts as
     using the phone; left alone, it goes to sleep and its screen stays dark.
@@ -198,8 +213,8 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
 |---|---|
 | Left button press, drag, release | Touch, drag, lift |
 | Left button held | Long press |
-| Scroll wheel | Android: scroll events, as from a mouse, glided over a few frames per notch. iPhone: a finger drag, held, moved one step per notch, and lifted once the wheel stops |
-| Touchpad scroll | Android: scroll events following the fingers, and a flick thrown on, slowing as a page does. iPhone: a finger that follows the touchpad and flings the page when lifted |
+| Scroll wheel | Android: scroll events, as from a mouse, each notch glided out over about a tenth of a second, stepped with the display's own frames (as smooth at 144 Hz as at 60). iPhone: a finger drag, held, moved one step per notch, and lifted once the wheel stops |
+| Touchpad scroll | Android: scroll events following the fingers, and a flick thrown on at the speed they had (measured over their last 120 ms, at most 6000 pixels a second), slowing as a page does, frame by frame; touching the touchpad again or clicking stops it. iPhone: a finger that follows the touchpad and flings the page when lifted |
 | Touchpad pinch, or Ctrl + scroll wheel | Two-finger pinch to zoom |
 | Right click | Back |
 | Middle click | Home |
@@ -238,7 +253,7 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
 
 ## 5. Screenshots
 
-- **Taking one:** the camera button on the bezel, **Ctrl+Shift+S**, or **Print**.
+- **Taking one:** the camera button in the options pill, **Ctrl+Shift+S**, or **Print**.
 - **Source and size:** captured on the phone itself, at its native resolution.
 - **Where it goes:** saved to Pictures › Screenshots and copied to the clipboard.
 - **App windows** capture the app's own screen.
@@ -255,10 +270,10 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
 - **Pinning:** apps can be pinned to the dock like any desktop app.
 - **When the phone disconnects,** its apps leave the launcher. Pinned apps stay, and opening one
   waits for the phone to come back.
-- **Phone Apps** (Ctrl+Shift+A, or from the bezel menu) lists the phone's apps for opening or
+- **Phone Apps** (Ctrl+Shift+A, or from the phone's menu) lists the phone's apps for opening or
   pinning.
-- **App window bezel:** a phone button that opens the full phone view, plus Minimize and Close,
-  with a thin frame round the window.
+- **App window controls:** a phone button that opens the full phone view, then the rest as any
+  phone window's. An Android app's own screen is drawn in its phone without the phone's cutout.
 
 ### Android app windows
 
@@ -281,7 +296,7 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
   that app open.
 - **Closing the window** takes the iPhone back to its home screen, through whichever window has its
   screen. A dark iPhone is left dark: Home would light it.
-- **Minimizing the window** (its bezel's button) takes the iPhone back to its home screen too, when
+- **Minimizing the window** (its Minimize button) takes the iPhone back to its home screen too, when
   the app was opened over the home screen (as the iPhone says, from its own word on its apps); one
   opened over another app leaves the iPhone as it is. Coming back to the window brings the app
   back.
@@ -324,7 +339,7 @@ Opened by launching Handset, with **Ctrl+,**, from the bezel's menu, or with `ha
 
 - **Delivered over Bluetooth Low Energy** through Apple Notification Center Service, the protocol
   smartwatches use.
-- **One-time pairing:** Pair an iPhone for Notifications (bezel menu) or `handset --pair-iphone`.
+- **One-time pairing:** Pair an iPhone for Notifications (the phone's menu) or `handset --pair-iphone`.
   Then, on the iPhone, choose the computer in Settings › Bluetooth and allow notifications.
 - **Automatic reconnection:** the paired iPhone is trusted in BlueZ, so it reconnects by itself.
   The computer is discoverable only during pairing, and while the paired iPhone is out of range.
@@ -405,7 +420,7 @@ Notifications can be switched off in Phones and Settings.
 
 ### Phone Files browser
 
-Opened with **Ctrl+Shift+F**, or from the bezel menu.
+Opened with **Ctrl+Shift+F**, or from the phone's menu.
 
 - **Browse** the phone's storage.
 - **Save** files to the computer's Downloads folder.
@@ -418,7 +433,7 @@ Opened with **Ctrl+Shift+F**, or from the bezel menu.
 
 ## 10. Audio and calls
 
-**Play Sound Here** (bezel menu or the phone's page) plays the phone's audio on the computer instead
+**Play Sound Here** (the phone's menu or its page) plays the phone's audio on the computer instead
 of the phone.
 
 - **Remembered for each phone,** and restored when the phone's window opens again.
@@ -524,7 +539,7 @@ Three features overlap. With both apps running, keep one of each:
 | Start at Sign-In | Phones and Settings | On |
 | Connected | Each phone's page | On |
 | Over Wi-Fi | Each phone's page | On |
-| Play Sound Here | Each phone's page, or the bezel menu | Off |
+| Play Sound Here | Each phone's page, or the phone's menu | Off |
 
 Settings are stored in `~/.config/handset/settings.json`.
 

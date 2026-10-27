@@ -3,7 +3,8 @@
 import unittest
 
 from handset.service import Phone
-from handset.window import FRAME, SIZES_SINCE, choose, fitted, migrated, window_size
+from handset import body as bodies
+from handset.window import CONTROLS, SIZES_SINCE, choose, migrated, window_size
 from tests.fakeservice import phone
 
 
@@ -64,30 +65,39 @@ class SettingsTest(unittest.TestCase):
 
 class SizeTest(unittest.TestCase):
     LAPTOP = (1366, 768)
+    PIXEL = bodies.parse_android("RoundedCorner{position=TopLeft, radius=47, center=Point(47, 47)}", (1080, 2400))
+
+    def screen(self, size, rotation=0):
+        """The screen's size as the window would draw it, at that window size."""
+        shape = bodies.layout(self.PIXEL, rotation, size[0], size[1] - CONTROLS)
+        return shape.screen[2], shape.screen[3]
 
     def test_upright_phone_fits_the_laptop(self):
-        w, h = fitted(1080 / 2400, self.LAPTOP)
-        self.assertEqual(h, 691)  # 90% of the screen's height
-        self.assertAlmostEqual(w / h, 0.45, places=2)
+        w, h = window_size(self.PIXEL, 0, self.LAPTOP)
+        self.assertLessEqual(h, 768 * 0.9)
+        self.assertGreater(h, 768 * 0.9 - 4)  # as large as fits
+        sw, sh = self.screen((w, h))
+        self.assertAlmostEqual(sw / sh, 0.45, places=2)
 
     def test_turned_phone_fits_too(self):
-        w, h = fitted(2400 / 1080, self.LAPTOP)
+        w, h = window_size(self.PIXEL, 90, self.LAPTOP)
         self.assertLessEqual(w, 1366 * 0.9)
         self.assertLessEqual(h, 768 * 0.9)
-        self.assertAlmostEqual(w / h, 2400 / 1080, places=2)
+        sw, sh = self.screen((w, h), 90)
+        self.assertAlmostEqual(sw / sh, 2400 / 1080, places=2)
 
     def test_the_persons_size_kept_while_it_fits(self):
-        self.assertEqual(fitted(0.45, self.LAPTOP, 500), (225, 500))
-        self.assertEqual(fitted(0.45, self.LAPTOP, 2000)[1], 691)
+        self.assertAlmostEqual(max(self.screen(window_size(self.PIXEL, 0, self.LAPTOP, 500))), 500, delta=2)
+        self.assertLessEqual(window_size(self.PIXEL, 0, self.LAPTOP, 2000)[1], 768 * 0.9)
 
-    def test_the_bezel_above_and_the_chin_below(self):
-        width, height = window_size(1080 / 2400, self.LAPTOP)
-        self.assertEqual((width, height - FRAME), fitted(1080 / 2400, (1366, 768 - FRAME)))
-        self.assertLessEqual(height, 768)
+    def test_the_rim_round_its_screen_and_its_options_above(self):
+        w, h = window_size(self.PIXEL, 0, self.LAPTOP, 500)
+        sw, sh = self.screen((w, h))
+        self.assertAlmostEqual(w - sw, 2 * bodies.RIM, delta=1)  # a hairline of rim either side
+        self.assertGreater(h - sh, CONTROLS)
 
     def test_a_big_monitor(self):
-        w, h = fitted(0.45, (3840, 2160))
-        self.assertEqual(h, 1944)
+        self.assertLessEqual(window_size(self.PIXEL, 0, (3840, 2160))[1], 1944)
 
 
 if __name__ == "__main__":
