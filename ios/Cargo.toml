@@ -1,6 +1,6 @@
 [package]
 name = "handset-ios"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Handset's iPhone helper: the phone's screen as HEVC on stdout, touches and keys on stdin"
 license = "GPL-3.0-or-later"

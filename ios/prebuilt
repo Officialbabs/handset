@@ -3,4 +3,4 @@
 # its SHA-256 here, where the computer's C library is at least glibc LEAST. Any other machine or
 # source builds it.
 # MACHINE SOURCE SHA256 LEAST URL
-x86_64 2f127050e7f02da9d4af88c2bc4eeaadc4f0b9b5dd93aa2bfa77fde0a47d15f2 e36b7b7ea360e478b5568a781322c0bba5db27779aeb0dc0e5cb4886b02db466 2.34 https://github.com/Officialbabs/handset/releases/download/v0.1.0/handset-ios-x86_64-linux
+x86_64 c987d4d3351fd0beaa7e02a23a5db1768cda673b9b354770a0ae72048360fd91 312a00c4927e2831dae3ec3a76ce6af228374cadcf470b3ffd24a75eddc772b9 2.34 https://github.com/Officialbabs/handset/releases/download/v0.2.0/handset-ios-x86_64-linux
