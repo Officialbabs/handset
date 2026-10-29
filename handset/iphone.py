@@ -688,6 +688,15 @@ class FilesSession:
     PHOTOS_SHORTCUT = "Handset Import"
     PHOTOS_URL = "shortcuts://run-shortcut?name=Handset%20Import"
     PHOTOS_WAIT_S = 60
+    # An iPhone that drops off Wi-Fi mid-command never answers it, and the phone's folder here
+    # (phonefs.py) waits on these answers, and with it whatever is looking at the folder: the
+    # desk's own shell, which is restarted after half a minute unanswered (seen 29 Oct, nine
+    # times in an afternoon). So a command not answered in time fails and its helper is ended,
+    # and for a while after, commands fail at once rather than each waiting its own time.
+    ANSWER_WITHIN_S = 12
+    LONG_OPS = ("fetch", "send", "find", "sharing")  # a file's worth, or the whole phone's
+    LONG_ANSWER_WITHIN_S = 600
+    QUIET_FOR_S = 30
 
     def __init__(self, link: Link):
         self.link = link
@@ -697,6 +706,7 @@ class FilesSession:
         self.was: str | None = UNSAID
         self.process: subprocess.Popen | None = None
         self.lock = threading.Lock()
+        self.quiet_until = 0.0  # the phone didn't answer: commands fail at once until then
         self._sharing: dict[str, str] | None = None
 
     def sharing(self) -> dict[str, str]:
@@ -830,6 +840,8 @@ class FilesSession:
     def _ask(self, command: dict) -> dict | str:
         """One command's answer, or why there's none, in words."""
         with self.lock:
+            if time.monotonic() < self.quiet_until:
+                return plainly("The iPhone didn't answer.")
             if not self.process or self.process.poll() is not None:
                 started = self.link.args("files")
                 if self.link.address:
@@ -839,6 +851,11 @@ class FilesSession:
                                                     stderr=subprocess.PIPE)
                 except OSError as error:
                     return str(error)
+            within = self.LONG_ANSWER_WITHIN_S if command.get("op") in self.LONG_OPS else self.ANSWER_WITHIN_S
+            late = threading.Event()
+            watchdog = threading.Timer(within, self._too_late, args=(self.process, late))
+            watchdog.daemon = True
+            watchdog.start()
             try:
                 self.process.stdin.write((json.dumps(command) + "\n").encode())
                 self.process.stdin.flush()
@@ -854,6 +871,22 @@ class FilesSession:
                         debug("iphone files helper:", line.decode(errors="replace").strip())
             except OSError as error:
                 return str(error)
+            finally:
+                watchdog.cancel()
+            if late.is_set():
+                debug("iphone files helper: no answer to", command.get("op"), "in", within, "s; ended")
+                gone, self.process = self.process, None
+                try:
+                    gone.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                for pipe in (gone.stdin, gone.stdout, gone.stderr):
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+                self.quiet_until = time.monotonic() + self.QUIET_FOR_S
+                return plainly("The iPhone didn't answer.")
             if answer is None:
                 why = self.process.stderr.read().decode(errors="replace") if self.process.poll() is not None else ""
                 message = next((json.loads(l).get("message") for l in why.splitlines()
@@ -863,6 +896,15 @@ class FilesSession:
             if answer.get("event") == "error":
                 return str(answer.get("message") or "It didn't work.")
             return answer
+
+    @staticmethod
+    def _too_late(process: subprocess.Popen, late: threading.Event):
+        """A command's time is up: its helper ended, which ends the wait for its answer."""
+        late.set()
+        try:
+            process.kill()
+        except OSError:
+            pass
 
     def list_folder(self, folder: str, hidden: bool = False) -> list | str:
         from .android import PhoneFile

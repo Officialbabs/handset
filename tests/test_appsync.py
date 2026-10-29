@@ -3,8 +3,10 @@ service and adb, in folders of the test's own."""
 
 import os
 import tempfile
+import threading
 import time
 import unittest
+from types import SimpleNamespace
 
 from gi.repository import GLib
 
@@ -215,3 +217,64 @@ class IPhoneNotificationsTest(unittest.TestCase):
             self.assertEqual(asked[-1], False)
         finally:
             appsync.AWAY_FOR_S = saved
+
+
+class Folder:
+    """A phone's folder here, as far as the sync sees it."""
+
+    def __init__(self):
+        self.stopped = threading.Event()
+
+    def stop(self):
+        self.stopped.set()
+
+
+class FolderGraceTest(unittest.TestCase):
+    """A phone's folder outlasts a moment out of reach, and goes when the phone stays gone."""
+
+    def setUp(self):
+        saved = appsync.FOLDER_STAYS_S, appsync.phone_files_wanted
+        self.addCleanup(lambda: setattr(appsync, "FOLDER_STAYS_S", saved[0]))
+        self.addCleanup(lambda: setattr(appsync, "phone_files_wanted", saved[1]))
+        appsync.FOLDER_STAYS_S = 1
+        self.switched_on = True
+        appsync.phone_files_wanted = lambda: self.switched_on
+        self.sync = appsync.AppSync.__new__(appsync.AppSync)
+        self.sync.mounting, self.sync.leaving = set(), {}
+        self.asked = []
+        self.sync._mount = self.asked.append
+        self.folder = Folder()
+        self.sync.mounts, self.sync.mounted_at = {"P": self.folder}, {"P": "192.168.18.10"}
+
+    def changed(self, online: bool, address: str = "192.168.18.10"):
+        phones = [SimpleNamespace(id="P", online=online, problem=None, address=address)]
+        self.sync.phones_now = phones
+        self.sync._mount_phones(phones)
+
+    def test_a_moment_out_of_reach_keeps_it(self):
+        self.changed(False)
+        self.changed(True)
+        end = time.monotonic() + 2.5
+        while time.monotonic() < end:
+            GLib.MainContext.default().iteration(False)
+            time.sleep(0.01)
+        self.assertFalse(self.folder.stopped.is_set())
+        self.assertIn("P", self.sync.mounts)
+        self.assertEqual(self.asked, [])  # not mounted again
+
+    def test_gone_for_good_takes_it_away(self):
+        self.changed(False)
+        self.assertFalse(self.folder.stopped.is_set())  # not at once
+        spin(self.folder.stopped.is_set, seconds=5)
+        self.assertNotIn("P", self.sync.mounts)
+
+    def test_back_somewhere_else_it_follows(self):
+        self.changed(False)
+        self.changed(True, address="192.168.18.44")
+        spin(lambda: self.folder.stopped.is_set() and self.asked, seconds=5)
+        self.assertEqual([p.address for p in self.asked], ["192.168.18.44"])
+
+    def test_switched_off_at_once(self):
+        self.switched_on = False
+        self.changed(True)
+        spin(self.folder.stopped.is_set, seconds=2)

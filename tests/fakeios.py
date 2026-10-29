@@ -132,6 +132,8 @@ def files():
                                                                   if os.path.isdir(os.path.join(shared, b))]}),
                       flush=True)
                 continue
+            if op == "list" and os.path.exists(os.path.join(HERE, "hang")):
+                time.sleep(3600)  # FAKEIOS_DIR/hang: an iPhone gone from Wi-Fi mid-command
             if op == "list":
                 entries = [{"name": n, "folder": os.path.isdir(os.path.join(here, n)),
                             "size": os.path.getsize(os.path.join(here, n)),

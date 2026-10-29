@@ -43,6 +43,9 @@ ICON_BATCH = 12
 AWAY_FOR_S = 60
 ICON_SIZE = 192
 ENTRY_RETENTION_S = 24 * 3600  # a gone phone's menu entries linger this long before they go
+# A phone's folder stays this long after the phone drops out, for a flaky Wi-Fi link that's back
+# in seconds: remounting each time left abandoned mounts behind (29 Oct, six in an afternoon).
+FOLDER_STAYS_S = 60
 
 
 def last_seen_path() -> str:
@@ -160,6 +163,8 @@ class AppSync:
         self.search = None  # the phones' files in the desktop's search (phonesearch.PhoneSearch)
         self.reconnect = None  # Android phones connected again over Wi-Fi (adbwifi.WifiReconnect)
         self.mounting: set[str] = set()
+        self.leaving: dict[str, int] = {}  # a phone's id → the timer that takes its folder away
+        self.mounted_at: dict[str, str | None] = {}  # a phone's id → its address when its folder came
         self.phones_now: list[Phone] = []
         self.phone_names: dict[str, str] = {}
         self.online: dict[str, Phone] = {}
@@ -181,6 +186,9 @@ class AppSync:
             self.autopause.stop()
         for player in self.players.values():
             player.stop()
+        for timer in self.leaving.values():
+            GLib.source_remove(timer)
+        self.leaving = {}
         for mounted in self.mounts.values():
             mounted.stop()
         self.mounts = {}
@@ -422,16 +430,44 @@ class AppSync:
 
     def _mount_phones(self, phones: list[Phone]):
         """Each connected phone's files as a folder here (~/Phones/NAME), while it's connected."""
-        from .finder import UNTRUSTED
-
-        # Connected (a phone's service may say more of it: not on Wi-Fi, say), and trusting this computer.
-        wanted = {p.id: p for p in phones if p.online and p.problem != UNTRUSTED} if phone_files_wanted() else {}
+        switched_on = phone_files_wanted()
+        wanted = self._folders_wanted(phones) if switched_on else {}
         for phone_id in [p for p in self.mounts if p not in wanted]:
-            threading.Thread(target=self.mounts.pop(phone_id).stop, daemon=True).start()
+            if not switched_on:
+                self._unmount(phone_id)
+            elif phone_id not in self.leaving:
+                self.leaving[phone_id] = GLib.timeout_add_seconds(FOLDER_STAYS_S, self._folder_gone, phone_id)
+        for phone_id in [p for p in self.leaving if p in wanted]:
+            GLib.source_remove(self.leaving.pop(phone_id))  # back in time: its folder never went
+            if wanted[phone_id].address != self.mounted_at.get(phone_id):
+                self._unmount(phone_id)  # back somewhere else: the folder follows it there
         for phone in wanted.values():
             if phone.id not in self.mounts and phone.id not in self.mounting:
                 self.mounting.add(phone.id)
                 threading.Thread(target=self._mount, args=(phone,), daemon=True).start()
+
+    @staticmethod
+    def _folders_wanted(phones: list[Phone]) -> dict[str, Phone]:
+        """The phones whose folders belong here: connected (a phone's service may say more of
+        it: not on Wi-Fi, say), and trusting this computer."""
+        from .finder import UNTRUSTED
+
+        return {p.id: p for p in phones if p.online and p.problem != UNTRUSTED}
+
+    def _folder_gone(self, phone_id: str):
+        """A phone out of reach its whole grace: its folder taken away, unless it's back."""
+        self.leaving.pop(phone_id, None)
+        if phone_id not in self._folders_wanted(self.phones_now) or not phone_files_wanted():
+            self._unmount(phone_id)
+        return GLib.SOURCE_REMOVE
+
+    def _unmount(self, phone_id: str):
+        timer = self.leaving.pop(phone_id, None)
+        if timer:
+            GLib.source_remove(timer)
+        mounted = self.mounts.pop(phone_id, None)
+        if mounted:
+            threading.Thread(target=mounted.stop, daemon=True).start()
 
     def _mount(self, phone: Phone):
         from . import android, iphone, phonefs
@@ -464,6 +500,7 @@ class AppSync:
             threading.Thread(target=mounted.stop, daemon=True).start()
         else:
             self.mounts[phone_id] = mounted
+            self.mounted_at[phone_id] = self.online[phone_id].address
             if self.search:
                 self.search.phone_here(phone_id)
         return GLib.SOURCE_REMOVE

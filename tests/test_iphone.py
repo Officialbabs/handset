@@ -272,6 +272,25 @@ class FakeHelper(unittest.TestCase):
         finally:
             session.stop()
 
+    def test_a_phone_that_stops_answering(self):
+        os.makedirs(os.path.join(self.tmp.name, "media", "DCIM"))
+        with open(os.path.join(self.tmp.name, "hang"), "w"):
+            pass
+        session = FilesSession(Link("UDID-1", "/p.rppairing", "192.168.18.10", FAKE_HELPER))
+        session.ANSWER_WITHIN_S, session.QUIET_FOR_S = 1, 2
+        try:
+            began = time.monotonic()
+            self.assertIsInstance(session.list_folder("/"), str)  # an answer in words, in time
+            self.assertLess(time.monotonic() - began, 5)
+            began = time.monotonic()
+            self.assertIsInstance(session.list_folder("/"), str)  # at once, while it's quiet
+            self.assertLess(time.monotonic() - began, 0.5)
+            os.unlink(os.path.join(self.tmp.name, "hang"))
+            time.sleep(2.1)
+            self.assertEqual([f.name for f in session.list_folder("/")], ["DCIM"])  # back: a new helper
+        finally:
+            session.stop()
+
     def test_apps_that_share_their_files(self):
         from handset import apps
         from handset.apps import PhoneApp

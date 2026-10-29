@@ -5,6 +5,7 @@ listing, reading, writing, saving through a hidden file, renaming, and the mount
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 
@@ -138,6 +139,50 @@ class MountedTest(unittest.TestCase):
             time.sleep(0.1)
         self.assertFalse(os.path.exists(self.mounted))  # its folder gone too
         self.assertTrue(self.phone.stopped)
+
+
+class SilentPhone(FolderPhone):
+    """A phone gone quiet mid-listing: its listings never come back until `release` is set."""
+
+    def __init__(self, top: str):
+        super().__init__(top)
+        self.release = threading.Event()
+
+    def listing(self, path):
+        self.calls.append("list " + path)
+        self.release.wait()
+        return "gone"
+
+
+@unittest.skipUnless(os.path.exists("/dev/fuse") and shutil.which("fusermount3"), "no FUSE here")
+class SilentPhoneTest(unittest.TestCase):
+    def test_whoever_waits_on_it_wakes_when_it_goes(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        phone = SilentPhone(tmp.name)
+        self.addCleanup(phone.release.set)
+        mounted = os.path.join(tmp.name, "Phones", "Quiet Phone")
+        fs = FileSystem(phone, mounted, os.path.join(tmp.name, "cache"))
+        self.assertIsNone(fs.start())
+        self.assertIsNotNone(fs.connection)
+        woke = []
+
+        def look():
+            try:
+                os.listdir(os.path.join(mounted, "DCIM"))
+            except OSError as error:
+                woke.append(error.errno)
+
+        waiter = threading.Thread(target=look, daemon=True)
+        waiter.start()
+        deadline = time.monotonic() + 5
+        while not phone.calls and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(phone.calls)  # the look is now waiting on the phone
+        fs.stop()
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())  # woken by the mount going, not left asleep
+        self.assertEqual(len(woke), 1)
 
 
 if __name__ == "__main__":

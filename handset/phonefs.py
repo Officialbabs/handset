@@ -243,6 +243,7 @@ class FileSystem:
         self.mountpoint = mountpoint
         self.cache = cache  # where opened files are kept here
         self.fd: int | None = None
+        self.connection: str | None = None  # the kernel's number for this mount (fusectl)
         self.channel: socket.socket | None = None  # to fusermount3: closing it unmounts
         self.helper: subprocess.Popen | None = None
         self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="phonefs")
@@ -291,6 +292,7 @@ class FileSystem:
             ours.close()
             return f"the phone's folder couldn't be mounted ({said or 'no answer'})"
         self.fd = struct.unpack("i", ancillary[0][2][:4])[0]
+        self.connection = connection_of(self.mountpoint)
         ours.settimeout(None)
         self.channel = ours  # auto_unmount: when it closes, fusermount3 unmounts
         threading.Thread(target=self._serve, daemon=True, name="phonefs").start()
@@ -321,11 +323,19 @@ class FileSystem:
     # ---- The kernel's requests ----------------------------------------------------------------
 
     def _sever(self):
-        """The kernel connection, cut. Closing /dev/fuse wakes everything waiting on this mount
-        with an error instead of leaving it asleep for good, and closing the channel has
-        fusermount3 (auto_unmount) take the mountpoint away. Safe to call twice."""
+        """The kernel connection, cut, which wakes everything waiting on this mount with an error
+        instead of leaving it asleep for good, and closing the channel has fusermount3
+        (auto_unmount) take the mountpoint away. Safe to call twice.
+
+        Closing /dev/fuse alone doesn't cut it while _serve is inside a read of it: the kernel
+        ends a connection at the last release, and a read in progress holds the file. Requests
+        already handed to the pool then wait for good (seen 29 Oct: six abandoned iPhone mounts
+        holding ten, the desk's shell among the waiters). fusectl's abort cuts it outright; it
+        comes first, while the descriptor still holds the connection, so its number can't yet
+        belong to another mount."""
         fd, self.fd = self.fd, None
         if fd is not None:
+            abort_connection(self.connection)
             try:
                 os.close(fd)
             except OSError:
@@ -721,6 +731,33 @@ def unmount(mountpoint: str):
         pass
     subprocess.run(["fusermount3", "-u", "-z", mountpoint], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, timeout=10)
+
+
+def connection_of(mountpoint: str) -> str | None:
+    """The kernel's number for the FUSE mount at `mountpoint` (its device's minor, as fusectl
+    names it under /sys/fs/fuse/connections), from mountinfo; None if it isn't mounted."""
+    escaped = mountpoint.replace("\\", "\\134").replace(" ", "\\040").replace("\t", "\\011").replace("\n", "\\012")
+    found = None
+    try:
+        with open("/proc/self/mountinfo") as file:
+            for line in file:
+                fields = line.split(" ")
+                if len(fields) > 4 and fields[4] == escaped:
+                    found = fields[2].split(":")[1]  # the last mount there is the one on top
+    except OSError:
+        return None
+    return found
+
+
+def abort_connection(connection: str | None):
+    """A FUSE connection cut through fusectl: everything waiting on it wakes with an error."""
+    if not connection:
+        return
+    try:
+        with open(f"/sys/fs/fuse/connections/{connection}/abort", "w") as file:
+            file.write("1")
+    except OSError:
+        pass  # gone already, or fusectl isn't mounted: closing the descriptor is what's left
 
 
 def phones_folder() -> str:
