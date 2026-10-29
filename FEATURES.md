@@ -401,6 +401,9 @@ Notifications can be switched off in Phones and Settings.
 - **How it works:** Handset's own FUSE file system, over the phone's existing link, so it works the
   same by cable or Wi-Fi. A file is fetched when it's opened and cached for a day; a file written
   to the folder is sent to the phone when it's closed.
+- **A phone that drops out:** its folder stays for a minute, so a moment off Wi-Fi doesn't take it
+  away. While the phone doesn't answer, looking in the folder gets an error within seconds (12 s
+  at most for an iPhone), never a wait that freezes the app or the desktop doing the looking.
 - **Access:** **Open in Files** on the phone's page. The folder can be switched off with Phone Files
   in the File Manager.
 
