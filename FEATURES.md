@@ -411,6 +411,10 @@ Notifications can be switched off in Phones and Settings.
 
 - **Searching:** files and folders on connected phones appear in the desktop's search results by
   name, each showing its phone and folder. Picking one opens it in its default app.
+- **A phone away:** one that's dropped off Wi-Fi or is out of reach is still searched, in the
+  index kept from when it was here; its results say "(not connected)". Picking one says it will
+  open when the phone is back, and opens it by itself once the phone's folder returns (within two
+  minutes). Phones switched off in Handset aren't searched.
 - **Indexing:** searches never wait for a phone, because results come from an index Handset keeps.
   The index is built when the phone connects (unless the one kept from before is under 30
   minutes old), and made again when a search finds it older than that: the phone is left alone
