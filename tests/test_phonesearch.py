@@ -146,6 +146,31 @@ class SearchTest(Phones):
         self.assertEqual(self.search.search(["scan"]), [])
         self.assertEqual(self.search.metas(["iphone\n/On My iPhone/VLC/Invoice scan.pdf"]), [])
 
+    def test_a_phone_away_a_moment_is_searched_in_its_kept_index(self):
+        known = {"pixel": "Pixel 7", "iphone": "My iPhone"}
+        wanted = []
+        away = PhoneSearch(lambda: {phone_id: (name, folder, lambda p=phone_id: self.listed[p])
+                                    for phone_id, (name, folder) in self.here.items()},
+                           lambda: wanted.append(1), lambda: known)
+        del self.here["iphone"]  # its index was kept on disk when it was here (setUp)
+        found = away.search(["scan"])
+        self.assertEqual(found, ["iphone\n/On My iPhone/VLC/Invoice scan.pdf"])
+        shown = {k: v.unpack() for k, v in away.metas(found)[0].items()}
+        self.assertEqual(shown["description"], "My iPhone (not connected) › On My iPhone › VLC")
+        with mock.patch.object(phonesearch, "open_here") as opened, mock.patch.object(away, "tell") as told:
+            away.activate(found[0])
+            self.assertEqual(opened.call_count, 0)  # nothing to open yet
+            self.assertEqual(told.call_count, 1)
+            self.assertIn(1, wanted)
+            self.here["iphone"] = ("My iPhone", "/home/me/Phones/My iPhone")
+            away.phone_here("iphone")  # back: the result opens
+            self.assertTrue(spin(lambda: opened.call_count == 1))
+        self.assertEqual(opened.call_args.args, ("/home/me/Phones/My iPhone/On My iPhone/VLC/Invoice scan.pdf", False))
+        self.assertEqual(away.waiting, {})
+        del known["iphone"]  # forgotten (or files switched off): not searched
+        del self.here["iphone"]
+        self.assertEqual(away.search(["scan"]), [])
+
     def test_the_index_kept_for_next_time(self):
         again = PhoneSearch(lambda: {"pixel": ("Pixel 7", "/x", lambda: None)})  # the phone doesn't answer now
         again.phone_here("pixel")

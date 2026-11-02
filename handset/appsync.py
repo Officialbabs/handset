@@ -522,6 +522,17 @@ class AppSync:
                            lister(mounted.phone))
                 for phone_id, mounted in self.mounts.items()}
 
+    def searchable_away(self) -> dict[str, str]:
+        """Every phone known here whose files may be searched, connected or not: id → name;
+        none while the phones' folders are switched off, nor one switched off in Handset or not
+        trusting this computer (its folder wouldn't come back by itself)."""
+        from .finder import UNTRUSTED
+        from .service import DISCONNECTED
+
+        if not phone_files_wanted():
+            return {}
+        return {phone.id: phone.name for phone in self.phones_now if phone.problem not in (DISCONNECTED, UNTRUSTED)}
+
     def _phone_entries(self, phones: list[Phone]):
         """Each phone an entry of its own, opening its window (so the dock shows each under its own
         icon); a phone the service no longer knows goes."""
@@ -755,7 +766,7 @@ def main() -> int:
     sync.start()
     from .phonesearch import PhoneSearch
 
-    sync.search = PhoneSearch(sync.searchable, lambda: sync.reconnect and sync.reconnect.now())
+    sync.search = PhoneSearch(sync.searchable, lambda: sync.reconnect and sync.reconnect.now(), sync.searchable_away)
     sync.search.start()
     from .adbwifi import WifiReconnect
 

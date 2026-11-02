@@ -5,7 +5,9 @@ A search never waits on a phone: it looks through an index of names kept here, m
 phone for its whole storage at once (an Android phone's `find`, the iPhone helper's walk) when its
 folder first comes (phonefs.py), and again only when it's searched and its index has grown old:
 the phone is left alone meanwhile. A result opens from that
-folder, in the app that opens its kind of file (the file fetched as it's opened).
+folder, in the app that opens its kind of file (the file fetched as it's opened). A phone away is
+searched too, in the index kept from when it was here: its results say it's not connected, and
+one opened opens once its folder is back.
 
 The sync serves it, under a bus name of its own (install.sh tells the desktop which).
 """
@@ -30,6 +32,8 @@ BUS_NAME = APP_ID + ".Sync"
 PATH = "/io/github/Officialbabs/Handset/SearchProvider"
 LIMIT = 10
 INDEX_EVERY_S = 30 * 60  # an index this old is made again, when the phones are searched
+# A result opened while its phone is away opens when the phone's folder is back, within this long.
+OPEN_WHEN_BACK_S = 120
 IPHONE_MOST = 100_000  # names asked of an iPhone, at most, for each place
 
 XML = """
@@ -230,9 +234,14 @@ class PhoneSearch:
     function answering [Found] or None when the phone didn't)."""
 
     def __init__(self, phones: Callable[[], dict[str, tuple[str, str, Callable[[], list[Found] | None]]]],
-                 wanted: Callable[[], None] | None = None):
+                 wanted: Callable[[], None] | None = None, known: Callable[[], dict[str, str]] | None = None):
         self.phones = phones
         self.wanted = wanted  # a search came: phones not connected now are wanted (adbwifi)
+        # Every phone Handset knows, here or not: its id → its name. One away a moment (a flaky
+        # Wi-Fi link, a phone across the room) is searched in the index kept from when it was
+        # here; its results say so, and one opened opens once the phone is back.
+        self.known = known
+        self.waiting: dict[str, tuple[str, float]] = {}  # an away phone → a result to open, since when
         self.indexes: dict[str, Index] = {}
         self.indexing: set[str] = set()
         self.bus: Gio.DBusConnection | None = None
@@ -261,11 +270,24 @@ class PhoneSearch:
     def phone_here(self, phone_id: str):
         """A phone's folder came: its index from before, at once; one made if there's none, or
         it's old."""
+        self._kept(phone_id)
+        self.freshen(phone_id)
+        identifier, since = self.waiting.pop(phone_id, ("", 0.0))
+        if identifier and time.monotonic() - since < OPEN_WHEN_BACK_S:
+            GLib.idle_add(self.activate, identifier)
+
+    def _kept(self, phone_id: str) -> Index | None:
+        """A phone's index, read from where it was kept if it isn't in memory yet."""
         if phone_id not in self.indexes:
             found, made = load_index(phone_id)
             if found:
                 self.indexes[phone_id] = Index(found, made)
-        self.freshen(phone_id)
+        return self.indexes.get(phone_id)
+
+    def _away(self, here: dict) -> dict[str, str]:
+        """The phones known but not here now: id → name."""
+        return {phone_id: name for phone_id, name in (self.known() if self.known else {}).items()
+                if phone_id not in here}
 
     def freshen(self, phone_id: str):
         index = self.indexes.get(phone_id)
@@ -306,25 +328,37 @@ class PhoneSearch:
         if self.wanted:
             self.wanted()  # one away answers the next searches, once it's back
         hits = []
-        for phone_id in self.phones():
+        here = self.phones()
+        for phone_id in here:
             self.freshen(phone_id)  # for the next search: this one answers from the index as it is
             index = self.indexes.get(phone_id)
+            if index:
+                hits += [(points, found, phone_id) for points, found in index.search(terms)]
+        for phone_id in self._away(here):
+            index = self._kept(phone_id)
             if index:
                 hits += [(points, found, phone_id) for points, found in index.search(terms)]
         # Surest first, then files before folders, newest first.
         hits.sort(key=lambda hit: (-hit[0], hit[1].folder, -hit[1].modified))
         return [result_id(phone_id, found.path) for _points, found, phone_id in hits[:LIMIT]]
 
-    def _found(self, identifier: str) -> tuple[str, str, Found] | None:
-        """A result's phone's name, its folder here and what it is, while that phone is here
-        (only what was offered: anything on the bus can ask)."""
+    def _found(self, identifier: str) -> tuple[str, str | None, Found] | None:
+        """A result's phone's name, its folder here (None while the phone is away) and what it
+        is (only what was offered: anything on the bus can ask)."""
         phone_id, path = split_id(identifier)
-        phone = self.phones().get(phone_id)
+        here = self.phones()
+        if phone_id in here:
+            name, folder = here[phone_id][0], here[phone_id][1]
+        else:
+            away = self._away(here)
+            if phone_id not in away:
+                return None
+            name, folder = away[phone_id], None
         index = self.indexes.get(phone_id)
         found = index.by_path.get(path) if index else None
-        if not phone or not found:
+        if not found:
             return None
-        return phone[0], phone[1], found
+        return name, folder, found
 
     def metas(self, identifiers: list[str]) -> list[dict]:
         metas = []
@@ -332,22 +366,42 @@ class PhoneSearch:
             known = self._found(identifier)
             if not known:
                 continue
-            name, _folder, found = known
+            name, folder, found = known
             where = [part for part in found.path.split("/")[:-1] if part]
+            phone = name if folder else f"{name} (not connected)"
             metas.append({
                 "id": GLib.Variant("s", identifier),
                 "name": GLib.Variant("s", found.name),
-                "description": GLib.Variant("s", " › ".join([name] + where)),
+                "description": GLib.Variant("s", " › ".join([phone] + where)),
                 "gicon": GLib.Variant("s", icon_for(found)),
             })
         return metas
 
     def activate(self, identifier: str):
         known = self._found(identifier)
-        if known:
-            _name, folder, found = known
+        if not known:
+            return GLib.SOURCE_REMOVE
+        name, folder, found = known
+        if folder:
             open_here(os.path.join(folder, found.path.lstrip("/")), found.folder)
+            return GLib.SOURCE_REMOVE
+        phone_id, _path = split_id(identifier)
+        self.waiting[phone_id] = (identifier, time.monotonic())
+        if self.wanted:
+            self.wanted()
+        self.tell(f"{found.name} opens when {name} is connected again",
+                  "It opens by itself as soon as the phone is back on this computer's Wi-Fi or cable.")
         return GLib.SOURCE_REMOVE
+
+    def tell(self, summary: str, body: str):
+        """A desktop notification, Handset's."""
+        if not self.bus:
+            return
+        self.bus.call("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                      "org.freedesktop.Notifications", "Notify",
+                      GLib.Variant("(susssasa{sv}i)", ("Handset", 0, APP_ID, summary, body, [],
+                                                        {"desktop-entry": GLib.Variant("s", APP_ID)}, 8000)),
+                      None, Gio.DBusCallFlags.NONE, -1, None, None, None)
 
     def launch_search(self):
         """The search's own page: the phones' folders, in the file manager."""
