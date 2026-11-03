@@ -357,20 +357,23 @@ def clipboard_server(port, options):
 
 def media_watch():
     """The loop that watches the media sessions: `media_session` (lines as dumpsys gives them),
-    said with the phone's uptime first, again each time the file changes; never-ending."""
+    said with the phone's uptime first, again each time the file changes, and anyway every 10
+    looks (as the phone's does every 8); never-ending."""
     path = os.path.join(HERE, "media_session")
     said = None
+    looks = 0
     while True:
         try:
             with open(path) as file:
                 lines = file.read()
         except OSError:
             lines = ""
-        if lines != said:
+        looks += 1
+        if lines != said or looks >= 10:
             print(f"{time.monotonic():.2f} 1.00")
             print(lines.rstrip("\n"))
             print("--", flush=True)
-            said = lines
+            said, looks = lines, 0
         time.sleep(0.05)
 
 

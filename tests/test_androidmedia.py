@@ -4,10 +4,15 @@ playing a phone whose sessions change."""
 
 import base64
 import json
+import math
 import os
+import re
+import subprocess
 import tempfile
+import threading
 import time
 import unittest
+import zipfile
 
 from gi.repository import GLib
 
@@ -108,6 +113,32 @@ class HelperWordsTest(unittest.TestCase):
         self.assertFalse(helped(dict(event, actions=0x37), time.monotonic()).can_seek)  # no SEEK_TO
         self.assertIsNone(helped({"event": "none"}, time.monotonic()))
 
+    def test_the_helper_leaves_a_long_paused_session_off_too(self):
+        """The helper (android/HandsetMedia.java, data/handset-media.jar built from it) chooses a
+        paused session only while it's been paused less than the shell's view keeps one
+        (PAUSED_FOR_S): an app leaving its session paused doesn't stay on the desk for good."""
+        with open(os.path.join(os.path.dirname(HERE), "android", "HandsetMedia.java")) as file:
+            source = file.read()
+        limit = re.search(r"long PAUSED_FOR_MS = ([\d *]+);", source)
+        self.assertIsNotNone(limit, "the helper keeps paused sessions with no limit")
+        self.assertEqual(math.prod(int(part) for part in limit[1].split("*")), androidmedia.PAUSED_FOR_S * 1000)
+        self.assertIn('getLastPositionUpdateTime") < PAUSED_FOR_MS', source)  # what a paused one's chosen by
+        # One left off still looked at every POLL_MS where sessions don't say what changes, and
+        # worked all the same with none shown (auto-pause playing it again, paused longer than that).
+        self.assertIn("((current == null && leftOff == null) || !heard.isEmpty())", source)
+        self.assertIn("Object controller = current != null ? current : leftOff;", source)
+        # Left off: the one paused too long, if it's the one shown till then (auto-pause's, not
+        # another app's paused long ago), and said so.
+        self.assertIn("leftOff = chosen == null ? left : null;", source)
+        self.assertRegex(source, r'else if \(left == null && shown != null && shown\.equals\(call\(controller, '
+                                 r'"asBinder"\)\)\) \{(\s*//[^\n]*)*\s*left = controller;')
+        self.assertRegex(source, r'if \(chosen != null\) \{\s*shown = call\(chosen, "asBinder"\);')
+        self.assertIn(r'leftOff == null ? "{\"event\":\"none\"}" : "{\"event\":\"none\",\"left_off\":true}"', source)
+        with zipfile.ZipFile(androidmedia.HELPER) as jar:  # what the phone runs: built from that source
+            dex = jar.read("classes.dex")
+        for name in (b"PAUSED_FOR_MS", b"leftOff", b"shown", b"left_off"):
+            self.assertTrue(name in dex, f"data/handset-media.jar isn't rebuilt from it (no {name.decode()})")
+
 
 class FollowTest(unittest.TestCase):
     def setUp(self):
@@ -183,6 +214,81 @@ class FollowTest(unittest.TestCase):
         self.assertTrue(self.wait(lambda: ["shell", "cmd media_session dispatch pause"] in self.asked()))
         self.write("media_session", dump(state=1, name="STOPPED"))
         self.assertTrue(self.wait(lambda: self.shown[-1] is None))
+
+    def test_a_session_left_paused_goes(self):
+        """A session left paused, its lines unchanged on the shell's view, goes from the desk once
+        it's been paused PAUSED_FOR_S: the phone's loop says them again now and then."""
+        saved = androidmedia.PAUSED_FOR_S
+        androidmedia.PAUSED_FOR_S = 1
+        self.addCleanup(lambda: setattr(androidmedia, "PAUSED_FOR_S", saved))
+        self.write("media_session", dump())
+        self.follower.start()
+        self.assertTrue(self.wait(lambda: self.shown and self.shown[-1] is not None))
+        # Paused now (fakeadb's uptime is this clock).
+        self.write("media_session", dump(state=2, name="PAUSED", updated=round(time.monotonic() * 1000)))
+        self.assertTrue(self.wait(lambda: self.shown[-1] is not None and not self.shown[-1].playing))
+        self.assertTrue(self.wait(lambda: self.shown[-1] is None, 5))
+
+    def test_left_off_only_the_session_it_showed(self):
+        """Showing nothing on the shell's view, the phone's session is left off only for its age
+        (auto-pause's play plays it again) while it's the one shown last, paused still: not
+        another app's paused long ago, nor the one shown once it's stopped."""
+        saved = androidmedia.PAUSED_FOR_S
+        androidmedia.PAUSED_FOR_S = 1
+        self.addCleanup(lambda: setattr(androidmedia, "PAUSED_FOR_S", saved))
+        self.write("media_session", dump())
+        self.follower.start()
+        self.assertTrue(self.wait(lambda: self.shown and self.shown[-1] is not None))
+        self.write("media_session", dump(state=2, name="PAUSED", updated=round(time.monotonic() * 1000)))
+        self.assertTrue(self.wait(lambda: self.shown[-1] is None, 5))
+        self.assertTrue(self.follower.left_off)
+        long_ago = round((time.monotonic() - 60) * 1000)
+        self.write("media_session", dump(state=2, name="PAUSED", updated=long_ago).replace(MUSIC, "org.example.talk"))
+        self.assertTrue(self.wait(lambda: not self.follower.left_off))  # another app's
+        self.write("media_session", dump(state=2, name="PAUSED", updated=long_ago))
+        self.assertTrue(self.wait(lambda: self.follower.left_off))
+        self.write("media_session", dump(state=1, name="STOPPED"))
+        self.assertTrue(self.wait(lambda: not self.follower.left_off))  # stopped
+        self.assertEqual(self.shown[-1], None)
+
+    def test_left_off_as_the_helper_says(self):
+        """Through the helper, which knows which session it showed: left off only when it says so."""
+        self.write("media_helper.jsonl", json.dumps({"event": "none", "left_off": True}) + "\n")
+        self.follower.start()
+        self.assertTrue(self.wait(lambda: self.follower.left_off))
+        self.write("media_helper.jsonl", json.dumps({"event": "none"}) + "\n")
+        self.assertTrue(self.wait(lambda: not self.follower.left_off))
+
+    def test_the_phones_loop_says_the_sessions_again_anyway(self):
+        """The loop on the phone (WATCH) says the sessions' lines again though they're unchanged:
+        run here, a stand-in for dumpsys giving them, its looks quick."""
+        tools = os.path.join(self.tmp.name, "bin")
+        os.mkdir(tools)
+        self.write("media_session", dump(state=2, name="PAUSED"))
+        with open(os.path.join(tools, "dumpsys"), "w") as file:
+            file.write(f"#!/bin/sh\ncat '{os.path.join(self.tmp.name, 'media_session')}'\n")
+        os.chmod(os.path.join(tools, "dumpsys"), 0o755)
+        watch = re.sub(r"sleep \d+", "sleep 0.01", androidmedia.WATCH)
+        process = subprocess.Popen(["sh", "-c", watch], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
+                                   env={**os.environ, "PATH": tools + os.pathsep + os.environ.get("PATH", "")})
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        stopping = threading.Timer(10, process.kill)  # one never said again: its output ends
+        stopping.start()
+        self.addCleanup(stopping.cancel)
+        blocks, block = [], []
+        with process.stdout:
+            for line in process.stdout:
+                if line.strip() == "--":
+                    blocks.append(block[1:])  # its uptime first
+                    block = []
+                    if len(blocks) == 2:
+                        break
+                else:
+                    block.append(line.rstrip("\n"))
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0], blocks[1])
+        self.assertIn(f"      package={MUSIC}", blocks[0])
 
 
 if __name__ == "__main__":

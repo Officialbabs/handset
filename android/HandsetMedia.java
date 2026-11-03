@@ -1,10 +1,11 @@
 /*
  * What an Android phone plays, read on the phone: run there by app_process (as scrcpy's server
  * is), it asks the phone's media session service for its sessions and says, a line of JSON on its
- * output each time it changes, the one playing (or paused last): its app, title, artist, album,
- * length, where it is and how it plays, what it takes, and its cover (a JPEG in base64, once a
- * cover). Lines on its input work that session: {"op":"play"|"pause"|"next"|"previous"} and
- * {"op":"seek","position":ms}.
+ * output each time it changes, the one playing (or paused, not for long): its app, title, artist,
+ * album, length, where it is and how it plays, what it takes, and its cover (a JPEG in base64, once
+ * a cover). Lines on its input work that session (with none shown, the one shown last if it's
+ * only left off for its age, said so, and auto-pause plays it again):
+ * {"op":"play"|"pause"|"next"|"previous"} and {"op":"seek","position":ms}.
  *
  * It looks only when there's news: the service calls it back (a binder of its own, News) when a
  * session comes or goes and when one's state or what it plays changes, as an app's own media
@@ -33,10 +34,15 @@ public final class HandsetMedia {
     private static final int QUIET_MS = 30_000;  // a look anyway, this long after the last news
     private static final int SETTLE_MS = 150;  // news comes in bursts: one look after it
     private static final int COVER_EDGE = 600;
+    // Paused this long, a session is left off the desk, as the phone drops it from its own
+    // controls (androidmedia.PAUSED_FOR_S, the shell's view's own).
+    private static final long PAUSED_FOR_MS = 10 * 60 * 1000;
     private static final PrintStream OUT = System.out;
 
     private static Object sessions;  // ISessionManager
     private static Object current;  // ISessionController of the session shown
+    private static Object leftOff;  // ISessionController of one paused too long to show, there all the same
+    private static Object shown;  // asBinder() of the session shown last: the only one left off so
     private static String said = "";
     private static String coverSaid = "";
     private static boolean verbose;
@@ -90,8 +96,9 @@ public final class HandsetMedia {
             } catch (Throwable error) {
                 say("{\"event\":\"error\",\"message\":" + quote(String.valueOf(error)) + "}");
             }
-            // Told of what changes: of sessions coming and going, and by the one shown, if any.
-            boolean told = listening && (current == null || !heard.isEmpty());
+            // Told of what changes: of sessions coming and going, and by the one shown, if any (one
+            // left off for its age plays again unannounced, so it's looked at as one shown is).
+            boolean told = listening && ((current == null && leftOff == null) || !heard.isEmpty());
             if (NEWS.tryAcquire(told ? QUIET_MS : POLL_MS, java.util.concurrent.TimeUnit.MILLISECONDS)) {
                 Thread.sleep(SETTLE_MS);
                 NEWS.drainPermits();
@@ -156,6 +163,8 @@ public final class HandsetMedia {
     private static void look() throws Exception {
         Object chosen = null;
         Object chosenState = null;
+        long looked = elapsedRealtime();
+        Object left = null;
         for (Object controller : controllers()) {
             Object state = call(controller, "getPlaybackState");
             int number = state == null ? 0 : (Integer) call(state, "getState");
@@ -164,14 +173,26 @@ public final class HandsetMedia {
                 chosenState = state;
                 break;
             }
-            if (chosen == null && state != null && number == 2) {  // the first one paused
-                chosen = controller;
-                chosenState = state;
+            // The first one paused, not for long (it's looked at again within QUIET_MS, so one
+            // paused longer goes from the desk then).
+            if (chosen == null && state != null && number == 2) {
+                if (looked - (Long) call(state, "getLastPositionUpdateTime") < PAUSED_FOR_MS) {
+                    chosen = controller;
+                    chosenState = state;
+                } else if (left == null && shown != null && shown.equals(call(controller, "asBinder"))) {
+                    // The one shown till then, not shown, but it may play again (auto-pause's, not
+                    // another app's paused long ago): unheard, it's looked at every POLL_MS.
+                    left = controller;
+                }
             }
         }
+        leftOff = chosen == null ? left : null;
         current = chosen;
+        if (chosen != null) {
+            shown = call(chosen, "asBinder");
+        }
         if (chosen == null) {
-            sayIfNew("{\"event\":\"none\"}");
+            sayIfNew(leftOff == null ? "{\"event\":\"none\"}" : "{\"event\":\"none\",\"left_off\":true}");
             return;
         }
         Object metadata = call(chosen, "getMetadata");
@@ -195,7 +216,7 @@ public final class HandsetMedia {
         String withoutCover = line.toString();
         // Where it is now: its position as of its last update, moved on since at its speed.
         long position = (Long) call(chosenState, "getPosition");
-        long now = (Long) Class.forName("android.os.SystemClock").getMethod("elapsedRealtime").invoke(null);
+        long now = elapsedRealtime();
         boolean moving = (Integer) call(chosenState, "getState") == 3;
         float speed = (Float) call(chosenState, "getPlaybackSpeed");
         if (moving) {
@@ -216,6 +237,11 @@ public final class HandsetMedia {
             saidSpeed = moving ? speed : 0f;
             say(line.toString());
         }
+    }
+
+    /** The phone's clock, the one a session's state is timed by: ms since it started, sleep counted. */
+    private static long elapsedRealtime() throws Exception {
+        return (Long) Class.forName("android.os.SystemClock").getMethod("elapsedRealtime").invoke(null);
     }
 
     /** The sessions' controllers, the most important first. */
@@ -348,7 +374,7 @@ public final class HandsetMedia {
     private static void readCommands() {
         try (BufferedReader input = new BufferedReader(new InputStreamReader(System.in))) {
             for (String line; (line = input.readLine()) != null; ) {
-                Object controller = current;
+                Object controller = current != null ? current : leftOff;
                 if (controller == null) {
                     continue;
                 }

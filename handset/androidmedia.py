@@ -4,10 +4,11 @@ server is): the media session's own words, length, where it is, its cover, and w
 said as they change; and played, paused, skipped and moved in through it.
 
 Where the helper can't run, the shell's view instead: the sessions from `dumpsys media_session`,
-read by a loop on the phone that says something only when they change (every second while one
-plays, now and then otherwise); a track's length and its words as the phone gives them to
-Bluetooth devices (`dumpsys bluetooth_manager`, while Bluetooth is on); and play, pause, next and
-previous sent as media keys (`cmd media_session dispatch`): no covers, no place to go to in a track.
+read by a loop on the phone that says them when they change and every so often anyway (looking
+every second while one plays, now and then otherwise); a track's length and its words as the
+phone gives them to Bluetooth devices (`dumpsys bluetooth_manager`, while Bluetooth is on); and
+play, pause, next and previous sent as media keys (`cmd media_session dispatch`): no covers, no
+place to go to in a track.
 """
 
 from __future__ import annotations
@@ -34,7 +35,8 @@ NONE, STOPPED, PAUSED, PLAYING, FAST_FORWARDING, REWINDING, BUFFERING, ERROR = r
 GOING = {PLAYING, FAST_FORWARDING, REWINDING, BUFFERING, 8, 9, 10, 11}
 MOVING = {PLAYING, FAST_FORWARDING, REWINDING}
 SKIP_TO_PREVIOUS, SKIP_TO_NEXT, SEEK_TO = 16, 32, 256  # its actions
-# Paused this long, it's left off the desk, as the phone itself drops it from its own controls.
+# Paused this long, it's left off the desk, as the phone itself drops it from its own controls: by
+# choose() on the shell's view, and by the helper itself (its PAUSED_FOR_MS) through it.
 PAUSED_FOR_S = 10 * 60
 LOOK_PLAYING_S, LOOK_IDLE_S = 1, 4
 
@@ -47,10 +49,11 @@ HELPER_FAILS_WITHIN_S = 5
 # Covers kept here for each phone, the latest few.
 COVERS_KEPT = 12
 
-# On the phone: the sessions' lines, said again only when they change.
-WATCH = ("o=; while :; do d=$(dumpsys media_session | grep -E "
-         "'userId=|package=|state=PlaybackState|metadata:'); "
-         "if [ \"$d\" != \"$o\" ]; then cat /proc/uptime; echo \"$d\"; echo --; o=$d; fi; "
+# On the phone: the sessions' lines, said again when they change, and anyway every 8 looks (so
+# choose() drops a session paused too long, its lines unchanged).
+WATCH = ("o=; n=0; while :; do d=$(dumpsys media_session | grep -E "
+         "'userId=|package=|state=PlaybackState|metadata:'); n=$((n+1)); "
+         "if [ \"$d\" != \"$o\" ] || [ $n -ge 8 ]; then cat /proc/uptime; echo \"$d\"; echo --; o=$d; n=0; fi; "
          f"case \"$d\" in *state=PLAYING*) sleep {LOOK_PLAYING_S};; *) sleep {LOOK_IDLE_S};; esac; done")
 AVRCP = "dumpsys bluetooth_manager | sed -n '/Profile: AvrcpTargetService/,/BTAudio/p'"
 
@@ -183,7 +186,9 @@ def covers_folder(serial: str) -> str:
 
 class MediaFollower:
     """One Android phone's now playing, followed while it's connected: `on_media(NowPlaying or
-    None)` on GLib's main loop as it changes."""
+    None)` on GLib's main loop as it changes. Showing nothing, `left_off` says whether the session
+    it showed last is only left off for its age, paused still (so a play plays it again): not one
+    stopped or gone since, nor another app's paused long ago."""
 
     def __init__(self, serial: str, on_media: Callable[[NowPlaying | None], None]):
         self.serial = serial
@@ -191,6 +196,8 @@ class MediaFollower:
         self.process: subprocess.Popen | None = None
         self.stopped = False
         self.playing = False
+        self.left_off = False
+        self.shown: tuple[str, str, str] | None = None  # the shell's view: the session shown last
         self.songs: dict[tuple[str, str], dict | None] = {}  # (package, description) → its Bluetooth song
         self.helper: subprocess.Popen | None = None  # the phone-side helper, while it runs
         self.helper_works: bool | None = None  # None: not tried yet
@@ -289,6 +296,7 @@ class MediaFollower:
             self._keep_cover(cover_id, str(event["cover"]))
         now = helped(event, received, self.covers.get(cover_id, ""))
         self.playing = bool(now and now.playing)
+        self.left_off = now is None and event.get("left_off") is True  # the helper's own: the one it showed
         GLib.idle_add(self._show, now)
 
     def _keep_cover(self, cover_id: str, encoded: str):
@@ -346,7 +354,11 @@ class MediaFollower:
         now = None
         if session:
             now = now_playing(session, uptime_ms, received, self._song(session))
+            self.shown = session.key
         self.playing = bool(now and now.playing)
+        # Not chosen, the one shown last that media keys go to, paused with something: only for its age.
+        self.left_off = session is None and any(
+            other.key == button == self.shown and other.state == PAUSED and other.description for other in sessions)
         GLib.idle_add(self._show, now)
 
     def _song(self, session: Session) -> dict | None:

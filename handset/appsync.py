@@ -156,6 +156,7 @@ class AppSync:
         self.players: dict[str, PhonePlayer] = {}  # a phone's id → what it plays, on the desk
         self.media: dict[str, object] = {}  # an Android phone's id → what follows its media sessions
         self.autopause = None  # one thing playing at a time (autopause.AutoPause)
+        self.leftover = None  # with it off, the phones' sound it still owed its volume (autopause.Lowered)
         self.looking: set[tuple[str, str, str]] = set()  # covers being looked up
         self.ancs = None
         self.away_timer = 0  # the iPhones went: their notifications stop when it's done
@@ -184,6 +185,8 @@ class AppSync:
             self.ancs.stop()
         if self.autopause:
             self.autopause.stop()
+        if self.leftover:
+            self.leftover.stop()
         for player in self.players.values():
             player.stop()
         for timer in self.leaving.values():
@@ -199,11 +202,7 @@ class AppSync:
 
     def start(self):
         self.watch.start()
-        from . import autopause
-
-        if autopause.wanted():
-            self.autopause = autopause.AutoPause(lambda: self.players)
-            self.autopause.start()
+        self._auto_pause()
         GLib.timeout_add_seconds(60, self._relist)
         apps.forget_old_icons()
         GLib.timeout_add_seconds(6 * 3600, lambda: (apps.forget_old_icons(), True)[1])
@@ -220,14 +219,7 @@ class AppSync:
         if file.get_path() != settings_file() or event not in (Gio.FileMonitorEvent.CREATED,
                                                                 Gio.FileMonitorEvent.CHANGES_DONE_HINT):
             return
-        from . import autopause
-
-        if autopause.wanted() and not self.autopause:
-            self.autopause = autopause.AutoPause(lambda: self.players)
-            self.autopause.start()
-        elif not autopause.wanted() and self.autopause:
-            self.autopause.stop()
-            self.autopause = None
+        self._auto_pause()
         from .service import refresh_all
 
         refresh_all()  # a phone switched off or on, or kept to its cable, in Handset's window
@@ -236,6 +228,26 @@ class AppSync:
             # Notifications reach every phone's followers: this sync starts again, as it is now.
             debug("notifications switched", "on" if not self.notifying else "off", "- the sync starts again")
             GLib.idle_add(self._start_again)
+
+    def _auto_pause(self):
+        """Auto-pause on or off, as Handset's settings say. Off, the phones' sound it still owes its
+        volume (gone while lowered, this sync or one before) is put back all the same once it's
+        made again, as it would be: not left lowered for good."""
+        from . import autopause
+
+        if autopause.wanted() and not self.autopause:
+            if self.leftover:
+                self.leftover.stop()  # what it owes kept for the one starting now, as the sync's next
+                self.leftover = None
+            self.autopause = autopause.AutoPause(
+                lambda: self.players, android=lambda phone_id: getattr(self.media.get(phone_id), "left_off", False))
+            self.autopause.start()
+        elif not autopause.wanted() and not self.leftover:
+            if self.autopause:
+                self.autopause.stop()
+                self.autopause = None
+            self.leftover = autopause.Lowered()
+            self.leftover.restore()
 
     def _start_again(self):
         self.stop()
