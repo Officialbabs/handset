@@ -469,6 +469,9 @@ activity pill; on other desktops, the shell's media controls.
   installed. It provides the app's own cover, the track length and seeking. The phone's media
   service calls it back when anything changes, so it does nothing in between. Without it, Handset
   reads the phone's media sessions as text, with no cover and no seeking.
+- **Paused for long:** an app paused on the phone for more than 10 minutes leaves the media
+  controls, on both ways, and comes back once it plays again. A phone Handset paused for the
+  computer still plays again when that's over, within its 30 minutes.
 - **iPhone:** delivered over Bluetooth through Apple Media Service, the protocol car systems use.
   That protocol carries no artwork, so covers are looked up in Apple's public music catalogue by
   artist and album and cached locally.
@@ -484,7 +487,9 @@ devices:
 - Whatever was paused resumes when the interruption ends.
 - **Short sounds** on the computer (a message tone, a notification chime) only lower the phones'
   audio routed to the computer for a moment. They pause nothing. A phone starting to play never
-  lowers its own sound.
+  lowers its own sound. The phones' audio always comes back as loud as it was: also when the sound
+  ended at once, when the phone's sound started again while it was lowered, or when Handset
+  stopped or restarted meanwhile.
 - **A track shorter than 20 seconds is a sound, not music,** however long its player says it's
   playing: two notification chimes in a row in a web page (WhatsApp Web in Natter or a browser),
   or a page's player left saying it plays, never pause anything or hold up a resume.
@@ -492,6 +497,9 @@ devices:
   lowered and nothing resumes in between.
 - **Players that stand for a phone are left alone,** so a phone never pauses itself. These include
   BlueZ's Bluetooth players and KDE Connect's.
+- **A web page's player** (a voice note in WhatsApp Web, in Natter or a browser) is taken down by
+  the page when another of its sounds starts, while its own plays on. The phones then wait until
+  that track would be over, counted from where it was, and come back once it is.
 
 This can be switched off in Phones and Settings.
 
