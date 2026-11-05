@@ -207,3 +207,33 @@ class SearchTest(Phones):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OnTheBusTest(unittest.TestCase):
+    """Only while there's something to search: none, and the desktop's search finds no one to ask."""
+
+    def test_the_search_is_offered_only_while_a_phone_can_be_searched(self):
+        from handset import phonesearch
+
+        owned = []
+        saved = phonesearch.Gio.bus_own_name, phonesearch.Gio.bus_unown_name
+        phonesearch.Gio.bus_own_name = lambda *args: owned.append(1) or len(owned)
+        phonesearch.Gio.bus_unown_name = lambda owner: owned.remove(1)
+        try:
+            here, known = {}, {}
+            search = PhoneSearch(lambda: here, None, lambda: known)
+            search.start()
+            self.assertEqual(owned, [])  # the phones switched off: nothing to search
+            known["pixel"] = "Pixel 7"
+            search.refresh()  # one away a moment: searched in what was kept of it
+            self.assertEqual(owned, [1])
+            search.refresh()
+            self.assertEqual(owned, [1])
+            known.clear()
+            search.refresh()
+            self.assertEqual(owned, [])
+            here["pixel"] = ("Pixel 7", "/x", lambda: None)
+            search.refresh()
+            self.assertEqual(owned, [1])
+        finally:
+            phonesearch.Gio.bus_own_name, phonesearch.Gio.bus_unown_name = saved

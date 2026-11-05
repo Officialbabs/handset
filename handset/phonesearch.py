@@ -249,8 +249,18 @@ class PhoneSearch:
         self.owner = 0
 
     def start(self):
-        self.owner = Gio.bus_own_name(Gio.BusType.SESSION, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
-                                      self._on_bus, None, None)
+        self.refresh()
+
+    def refresh(self):
+        """On the bus only while there's something to search: a phone's folder here, or one away
+        a moment. Otherwise (the phones switched off in Handset, or forgotten) the desktop's search
+        finds no one to ask (its entry says not to start Handset for it) and doesn't wait."""
+        if self.phones() or self._away({}):
+            if not self.owner:
+                self.owner = Gio.bus_own_name(Gio.BusType.SESSION, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
+                                              self._on_bus, None, None)
+        elif self.owner:
+            self.stop()
 
     def stop(self):
         if self.bus and self.registered:
@@ -275,6 +285,7 @@ class PhoneSearch:
         identifier, since = self.waiting.pop(phone_id, ("", 0.0))
         if identifier and time.monotonic() - since < OPEN_WHEN_BACK_S:
             GLib.idle_add(self.activate, identifier)
+        self.refresh()
 
     def _kept(self, phone_id: str) -> Index | None:
         """A phone's index, read from where it was kept if it isn't in memory yet."""

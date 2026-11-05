@@ -79,6 +79,10 @@ class SyncTest(unittest.TestCase):
     def names(self):
         return sorted(app.name for app in apps.entries())
 
+    def hidden(self, app) -> bool:
+        with open(apps.entry_path(app.phone_id, app.app)) as file:
+            return "NoDisplay=true" in file.read()
+
     def test_a_connected_phones_apps_come_and_go(self):
         sync = appsync.AppSync()
         sync.start()
@@ -92,14 +96,37 @@ class SyncTest(unittest.TestCase):
         self.service.push([phone(id="FAKE7", name="Pixel 7", usb=False, status="offline")])
         spin(lambda: not sync.online)
         self.assertEqual(len(apps.entries()), 3)
+        self.assertFalse(any(self.hidden(app) for app in apps.entries()))
+        # Away a while: hidden from the desk's lists and search, the docked one too stays shown.
+        sync.last_seen["FAKE7"] -= appsync.HIDE_AFTER_S
+        sync._drop_unconnected()
+        self.assertEqual(sorted(app.name for app in apps.entries() if not self.hidden(app)), ["Fake Chat"])
         # Gone for good a day later: its apps go too, but for the one in the dock.
         sync.last_seen["FAKE7"] -= appsync.ENTRY_RETENTION_S
         sync._drop_unconnected()
         self.assertEqual(self.names(), ["Fake Chat"])
-        # And back.
+        # And back: shown again.
         self.service.push([phone(id="FAKE7", name="Pixel 7", usb=True, status="connected")])
         spin(lambda: len(apps.entries()) == 3)
+        spin(lambda: not any(self.hidden(app) for app in apps.entries()))
         spin(lambda: not sync.busy)  # nothing of this test's left running into the next
+        sync.watch.stop()
+        sync.stop()
+
+    def test_a_phone_switched_off_in_handset_has_its_apps_hidden_at_once(self):
+        from dataclasses import replace
+
+        from handset.service import DISCONNECTED
+
+        sync = appsync.AppSync()
+        sync.start()
+        spin(lambda: len(apps.entries()) == 3 and not sync.busy)
+        here = sync.phones_now[0]
+        sync._phones_changed([replace(here, online=False, usb=False, problem=DISCONNECTED)])
+        self.assertTrue(all(self.hidden(app) for app in apps.entries()))
+        sync._phones_changed([here])
+        self.assertFalse(any(self.hidden(app) for app in apps.entries()))
+        spin(lambda: not sync.busy)
         sync.watch.stop()
         sync.stop()
 
@@ -240,7 +267,7 @@ class FolderGraceTest(unittest.TestCase):
         self.switched_on = True
         appsync.phone_files_wanted = lambda: self.switched_on
         self.sync = appsync.AppSync.__new__(appsync.AppSync)
-        self.sync.mounting, self.sync.leaving = set(), {}
+        self.sync.mounting, self.sync.leaving, self.sync.search = set(), {}, None
         self.asked = []
         self.sync._mount = self.asked.append
         self.folder = Folder()

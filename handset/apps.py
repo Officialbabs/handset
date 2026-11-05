@@ -208,6 +208,29 @@ def write_entry(app: PhoneApp, icon: bytes | None = None, replace: bool = True) 
     return True
 
 
+def set_hidden(phone_id: str, app: str, hidden: bool) -> bool:
+    """An entry kept, but out of the desk's lists and its search (NoDisplay) while its phone is
+    away, or back in them: True when it changed. One written afresh (write_entry) is shown."""
+    path = entry_path(phone_id, app)
+    entry = GLib.KeyFile()
+    try:
+        entry.load_from_file(path, GLib.KeyFileFlags.KEEP_COMMENTS)
+    except GLib.Error:
+        return False
+    try:
+        now = entry.get_boolean(ENTRY, "NoDisplay")
+    except GLib.Error:
+        now = False
+    if now == hidden:
+        return False
+    if hidden:
+        entry.set_boolean(ENTRY, "NoDisplay", True)
+    else:
+        entry.remove_key(ENTRY, "NoDisplay")
+    GLib.file_set_contents(path, entry.to_data()[0].encode())
+    return True
+
+
 # ---- The phones' own entries -------------------------------------------------------------------
 # Each phone has an entry too ("Pixel 7"), opening its window: its window carries the entry's id,
 # so the dock shows each phone under its own icon, to pin and open on its own.

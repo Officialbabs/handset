@@ -43,6 +43,11 @@ ICON_BATCH = 12
 AWAY_FOR_S = 60
 ICON_SIZE = 192
 ENTRY_RETENTION_S = 24 * 3600  # a gone phone's menu entries linger this long before they go
+# Meanwhile they're hidden from the desk's lists and search once it's been away this long (at
+# once when it's switched off in Handset), and shown again when it's back: ~200 entries of a
+# phone that isn't here crowded the desk's search as it was typed in (5 Nov).
+HIDE_AFTER_S = 10 * 60
+TIDY_S = 5 * 60
 # A phone's folder stays this long after the phone drops out, for a flaky Wi-Fi link that's back
 # in seconds: remounting each time left abandoned mounts behind (29 Oct, six in an afternoon).
 FOLDER_STAYS_S = 60
@@ -175,6 +180,8 @@ class AppSync:
         self.packages: dict[str, dict[str, str]] = {}  # an Android phone's id → its packages when it was
         self.busy: set[str] = set()
         self.seen = False  # a first state from the service: entries left from before are checked
+        self.off_before: frozenset[str] | None = None  # the phones switched off in Handset, last tidy
+        self.tidied = 0.0
         self.lock = threading.Lock()  # entries are written by one at a time
 
     def stop(self):
@@ -204,6 +211,7 @@ class AppSync:
         self.watch.start()
         self._auto_pause()
         GLib.timeout_add_seconds(60, self._relist)
+        GLib.timeout_add_seconds(TIDY_S, self._tidy)
         apps.forget_old_icons()
         GLib.timeout_add_seconds(6 * 3600, lambda: (apps.forget_old_icons(), True)[1])
         self.notifying = notifications_wanted()
@@ -423,7 +431,10 @@ class AppSync:
                 pass
         if gone or came or first:
             debug("phones connected:", sorted(p.name for p in online.values()))
-            self._drop_unconnected()
+            self.off_before = None
+        self._tidy()
+        if self.search:
+            self.search.refresh()  # none to search: off the bus, so the desktop's search doesn't ask
         for phone_id in gone:
             self.listed.pop(phone_id, None)  # listed afresh when it's back
             self.packages.pop(phone_id, None)
@@ -480,6 +491,8 @@ class AppSync:
         mounted = self.mounts.pop(phone_id, None)
         if mounted:
             threading.Thread(target=mounted.stop, daemon=True).start()
+        if self.search:
+            self.search.refresh()
 
     def _mount(self, phone: Phone):
         from . import android, iphone, phonefs
@@ -588,18 +601,37 @@ class AppSync:
         """The entries of phones that have been away a while go, but for the ones in the dock.
         A phone merely off for a bit — asleep, between Wi-Fi naps, or across a restart of
         Handset — keeps its entries: taking ~200 of them out and putting them back has the
-        desk re-read the lot each way, and its search drags while it does (26 Oct)."""
+        desk re-read the lot each way, and its search drags while it does (26 Oct). They're
+        hidden meanwhile (HIDE_AFTER_S), and a connected phone's are shown."""
+        from .service import DISCONNECTED
+
         now = time.time()
+        off = {p.id for p in self.phones_now if p.problem == DISCONNECTED}
         with self.lock:
             docked = set(apps.docked())
             for app in apps.entries():
-                if app.phone_id in self.online or f"{app.id}.desktop" in docked:
+                if app.phone_id in self.online:
+                    apps.set_hidden(app.phone_id, app.app, False)
+                    continue
+                if f"{app.id}.desktop" in docked:
                     continue
                 last = self.last_seen.setdefault(app.phone_id, now)  # unknown: as of now, and counting
-                if now - last < ENTRY_RETENTION_S:
-                    continue
-                debug("away with", app.title)
-                apps.remove_entry(app.phone_id, app.app)
+                if now - last >= ENTRY_RETENTION_S:
+                    debug("away with", app.title)
+                    apps.remove_entry(app.phone_id, app.app)
+                elif app.phone_id in off or now - last >= HIDE_AFTER_S:
+                    apps.set_hidden(app.phone_id, app.app, True)
+
+    def _tidy(self):
+        """Every few minutes, and when a phone is switched off or on in Handset: the entries
+        of phones away hidden or gone in their time, not only when a phone comes or goes."""
+        from .service import DISCONNECTED
+
+        off = frozenset(p.id for p in self.phones_now if p.problem == DISCONNECTED)
+        if off != self.off_before or time.time() - self.tidied >= TIDY_S - 1:
+            self.off_before, self.tidied = off, time.time()
+            self._drop_unconnected()
+        return GLib.SOURCE_CONTINUE
 
     # ---- One phone's apps (off the main loop) ------------------------------------------------
 
