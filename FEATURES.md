@@ -268,8 +268,11 @@ Opened by launching Handset, with **Ctrl+,**, from the phone's menu, or with `ha
   icon, named "‹App› (‹Phone name›)".
 - **Each app opens in its own window**, with its own dock icon, separate from Handset's.
 - **Pinning:** apps can be pinned to the dock like any desktop app.
-- **When the phone disconnects,** its apps leave the launcher. Pinned apps stay, and opening one
-  waits for the phone to come back.
+- **When the phone disconnects,** its apps leave search and the app grid: at once when it's
+  switched off in Handset, after 10 minutes when it drops off by itself (a moment off Wi-Fi
+  doesn't count). They come back as soon as it's connected again. After a day away they're
+  removed, and listed again when the phone returns. Pinned apps stay, and opening one waits for
+  the phone to come back.
 - **Phone Apps** (Ctrl+Shift+A, or from the phone's menu) lists the phone's apps for opening or
   pinning.
 - **App window controls:** a phone button that opens the full phone view, then the rest as any
@@ -415,6 +418,8 @@ Notifications can be switched off in Phones and Settings.
   index kept from when it was here; its results say "(not connected)". Picking one says it will
   open when the phone is back, and opens it by itself once the phone's folder returns (within two
   minutes). Phones switched off in Handset aren't searched.
+- **No phone to search:** with every phone switched off in Handset, the search provider leaves
+  the session bus, so the desktop's search has nothing to ask and never waits on Handset.
 - **Indexing:** searches never wait for a phone, because results come from an index Handset keeps.
   The index is built when the phone connects (unless the one kept from before is under 30
   minutes old), and made again when a search finds it older than that: the phone is left alone
