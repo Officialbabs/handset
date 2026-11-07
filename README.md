@@ -348,6 +348,16 @@ Handset keeps trying until it can.
   answered through its microphone). Pair it with the computer once in Settings › Bluetooth on the
   iPhone, as for notifications.
 
+## The phone's camera as a webcam
+
+**Use Camera as Webcam** (in a phone window's menu: Off, Back Camera or Front Camera) makes an
+Android phone's camera (Android 12 and later) a camera of the computer, named for the phone
+("Pixel 7 camera"), for video calls and camera apps. It's offered through PipeWire, so browsers
+based on Firefox, OBS and GNOME's Camera list it; apps that only open V4L2 cameras (Zoom, Chrome
+as it comes) list it when started through `pw-v4l2`. The phone's camera runs only while an app is
+watching, and goes off 20 seconds after; it carries on when the phone's window closes, until it's
+switched off (`handset --webcam ID [--front]` does the same from a terminal).
+
 ## Media controls
 
 Whatever a phone plays is one of the desktop's media players (MPRIS), so the desktop's media

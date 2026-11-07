@@ -48,6 +48,7 @@ iOS, and standard Bluetooth profiles.
 | Phone storage as a desktop folder | Shared storage | Media folders and apps that share their files |
 | Phone files in desktop search | Yes | Yes |
 | Phone audio on the computer | Media, video and games (Android 11+) | All audio, plus phone calls (Bluetooth A2DP/HFP) |
+| The phone's camera as a webcam | Back or front camera (Android 12+) | No |
 | Desktop media controls | Title, artist, cover, position, seeking | Title, artist and album, with the cover from Apple's music catalogue |
 | Connection | USB and Wi-Fi, at the same time | USB and Wi-Fi, at the same time |
 
@@ -458,6 +459,27 @@ of the phone.
 | Audio covered | Media, video and games; the phone itself goes quiet. Ringtones and notification sounds stay on the phone | All audio |
 | Calls | Stay on the phone | Heard through the computer's speakers and answered with its microphone |
 
+### The phone's camera as a webcam
+
+**Use Camera as Webcam** (the phone's menu: Off, Back Camera or Front Camera) makes an Android
+phone's camera a camera of this computer, named for the phone ("Pixel 7 camera"), for video calls
+and camera apps.
+
+- **Offered through PipeWire,** beside the computer's own camera. Apps that open cameras through
+  PipeWire or the camera portal list it: Firefox-based browsers, OBS, GNOME's Camera. Apps that
+  only open V4L2 devices (Zoom, Chrome as it comes, Discord) see it when started through
+  PipeWire's `pw-v4l2`.
+- **The phone's camera runs only while an app watches it,** and turns off 20 seconds after the
+  last one stops. Until it starts, and between uses, the camera shows black, so an app that opens
+  it never waits on the phone.
+- **Video:** 16:9, up to 1280×720 at 30 frames a second, H.264 from scrcpy's server, decoded on
+  the GPU where it can be.
+- **Keeps going when the phone's window closes:** it runs as a service of its own
+  (`handset --webcam`), and stops when it's switched off, or when the phone is switched off in
+  Handset.
+- **When the camera won't start** (Android older than 12, or another app on the phone holding the
+  camera), Handset tries three times while an app watches, then says why in a notification.
+
 ---
 
 ## 11. Media integration
@@ -594,6 +616,7 @@ Settings are stored in `~/.config/handset/settings.json`.
 | `handset --off` | Close every window and quit |
 | `handset --sync` | Run the background service: phone apps, notifications, media and file search |
 | `handset --pair-iphone` | Make the computer discoverable to pair an iPhone for notifications and audio |
+| `handset --webcam ID [--front]` | Offer an Android phone's camera as a webcam until stopped |
 | `handset --forget-apps` | Remove every phone app from the launcher |
 
 ---
@@ -668,6 +691,7 @@ Settings are stored in `~/.config/handset/settings.json`.
 | Rust 1.85 or newer, with a C compiler | Building the iPhone helper, where there's no ready-built one (other than x86_64, or a changed helper) |
 | usbmuxd | iPhones over USB |
 | BlueZ and PipeWire | iPhone notifications, media information and audio |
+| GStreamer's PipeWire plugin | A phone's camera as a webcam |
 | fusermount3 (fuse3) | Phone folders in `~/Phones` |
 | Avahi | Finding Android phones for Wi-Fi pairing |
 | wl-clipboard, pactl | The clipboard, and lowering the phones' sound |
@@ -675,7 +699,7 @@ Settings are stored in `~/.config/handset/settings.json`.
 ### Phone
 
 - **Android:** Developer options with USB debugging. Android 11 or later for Wireless debugging
-  pairing and for audio.
+  pairing and for audio; Android 12 or later for its camera as a webcam.
 - **iPhone:** a trust pairing with the computer, Developer Mode, and Apple's developer disk image
   (installed by Handset). Bluetooth pairing for notifications and audio. A one-time Shortcut for
   importing into Photos.
@@ -726,6 +750,8 @@ graphics hardware haven't been tested yet.
 - **Android app windows** go black while the phone is locked, until it's unlocked.
 - **Clipboard:** images copied on Android don't reach the computer; only text does.
 - **Android audio** needs Android 11 or later. Ringtones and notification sounds stay on the phone.
+- **Camera as a webcam** is for Android only (12 or later): an iPhone's camera can't be reached
+  this way. Apps that only open V4L2 cameras need starting through `pw-v4l2` to list it.
 - **iPhone Photos import** needs the one-time Handset Import Shortcut.
 - **Developer access:** Android needs USB or Wireless debugging and the iPhone needs Developer
   Mode. Some Android banking apps refuse to run while developer options are on.

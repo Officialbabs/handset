@@ -89,6 +89,8 @@ def scrcpy(command):
     if options.get("video") == "false":
         return clipboard_server(port, options)
     width, height = (int(n) for n in options.get("new_display", f"{NATURAL[0]}x{NATURAL[1]}").split("/")[0].split("x"))
+    if options.get("video_source") == "camera":  # the phone's camera: landscape, as a camera's
+        width, height = 1280, 720
     server = socket.create_server(("127.0.0.1", port))
     video, _ = server.accept()
     video.sendall(b"\0" + struct.pack(">III", 0x68323634, width, height))

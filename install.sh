@@ -118,7 +118,8 @@ family() {
 distro_name() { (. "$OS_RELEASE" 2>/dev/null && echo "${PRETTY_NAME:-$ID}") || echo "this system"; }
 
 # The packages Handset uses, by family. Python with PyGObject and pycairo; GTK 4 and libadwaita,
-# GStreamer (video in, sound out: base, good, bad for VA-API, libav for decoding in software);
+# GStreamer (video in, sound out: base, good, bad for VA-API, libav for decoding in software,
+# PipeWire's for a phone's camera as a webcam);
 # adb (with its udev rules, for phones by cable), usbmuxd (iPhones by cable), Avahi (phones
 # over Wi-Fi), fuse3 (the phones' folders), wl-clipboard and pactl (the clipboard, the sound),
 # BlueZ (an iPhone's notifications and music), psmisc (fuser), git and curl. Rust (rust_packages)
@@ -128,15 +129,15 @@ packages() {
         apt) echo "python3 python3-gi python3-gi-cairo python3-cairo gir1.2-gtk-4.0 gir1.2-adw-1
               gir1.2-graphene-1.0 gir1.2-gdkpixbuf-2.0 gir1.2-rsvg-2.0 gir1.2-gstreamer-1.0
               gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good
-              gstreamer1.0-plugins-bad gstreamer1.0-libav adb android-udev-rules|android-sdk-platform-tools-common
+              gstreamer1.0-plugins-bad gstreamer1.0-libav gstreamer1.0-pipewire adb android-udev-rules|android-sdk-platform-tools-common
               usbmuxd avahi-daemon fuse3 wl-clipboard pulseaudio-utils bluez psmisc git curl" ;;
         dnf) echo "python3 python3-gobject python3-cairo gtk4 libadwaita graphene gdk-pixbuf2 librsvg2
               gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free
-              gstreamer1-plugin-openh264 gstreamer1-plugin-libav android-tools usbmuxd avahi fuse3
+              gstreamer1-plugin-openh264 gstreamer1-plugin-libav pipewire-gstreamer android-tools usbmuxd avahi fuse3
               wl-clipboard pulseaudio-utils bluez psmisc git curl" ;;
         pacman) echo "python python-gobject python-cairo gtk4 libadwaita graphene gdk-pixbuf2 librsvg
               gstreamer gst-plugins-base-libs gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugin-va
-              gst-libav android-tools android-udev usbmuxd avahi fuse3 wl-clipboard libpulse bluez
+              gst-libav gst-plugin-pipewire android-tools android-udev usbmuxd avahi fuse3 wl-clipboard libpulse bluez
               psmisc git curl" ;;
         zypper) echo "python3 python3-gobject python3-gobject-Gdk python3-gobject-cairo python3-pycairo
               typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1 typelib-1_0-Graphene-1_0 typelib-1_0-GdkPixbuf-2_0

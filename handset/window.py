@@ -598,6 +598,9 @@ class Window(Adw.ApplicationWindow):
         screen_off.connect("change-state", self._screen_off)
         screen_off.set_enabled(False)  # an Android phone's, once it's shown
         self.add_action(screen_off)
+        webcam = Gio.SimpleAction.new_stateful("webcam", GLib.VariantType.new("s"), GLib.Variant("s", "off"))
+        webcam.connect("change-state", self._webcam)
+        self.add_action(webcam)
         self._action("pair-iphone", lambda _a, _p: self._pair_iphone())
         self._action("pin", lambda _a, _p: self._pin_this(True))
         self._action("unpin", lambda _a, _p: self._pin_this(False))
@@ -784,6 +787,7 @@ class Window(Adw.ApplicationWindow):
         sound = self.get_application().sound
         self.sound_switched(bool(sound and self.phone and sound.is_on(self.phone.id)))
         menu = Gio.Menu()
+        camera = self._webcam_menu()
         if self.phone_app:
             pinned = apps.is_pinned(self.phone_app.phone_id, self.phone_app.app)
             menu.append("Unpin from the Dock" if pinned else "Pin to the Dock", "win.unpin" if pinned else "win.pin")
@@ -793,6 +797,8 @@ class Window(Adw.ApplicationWindow):
             menu.append("Play Sound Here", "win.sound-here")
             if self.phone and self.phone.platform == "android":
                 menu.append("Phone Screen Off", "win.screen-off")
+            if camera:
+                menu.append_submenu("Use Camera as Webcam", camera)
         else:
             menu.append("Phone Apps…", "win.phone-apps")
             menu.append("Phone Files…", "win.phone-files")
@@ -800,6 +806,8 @@ class Window(Adw.ApplicationWindow):
             menu.append("Play Sound Here", "win.sound-here")
             if self.phone and self.phone.platform == "android":
                 menu.append("Phone Screen Off", "win.screen-off")
+            if camera:
+                menu.append_submenu("Use Camera as Webcam", camera)
             menu.append("Pair an iPhone for Notifications…", "win.pair-iphone")
             menu.append("New Window", "app.new-window")
             menu.append("Phones and Settings…", "app.phones")
@@ -824,6 +832,39 @@ class Window(Adw.ApplicationWindow):
 
         popover.connect("closed", closed)
         popover.popup()
+
+    def _webcam_menu(self) -> Gio.Menu | None:
+        """An Android phone's camera as this computer's webcam: off, its back camera or its
+        front one (webcam.py), as it is now."""
+        from . import webcam
+
+        if not self.phone or self.phone.platform != "android":
+            return None
+        self.lookup_action("webcam").set_state(GLib.Variant("s", webcam.running(self.phone.id) or "off"))
+        camera = Gio.Menu()
+        for label, facing in (("Off", "off"), ("Back Camera", "back"), ("Front Camera", "front")):
+            camera.append(label, f"win.webcam::{facing}")
+        return camera
+
+    def _webcam(self, action: Gio.SimpleAction, value: GLib.Variant):
+        from . import webcam
+
+        if not self.phone:
+            return
+        facing = value.get_string()
+        why = webcam.available() if facing != "off" else None
+        if why:
+            self.say(why)
+            return
+        action.set_state(value)
+        phone = self.phone
+
+        def switch():
+            webcam.switch(phone.id, None if facing == "off" else facing)
+
+        threading.Thread(target=switch, daemon=True).start()
+        if facing != "off":
+            self.say(f"{phone.name}'s camera is a webcam now: pick “{phone.name} camera” in your video app")
 
     def _pair_iphone(self):
         """This computer, visible to iPhones for a few minutes: one paired from its Bluetooth
