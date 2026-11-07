@@ -424,7 +424,8 @@ Notifications can be switched off in Phones and Settings.
 - **Indexing:** searches never wait for a phone, because results come from an index Handset keeps.
   The index is built when the phone connects (unless the one kept from before is under 30
   minutes old), and made again when a search finds it older than that: the phone is left alone
-  meanwhile.
+  meanwhile. When the system's memory monitor says memory is short, the indexes leave memory
+  (about 36 MB for a phone of 100,000 files) and are read back from disk at the next search.
   - **Android:** one `find` over the phone's storage, which took under a second on the test
     platform.
   - **iPhone:** walked by the helper.

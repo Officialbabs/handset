@@ -205,6 +205,35 @@ class SyncTest(unittest.TestCase):
         self.assertFalse(appsync.running())
 
 
+class MemoryTest(unittest.TestCase):
+    """The system's memory monitor's warnings: at medium or worse the phones' file indexes leave
+    memory, each level answered at most once every MEMORY_WARNED_EVERY_S."""
+
+    def test_warnings_answered(self):
+        from unittest import mock
+
+        from gi.repository import Gio
+
+        levels = Gio.MemoryMonitorWarningLevel
+        let_go = []
+        sync = SimpleNamespace(memory_warned={}, search=SimpleNamespace(let_go=lambda: let_go.append(1)))
+
+        def warn(level, at):
+            with mock.patch("time.monotonic", return_value=at):
+                appsync.AppSync._memory_low(sync, None, level)
+
+        warn(levels.LOW, 1000.0)
+        self.assertEqual(let_go, [])  # low: nothing worth the reading again
+        warn(levels.MEDIUM, 1000.0)
+        warn(levels.MEDIUM, 1010.0)  # said again: answered already
+        self.assertEqual(let_go, [1])
+        warn(levels.CRITICAL, 1010.0)
+        warn(levels.MEDIUM, 1000.0 + appsync.MEMORY_WARNED_EVERY_S)
+        self.assertEqual(let_go, [1, 1, 1])
+        sync.search = None  # before the search has started
+        warn(levels.CRITICAL, 2000.0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

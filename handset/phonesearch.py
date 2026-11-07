@@ -295,13 +295,18 @@ class PhoneSearch:
                 self.indexes[phone_id] = Index(found, made)
         return self.indexes.get(phone_id)
 
+    def let_go(self):
+        """Memory is short: the indexes leave memory (about 36 MB for a phone of 100,000 files),
+        each read again from where it was kept when it's next searched."""
+        self.indexes.clear()
+
     def _away(self, here: dict) -> dict[str, str]:
         """The phones known but not here now: id → name."""
         return {phone_id: name for phone_id, name in (self.known() if self.known else {}).items()
                 if phone_id not in here}
 
     def freshen(self, phone_id: str):
-        index = self.indexes.get(phone_id)
+        index = self._kept(phone_id)
         if not index or time.time() - index.made >= INDEX_EVERY_S:
             self.index(phone_id)
 
@@ -365,7 +370,7 @@ class PhoneSearch:
             if phone_id not in away:
                 return None
             name, folder = away[phone_id], None
-        index = self.indexes.get(phone_id)
+        index = self._kept(phone_id)
         found = index.by_path.get(path) if index else None
         if not found:
             return None

@@ -188,6 +188,21 @@ class SearchTest(Phones):
         self.assertTrue(spin(lambda: asked and not again.indexing))
         self.assertEqual(asked, [1])
 
+    def test_memory_short_the_indexes_go_and_come_back_from_disk(self):
+        asked = []
+        again = PhoneSearch(lambda: {"pixel": ("Pixel 7", "/x", lambda: asked.append(1) or self.listed["pixel"])})
+        again.phone_here("pixel")
+        self.assertTrue(spin(lambda: not again.indexing))
+        again.let_go()
+        again.let_go()
+        self.assertEqual(again.indexes, {})
+        found = again.search(["pxl"])  # read again from where it was kept: the phone is left alone
+        self.assertEqual(found, ["pixel\n/DCIM/Camera/PXL_1.jpg"])
+        again.let_go()  # between the search and its results' details
+        self.assertEqual(again.metas(found)[0]["name"].unpack(), "PXL_1.jpg")
+        self.assertFalse(again.indexing)
+        self.assertEqual(asked, [])
+
     def test_asked_over_the_bus(self):
         answered = []
 

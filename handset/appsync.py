@@ -51,6 +51,9 @@ TIDY_S = 5 * 60
 # A phone's folder stays this long after the phone drops out, for a flaky Wi-Fi link that's back
 # in seconds: remounting each time left abandoned mounts behind (29 Oct, six in an afternoon).
 FOLDER_STAYS_S = 60
+# The system's memory monitor repeats its warnings while memory stays short: each level is
+# answered at most this often.
+MEMORY_WARNED_EVERY_S = 30
 
 
 def last_seen_path() -> str:
@@ -183,6 +186,8 @@ class AppSync:
         self.off_before: frozenset[str] | None = None  # the phones switched off in Handset, last tidy
         self.tidied = 0.0
         self.lock = threading.Lock()  # entries are written by one at a time
+        self.memory = None  # the system's memory monitor
+        self.memory_warned: dict[int, float] = {}  # a warning's level → when it was last answered
 
     def stop(self):
         """Its readers on the phones stopped (adb's would go on without it), its players gone."""
@@ -206,6 +211,8 @@ class AppSync:
             self.search.stop()
         if self.reconnect:
             self.reconnect.stop()
+        if self.memory:
+            self.memory.disconnect_by_func(self._memory_low)
 
     def start(self):
         self.watch.start()
@@ -222,6 +229,23 @@ class AppSync:
         folder = Gio.File.new_for_path(os.path.dirname(settings_file()))
         self.settings_monitor = folder.monitor_directory(Gio.FileMonitorFlags.NONE, None)
         self.settings_monitor.connect("changed", self._settings_changed)
+        try:
+            self.memory = Gio.MemoryMonitor.dup_default()
+            self.memory.connect("low-memory-warning", self._memory_low)
+        except (AttributeError, GLib.Error):  # a GLib without one
+            self.memory = None
+
+    def _memory_low(self, _monitor, level):
+        """Memory is short, the system's memory monitor says. All the sync holds that it can make
+        again is the phones' file indexes for the desktop's search (each kept on disk too): at
+        medium or worse they go. The rest is small, or in use."""
+        level, now = int(level), time.monotonic()
+        if level in self.memory_warned and now - self.memory_warned[level] < MEMORY_WARNED_EVERY_S:
+            return
+        self.memory_warned[level] = now
+        if level >= Gio.MemoryMonitorWarningLevel.MEDIUM and self.search:
+            debug("memory is short: the phones' file indexes leave memory")
+            self.search.let_go()
 
     def _settings_changed(self, _monitor, file, _other, event):
         if file.get_path() != settings_file() or event not in (Gio.FileMonitorEvent.CREATED,
